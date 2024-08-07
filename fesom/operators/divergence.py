@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 from jax import jit
 
+
 # Function to calculate divergence
 def calculate_divergence(u, v, areas, normals, edge_lengths):
     velocities = jnp.stack([u, v], axis=-1)[:, jnp.newaxis, :]  # Shape: (n_cells, 1, 2)
@@ -9,5 +10,10 @@ def calculate_divergence(u, v, areas, normals, edge_lengths):
     divergence = fluxes / areas
     return divergence
 
+
 # JIT compile the divergence calculation
 calculate_divergence_jit = jit(calculate_divergence)
+
+
+def hello():
+    return "hello"
