@@ -1,0 +1,118 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+env.bak/
+venv.bak/
+
+# Conda
+.conda/
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+*.cover
+*.py,cover
+.hypothesis/
+coverage.xml
+nosetests.xml
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Output and data files
+output/
+outputs/
+results/
+logs/
+*.log
+*.nc
+*.zarr/
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# Generated images
+*.png
+*.pdf
+*.jpg
+*.jpeg
+*.gif
+*.svg
+
+# JAX / XLA cache
+.jax_cache/
+*.xla
+
+# Slurm
+slurm-*.out
+*.slurm.out
+*.batch
+
+# Profiling
+*.prof
+*.lprof
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
