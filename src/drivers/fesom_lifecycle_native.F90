@@ -37,7 +37,7 @@ program fesom_lifecycle_native
     use, intrinsic :: iso_fortran_env, only: int32, real64
     use mod_precision,      only: WP, MP
     use mod_constants,      only: density_0
-    use mod_param_phys,     only: N2smth_h, alpha, theta
+    use mod_param_phys,     only: N2smth_h, alpha, theta, scale_area
     use mod_param_phys,     only: mix_coeff_PP, A_ver, K_ver, Kv0_const, mix_scheme_nmb
     use mod_param_phys,     only: use_instabmix, instabmix_kv, use_momix, use_windmix
     ! M4e: GM bolus (FESOM3_FER_GM) + Redi isopycnal diffusion (FESOM3_REDI) in the
@@ -448,6 +448,11 @@ program fesom_lifecycle_native
     ice%delta_min     = 1.0e-11_WP
     ice%ice_diff      = 0.0_WP
     ice%ice_gamma_fct = 0.5_WP
+    ! &oce_dyn scale_area: the CORE2 namelist.oce value, NOT the o_PARAM default 2.0e8. The ice
+    ! FCT is its only consumer (diff = ice_diff*sqrt(elem_area/scale_area), ice_fct.F90:175);
+    ! inert while ice_diff=0, but with ice_diff/=0 the default gives sqrt(5.8e9/2e8) = 5.4x the
+    ! reference ice diffusion (the C port's 63-yr drift, port2 21da79e).
+    scale_area        = 5.8e9_WP
     ice%thermo%Sice              = 4.0_WP
     ice%thermo%iclasses          = 7
     ice%thermo%new_iclasses      = .false.

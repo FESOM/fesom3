@@ -38,7 +38,9 @@ module mod_ice_fct
     !  - ice_diff=0.0 / ice_gamma_fct=0.5 are set by the driver to the CORE2 namelist values
     !    (NOT the t_ice single->WP defaults 10.0/0.25); the FCT reads ice%ice_diff /
     !    ice%ice_gamma_fct so the override propagates. scale_area only multiplies the (zero)
-    !    diffusion, but is kept correct (=2.0e8) so sqrt(elem_area/scale_area) is finite.
+    !    diffusion; the drivers set it to the namelist.oce value 5.8e9 (NOT the o_PARAM default
+    !    2.0e8, which gives 5.4x the reference diffusion once ice_diff/=0). It must stay finite
+    !    and nonzero so sqrt(elem_area/scale_area) is finite (else 0*NaN=NaN).
     !  - elem2D_nodes(1:3,el) sliced 1:3 (MAX_NV=4) to avoid the L15 shape trap.
     use mod_precision,    only: WP
     use mod_mesh,         only: t_mesh
