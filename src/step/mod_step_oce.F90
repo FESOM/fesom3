@@ -59,6 +59,7 @@ module mod_step_oce
     use oce_mixing_kpp,     only: oce_mixing_kpp_driver
     use oce_mixing_tke,     only: calc_cvmix_tke
     use oce_mo_conv,        only: mo_convect
+    use oce_vert_spline,    only: compute_shear2
     use oce_dyn_velrhs,     only: compute_vel_rhs
     use oce_dyn_visc,       only: viscosity_filter
     use oce_dyn_ivertvisc,  only: impl_vert_visc_ale
@@ -120,12 +121,14 @@ contains
             call pressure_bv(tracers%data(1)%values, tracers%data(2)%values, &
                              dynamics%work%density_ref, mesh, &
                              dynamics%work%density_m_rho0, dynamics%work%hpressure, &
-                             dynamics%work%bvfreq, partit, dbsfc=dynamics%work%dbsfc)
+                             dynamics%work%bvfreq, partit, dbsfc=dynamics%work%dbsfc, &
+                             bvfreq_raw=dynamics%work%bvfreq_raw)
         else
             call pressure_bv(tracers%data(1)%values, tracers%data(2)%values, &
                              dynamics%work%density_ref, mesh, &
                              dynamics%work%density_m_rho0, dynamics%work%hpressure, &
-                             dynamics%work%bvfreq, partit)
+                             dynamics%work%bvfreq, partit, &
+                             bvfreq_raw=dynamics%work%bvfreq_raw)
         end if
         call dump_node(DUMP_SUBSTEP_PRESSURE_BV, n, 'density',  dynamics%work%density_m_rho0, mesh%nlevels_nod2D)
         call dump_node(DUMP_SUBSTEP_PRESSURE_BV, n, 'pressure', dynamics%work%hpressure,      mesh%nlevels_nod2D)
@@ -179,6 +182,9 @@ contains
         ! Kv=Kv_double loop), so the branch only calls it then mo_convect. Av stays element-based
         ! and Kv node-based -> impl_vert_visc_ale + the tracer TDMA are BYTE-UNCHANGED from M6.
         call timer_start(TMR_OCE_MIXPRES)
+        ! ONE shear for all three schemes (they each built their own before). Must run
+        ! after compute_vel_nodes (uvnode) and before any scheme reads dyn%work%shear2.
+        call compute_shear2(dynamics, mesh, partit)
         if (is_kpp) then
             if (.not. present(stress_node_surf)) &
                 error stop 'step_oce: KPP (mix_scheme_nmb==1) requires stress_node_surf'

@@ -15,14 +15,16 @@ module oce_ale_tracer
     !                               consumer of the M2.8 PP vertical diffusivity dyn%work%Kv
     ! Gated for the pi / reduced-M2 config:
     !   Redi=.false.        -> the isoneutral slope (slope_tapered/Ki) terms vanish (isredi=0)
-    !   tra_adv_lim='FCT'   -> do_wimpl=.false. (implicit vertical advection off; the FCT
-    !                          scheme carries vertical advection explicitly via the full w)
+    !   tra_adv_lim='FCT'   -> do_wimpl=.false. (an FCT tracer takes the implicit part w_i
+    !                          of the use_wsplit split through adv_tra_vert_impl inside
+    !                          do_oce_adv_tra instead; without the split w_i = 0 anyway)
     !   i_vert_diff=.true.  -> the implicit (not explicit) vertical-diffusion path
     !   PP mixing (not KPP) -> use_kpp_nonlclflx=.false.; no sw-penetration / icebergs
     ! The branches deferred for that config (Redi explicit slopes, KPP nonlocal fluxes,
     ! shortwave penetration, icebergs, the explicit diff_ver_part_expl_ale, the biharmonic
     ! diff_part_bh) enter with their enabling features (M2.10+); the do_wimpl advection
-    ! terms are transcribed but unexercised on FCT (gated .false.). 1-rank only; the FESOM2
+    ! terms (use_wsplit, non-FCT tracers) are pinned by test_wsplit part X (QR4C + this
+    ! TDMA, Kv = 0) and are off for FCT tracers. 1-rank only; the FESOM2
     ! exchange_nod(values) loop tail is a no-op here (M2.12).
     use mod_precision,      only: WP, MP
     use mod_constants,      only: vcpw
@@ -36,7 +38,7 @@ module oce_ale_tracer
                                   mix_scheme_nmb, ref_sss, ref_sss_local
     use mod_config,         only: use_sw_pene
     use oce_tracer_mod,     only: init_tracers_AB
-    use oce_tracer_grad,    only: tracer_gradient_elements, tracer_gradient_z
+    use oce_tracer_grad,    only: tracer_gradient_z
     use oce_adv_tra_driver, only: do_oce_adv_tra
     implicit none
     private
@@ -118,20 +120,23 @@ contains
         type(t_partit), intent(in), optional  :: partit
         integer :: tr_num, node, elem, nzmin, nzmax
         integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
-        real(kind=WP), allocatable :: tr_xy(:,:,:)
         real(kind=WP), dimension(:,:), pointer :: Svalues
 
-        ! M2.12c-3: tr_xy is sized to the LOCAL element count (mesh%elem2D holds the GLOBAL
-        ! count in the partitioned mesh). tracer_gradient_elements writes OWNED elements;
-        ! diff_part_hor_redi reads tr_xy only at the (owned) triangles of owned edges.
+        ! The elemental tracer gradient for the horizontal diffusion / Redi is
+        ! tracers%work%tr_xy, built by init_tracers_AB (called inside advect_tracer) from
+        ! the same values (advection writes only del_ttf), so it is not recomputed here;
+        ! diff_part_hor_redi reads it only at the (owned) elements of owned edges.
         call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
-        allocate(tr_xy(2, mesh%nl-1, nElemF))
 
         ! M4c GM bolus ADD (FESOM2 oce_ale_tracer.F90:199-211): advect with the residual-mean
         ! velocity UV + fer_uv / Wvel + fer_w. Added over owned+halo (advection reads the halo;
         ! fer_uv/fer_w were exchanged in fer_gamma2vel/vert_vel_ale), subtracted after the tracer
-        ! loop. fer_w goes into BOTH w and w_e (faithful; w_e is unused at use_wsplit=.false.).
-        ! Guarded by Fer_GM -> the GM-off (M2/M3) tracer solve is byte-unchanged.
+        ! loop. fer_w goes into BOTH w and w_e (faithful: the non-FCT high-order vertical
+        ! advection reads w_e, the FCT low-order step reads w_e and w; with the split off
+        ! w_e == w). With use_wsplit the whole bolus velocity is added to the EXPLICIT part
+        ! and bypasses the CFL cap (FESOM2 behaviour; the GM+wsplit gate config of
+        ! tools/run_conserve_pi.sh runs this combination). Guarded by Fer_GM -> the GM-off
+        ! (M2/M3) tracer solve is byte-unchanged.
         if (Fer_GM) then
             do elem = 1, nElemL
                 dynamics%uv(:,:,elem) = dynamics%uv(:,:,elem) + dynamics%fer_uv(:,:,elem)
@@ -145,12 +150,12 @@ contains
         do tr_num = 1, tracers%num_tracers
             ! advection: del_ttf = advhoriz + advvert (del_ttf zeroed in init_tracers_AB)
             call advect_tracer(dt, tr_num, dynamics, tracers, mesh, partit)
-            ! elemental gradient of the pre-diffusion tracer (advection left values = T^n)
-            call tracer_gradient_elements(tracers%data(tr_num)%values, tr_xy, mesh, partit)
+            ! elemental gradient of the pre-diffusion tracer (advection left values = T^n):
+            ! tracers%work%tr_xy from init_tracers_AB of this tracer (see above)
             ! M4d Redi: vertical gradient tr_z of the same T^n (feeds diff_part_hor_redi K13/K23)
             if (Redi) call tracer_gradient_z(tracers%data(tr_num)%values, tracers%work%tr_z, mesh, partit)
             ! horizontal diffusion + ALE reconstruct + implicit vertical-diffusion TDMA
-            call diff_tracers_ale(tr_num, dt, dynamics, tracers, mesh, tr_xy, Ki, &
+            call diff_tracers_ale(tr_num, dt, dynamics, tracers, mesh, tracers%work%tr_xy, Ki, &
                                   heat_flux, water_flux, virtual_salt, relax_salt, &
                                   real_salt_flux, is_nonlinfs, partit)
             ! relax_to_clim (clim_relax=0): no-op. exchange_nod(values) (FESOM2 :268): the
@@ -182,7 +187,6 @@ contains
             where (Svalues(nzmin:nzmax,node) <  3.0_WP) Svalues(nzmin:nzmax,node) =  3.0_WP
         end do
 
-        deallocate(tr_xy)
     end subroutine solve_tracers_ale
 
     !===========================================================================
@@ -259,7 +263,7 @@ contains
         ! del_ttf at the two edge nodes. The Redi isoneutral-slope terms (slope_tapered/tr_z,
         ! x isredi) vanish for Redi=off; they are deferred to a future Redi gate.
         ! M2.12c-3: optional partit -> OWNED edge loop (FESOM2 :1208 do edge=1, myDim_edge2D).
-        ! For owned edges both triangles are owned (invariant ii) so tr_xy/helem read in the
+        ! For owned edges both elements are owned (invariant ii) so tr_xy/helem read in the
         ! owned-only element range; Ki/areasvol are read at the edge's two nodes (one may be a
         ! halo node — Ki is prescribed owned+halo, areasvol is M2.12b-exchanged). The owned-
         ! node del_ttf scatter is complete (invariant i).
@@ -295,7 +299,7 @@ contains
             ul1     = mesh%ulevels(el(1))
             nl2 = 0
             ul2 = 0
-            if (el(2) > 0) then
+            if (el(2) /= el(1)) then
                 nl2 = mesh%nlevels(el(2)) - 1
                 ul2 = mesh%ulevels(el(2))
                 deltaX2 = mesh%edge_cross_dxdy(3,edge)
@@ -396,9 +400,9 @@ contains
             ul12 = ul1
             if (ul2 > 0) ul12 = min(ul1, ul2)
             del_ttf(ul12:nl12,enodes(1)) = del_ttf(ul12:nl12,enodes(1)) &
-                + rhs1(ul12:nl12)*dt/mesh%areasvol(ul12:nl12,enodes(1))
+                + rhs1(ul12:nl12)*dt/mesh%areasvol(enodes(1))
             del_ttf(ul12:nl12,enodes(2)) = del_ttf(ul12:nl12,enodes(2)) &
-                + rhs2(ul12:nl12)*dt/mesh%areasvol(ul12:nl12,enodes(2))
+                + rhs2(ul12:nl12)*dt/mesh%areasvol(enodes(2))
         end do
     end subroutine diff_part_hor_redi
 
@@ -430,7 +434,25 @@ contains
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
         allocate(tr_xynodes(2, mesh%nl-1, nNodL))
 
-        ! node-averaged element gradients (no halo exchange of tr_xynodes is needed)
+        ! Node-averaged element gradients (no halo exchange of tr_xynodes is needed).
+        !
+        ! The denominator is areasvol -- the FULL scalar-cell area -- and NOT the area of
+        ! the elements that happen to be wet at this level. Under the FESOM3 vertex bottom
+        ! an adjacent element that is dry at nz is not MISSING data to be dropped from the
+        ! average: its velocity/flux there is genuinely ZERO (that is what "velocities
+        ! touching topography are zero" means), so it must contribute zero carrying its
+        ! full area weight. Dividing by the wet area instead inflates the result by
+        ! full/wet -- up to 7x on pi, at 10% of node-levels.
+        !
+        ! This is also why it composes correctly downstream: the Redi flux below is
+        ! tr_xynodes*area(nz,n), so with this denominator it collapses to
+        ! sum over wet elements of tr_xy*elem_area, i.e. each element contributing its own
+        ! share and the dry ones nothing. In FESOM2 the same expression was correct for the
+        ! same reason -- areasvol was then the depth-gathered (wet) area, and the two /3
+        ! cancelled; only the definition of areasvol changed, not the intent.
+        ! Hybrid meshes: each element contributes its kite share elem_area*nod_in_elem2D_w
+        ! (FESOM2's hidden 1/3 = the triangle kite weight), so areasvol = the sum of those
+        ! shares and a uniform gradient gathers to itself on triangles and quads alike.
         do n = 1, nNodO
             nl1 = mesh%nlevels_nod2D(n)-1
             ul1 = mesh%ulevels_nod2D(n)
@@ -440,12 +462,12 @@ contains
                 do k = 1, mesh%nod_in_elem2D_num(n)
                     elem = mesh%nod_in_elem2D(k,n)
                     if (nz <= (mesh%nlevels(elem)-1) .and. nz >= mesh%ulevels(elem)) then
-                        Tx = Tx + tr_xy(1,nz,elem)*mesh%elem_area(elem)
-                        Ty = Ty + tr_xy(2,nz,elem)*mesh%elem_area(elem)
+                        Tx = Tx + tr_xy(1,nz,elem)*mesh%elem_area(elem)*mesh%nod_in_elem2D_w(k,n)
+                        Ty = Ty + tr_xy(2,nz,elem)*mesh%elem_area(elem)*mesh%nod_in_elem2D_w(k,n)
                     end if
                 end do
-                tr_xynodes(1,nz,n) = Tx/3.0_WP/mesh%areasvol(nz,n)
-                tr_xynodes(2,nz,n) = Ty/3.0_WP/mesh%areasvol(nz,n)
+                tr_xynodes(1,nz,n) = Tx/mesh%areasvol(n)
+                tr_xynodes(2,nz,n) = Ty/mesh%areasvol(n)
             end do
         end do
 
@@ -469,10 +491,10 @@ contains
                 vd_flux(nz) = vd_flux(nz) + &
                               (zbar_n(nz)-z_n(nz))*(slope_tapered(1,nz,n)*tr_xynodes(1,nz,n) &
                             + slope_tapered(2,nz,n)*tr_xynodes(2,nz,n))*Ki(nz,n)
-                vd_flux(nz) = vd_flux(nz)/(z_n(nz-1)-z_n(nz))*mesh%area(nz,n)
+                vd_flux(nz) = vd_flux(nz)/(z_n(nz-1)-z_n(nz))*mesh%area(n)
             end do
             do nz = ul1, nl1
-                del_ttf(nz,n) = del_ttf(nz,n) + (vd_flux(nz)-vd_flux(nz+1))*dt/mesh%areasvol(nz,n)
+                del_ttf(nz,n) = del_ttf(nz,n) + (vd_flux(nz)-vd_flux(nz+1))*dt/mesh%areasvol(n)
             end do
         end do
 
@@ -491,9 +513,12 @@ contains
         ! relaxation), and solves it with the Thomas algorithm; then T += dTnew.
         !
         ! Redi (isredi=0) zeroes the isoneutral Ty/Ty1 terms; do_wimpl (use_wsplit .and. not
-        ! FCT) adds the implicit vertical advection, transcribed but .false. on the pi FCT
-        ! tracers. KPP nonlocal fluxes / shortwave penetration / icebergs are deferred with
-        ! their features (M2.10+).
+        ! FCT) adds the implicit upwind advection of w_i (the implicit part of the smooth
+        ! split, compute_Wvel_split) to the same TDMA -- live for non-FCT tracers and pinned
+        ! by test_wsplit part X (the chain == this TDMA bitwise in the fully implicit limit);
+        ! FCT tracers take w_i through adv_tra_vert_impl in do_oce_adv_tra instead. KPP
+        ! nonlocal fluxes / shortwave penetration / icebergs are deferred with their
+        ! features (M2.10+).
         integer,        intent(in)            :: tr_num
         real(kind=WP),  intent(in)            :: dt
         type(t_dyn),    intent(inout), target :: dynamics
@@ -553,12 +578,12 @@ contains
             if (Redi) Ty1 = (Z_n(nz)     -zbar_n(nz+1))*zinv2*dynamics%work%slope_tapered(3,nz  ,n)**2*dynamics%work%Ki(nz  ,n) &
                           + (zbar_n(nz+1)-Z_n(nz+1)   )*zinv2*dynamics%work%slope_tapered(3,nz+1,n)**2*dynamics%work%Ki(nz+1,n)
             a(nz) = 0.0_WP
-            c(nz) = -(dynamics%work%Kv(nz+1,n)+Ty1)*zinv2*zinv * mesh%area(nz+1,n)/mesh%areasvol(nz,n)
+            c(nz) = -(dynamics%work%Kv(nz+1,n)+Ty1)*zinv2*zinv * mesh%area(n)/mesh%areasvol(n)
             b(nz) = -c(nz) + mesh%hnode_new(nz,n)
             if (do_wimpl) then
-                v_adv = zinv * ( mesh%area(nz  ,n)/mesh%areasvol(nz,n) )
+                v_adv = zinv * ( mesh%area(n)/mesh%areasvol(n) )
                 b(nz) = b(nz) + Wvel_i(nz, n)*v_adv
-                v_adv = zinv * mesh%area(nz+1,n)/mesh%areasvol(nz,n)
+                v_adv = zinv * mesh%area(n)/mesh%areasvol(n)
                 b(nz) = b(nz) - min(0._WP, Wvel_i(nz+1, n))*v_adv
                 c(nz) = c(nz) - max(0._WP, Wvel_i(nz+1, n))*v_adv
             end if
@@ -575,15 +600,15 @@ contains
                     Ty1 = (Z_n(nz     )-zbar_n(nz+1))*zinv2*dynamics%work%slope_tapered(3,nz  ,n)**2*dynamics%work%Ki(nz  ,n) &
                         + (zbar_n(nz+1)-Z_n(nz+1    ))*zinv2*dynamics%work%slope_tapered(3,nz+1,n)**2*dynamics%work%Ki(nz+1,n)
                 end if
-                a(nz) = -(dynamics%work%Kv(nz,n)  +Ty )*zinv1*zinv * ( mesh%area(nz  ,n)/mesh%areasvol(nz,n) )
-                c(nz) = -(dynamics%work%Kv(nz+1,n)+Ty1)*zinv2*zinv *   mesh%area(nz+1,n)/mesh%areasvol(nz,n)
+                a(nz) = -(dynamics%work%Kv(nz,n)  +Ty )*zinv1*zinv * ( mesh%area(n)/mesh%areasvol(n) )
+                c(nz) = -(dynamics%work%Kv(nz+1,n)+Ty1)*zinv2*zinv *   mesh%area(n)/mesh%areasvol(n)
                 b(nz) = -a(nz)-c(nz) + mesh%hnode_new(nz,n)
                 zinv1 = zinv2
                 if (do_wimpl) then
-                    v_adv = zinv * ( mesh%area(nz  ,n)/mesh%areasvol(nz,n) )
+                    v_adv = zinv * ( mesh%area(n)/mesh%areasvol(n) )
                     a(nz) = a(nz) + min(0._WP, Wvel_i(nz, n))*v_adv
                     b(nz) = b(nz) + max(0._WP, Wvel_i(nz, n))*v_adv
-                    v_adv = zinv * mesh%area(nz+1,n)/mesh%areasvol(nz,n)
+                    v_adv = zinv * mesh%area(n)/mesh%areasvol(n)
                     b(nz) = b(nz) - min(0._WP, Wvel_i(nz+1, n))*v_adv
                     c(nz) = c(nz) - max(0._WP, Wvel_i(nz+1, n))*v_adv
                 end if
@@ -595,11 +620,11 @@ contains
             Ty = 0.0_WP
             if (Redi) Ty = (Z_n(nz-1)-zbar_n(nz))*zinv1*dynamics%work%slope_tapered(3,nz-1,n)**2*dynamics%work%Ki(nz-1,n) &
                          + (zbar_n(nz )-Z_n(nz  ))*zinv1*dynamics%work%slope_tapered(3,nz  ,n)**2*dynamics%work%Ki(nz  ,n)
-            a(nz) = -(dynamics%work%Kv(nz,n)+Ty)*zinv1*zinv * ( mesh%area(nz  ,n)/mesh%areasvol(nz,n) )
+            a(nz) = -(dynamics%work%Kv(nz,n)+Ty)*zinv1*zinv * ( mesh%area(n)/mesh%areasvol(n) )
             c(nz) = 0.0_WP
             b(nz) = -a(nz) + mesh%hnode_new(nz,n)
             if (do_wimpl) then
-                v_adv = zinv * ( mesh%area(nz  ,n)/mesh%areasvol(nz,n) )
+                v_adv = zinv * ( mesh%area(n)/mesh%areasvol(n) )
                 a(nz) = a(nz) + min(0._WP, Wvel_i(nz, n))*v_adv
                 b(nz) = b(nz) + max(0._WP, Wvel_i(nz, n))*v_adv
             end if
@@ -627,29 +652,29 @@ contains
                 if (id == 1) then           ! temperature
                     nz = nzmin
                     tr(nz) = tr(nz) + ( -MIN(dynamics%work%ghats(nz+1,n)*dynamics%work%blmc(nz+1,n,2), 1.0_WP) &
-                                        *(mesh%area(nz+1,n)/mesh%areasvol(nz,n)) ) * heat_flux(n) / vcpw * dt
+                                        *(mesh%area(n)/mesh%areasvol(n)) ) * heat_flux(n) / vcpw * dt
                     do nz = nzmin+1, nzmax-2
-                        tr(nz) = tr(nz) + (  MIN(dynamics%work%ghats(nz  ,n)*dynamics%work%blmc(nz  ,n,2), 1.0_WP)*(mesh%area(nz  ,n)/mesh%areasvol(nz,n)) &
-                                            -MIN(dynamics%work%ghats(nz+1,n)*dynamics%work%blmc(nz+1,n,2), 1.0_WP)*(mesh%area(nz+1,n)/mesh%areasvol(nz,n)) &
+                        tr(nz) = tr(nz) + (  MIN(dynamics%work%ghats(nz  ,n)*dynamics%work%blmc(nz  ,n,2), 1.0_WP)*(mesh%area(n)/mesh%areasvol(n)) &
+                                            -MIN(dynamics%work%ghats(nz+1,n)*dynamics%work%blmc(nz+1,n,2), 1.0_WP)*(mesh%area(n)/mesh%areasvol(n)) &
                                           ) * heat_flux(n) / vcpw * dt
                     end do
                     nz = nzmax-1
                     tr(nz) = tr(nz) + (  MIN(dynamics%work%ghats(nz  ,n)*dynamics%work%blmc(nz  ,n,2), 1.0_WP) &
-                                        *(mesh%area(nz  ,n)/mesh%areasvol(nz,n)) ) * heat_flux(n) / vcpw * dt
+                                        *(mesh%area(n)/mesh%areasvol(n)) ) * heat_flux(n) / vcpw * dt
                 else if (id == 2) then      ! salinity
                     rsss = ref_sss
                     if (ref_sss_local) rsss = trarr(1,n)   ! FESOM2 values(1,n): level 1 (=nzmin, no cavity)
                     nz = nzmin
                     tr(nz) = tr(nz) - ( -MIN(dynamics%work%ghats(nz+1,n)*dynamics%work%blmc(nz+1,n,3), 1.0_WP) &
-                                        *(mesh%area(nz+1,n)/mesh%areasvol(nz,n)) ) * rsss * water_flux(n) * dt
+                                        *(mesh%area(n)/mesh%areasvol(n)) ) * rsss * water_flux(n) * dt
                     do nz = nzmin+1, nzmax-2
-                        tr(nz) = tr(nz) - (  MIN(dynamics%work%ghats(nz  ,n)*dynamics%work%blmc(nz  ,n,3), 1.0_WP)*(mesh%area(nz  ,n)/mesh%areasvol(nz,n)) &
-                                            -MIN(dynamics%work%ghats(nz+1,n)*dynamics%work%blmc(nz+1,n,3), 1.0_WP)*(mesh%area(nz+1,n)/mesh%areasvol(nz,n)) &
+                        tr(nz) = tr(nz) - (  MIN(dynamics%work%ghats(nz  ,n)*dynamics%work%blmc(nz  ,n,3), 1.0_WP)*(mesh%area(n)/mesh%areasvol(n)) &
+                                            -MIN(dynamics%work%ghats(nz+1,n)*dynamics%work%blmc(nz+1,n,3), 1.0_WP)*(mesh%area(n)/mesh%areasvol(n)) &
                                           ) * rsss * water_flux(n) * dt
                     end do
                     nz = nzmax-1
                     tr(nz) = tr(nz) - (  MIN(dynamics%work%ghats(nz  ,n)*dynamics%work%blmc(nz  ,n,3), 1.0_WP) &
-                                        *(mesh%area(nz  ,n)/mesh%areasvol(nz,n)) ) * rsss * water_flux(n) * dt
+                                        *(mesh%area(n)/mesh%areasvol(n)) ) * rsss * water_flux(n) * dt
                 end if
             end if
             !___________________________________________________________________
@@ -663,7 +688,7 @@ contains
                 do nz = nzmin, nzmax-1
                     zinv = 1.0_WP*dt
                     tr(nz) = tr(nz) + (dynamics%work%sw_3d(nz,n) &
-                             - dynamics%work%sw_3d(nz+1,n) * mesh%area(nz+1,n)/mesh%areasvol(nz,n)) * zinv
+                             - dynamics%work%sw_3d(nz+1,n) * mesh%area(n)/mesh%areasvol(n)) * zinv
                 end do
             end if
             !___________________________________________________________________

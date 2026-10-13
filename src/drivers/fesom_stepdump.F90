@@ -121,12 +121,14 @@ program fesom_stepdump
     allocate(dyn%cfl_z(nl, mesh%nod2D))
     ! work scratch (zeroed at setup, mirroring FESOM2 arrays_init; pressure_bv/PP overwrite)
     allocate(dyn%work%density_ref(nl-1, mesh%nod2D), dyn%work%density_m_rho0(nl-1, mesh%nod2D))
-    allocate(dyn%work%hpressure(nl, mesh%nod2D), dyn%work%bvfreq(nl, mesh%nod2D))
+    allocate(dyn%work%hpressure(nl, mesh%nod2D), dyn%work%bvfreq(nl, mesh%nod2D), dyn%work%bvfreq_raw(nl, mesh%nod2D), dyn%work%shear2(nl, mesh%nod2D))
     allocate(dyn%work%pgf_x(nl-1, mesh%elem2D), dyn%work%pgf_y(nl-1, mesh%elem2D))
     allocate(dyn%work%u_c(nl-1, mesh%elem2D), dyn%work%v_c(nl-1, mesh%elem2D))
     allocate(dyn%work%uvnode_rhs(2, nl-1, mesh%nod2D))
+    allocate(dyn%work%vorticity(nl-1, mesh%nod2D))   ! momadv_opt==1 (vector-invariant) scratch
+    dyn%work%vorticity = 0.0_WP
     allocate(dyn%work%Kv(nl, mesh%nod2D), dyn%work%Av(nl, mesh%elem2D))
-    dyn%work%density_m_rho0 = 0.0_WP; dyn%work%hpressure = 0.0_WP; dyn%work%bvfreq = 0.0_WP
+    dyn%work%density_m_rho0 = 0.0_WP; dyn%work%hpressure = 0.0_WP; dyn%work%bvfreq = 0.0_WP; dyn%work%bvfreq_raw = 0.0_WP; dyn%work%shear2 = 0.0_WP
     dyn%work%pgf_x = 0.0_WP; dyn%work%pgf_y = 0.0_WP
     dyn%work%u_c = 0.0_WP; dyn%work%v_c = 0.0_WP; dyn%work%uvnode_rhs = 0.0_WP
     dyn%work%Kv = 0.0_WP; dyn%work%Av = 0.0_WP    ! surface/bottom stay 0 (PP sets interior)
@@ -142,12 +144,14 @@ program fesom_stepdump
     dyn%visc_gamma2   = 0.285_WP
     dyn%visc_gamma0_h = 0.0_WP
     dyn%visc_gamma1_h = 0.0_WP
-    ! use_wsplit=.false. for the step gate (M1.4 precedent): the FCT implicit
-    ! vertical-advection correction (adv_tra_vert_impl, the use_wsplit=.true. path of
-    ! do_oce_adv_tra) is a distinct unported kernel. With .false. the explicit/implicit
-    ! split is trivial (w_e=w, w_i=0) AFTER vert_vel_ale; impl_vert_visc_ale still runs on
-    ! the prescribed w_i (it precedes compute_Wvel_split), so vertical momentum advection is
-    ! exercised. The use_wsplit=.true. split itself is gated separately at M2.7.
+    ! use_wsplit=.false. for the step gate (M1.4 precedent): the FESOM2 oracle of this
+    ! dump has the hard CFL switch, FESOM3 the smooth Shchepetkin split (oce_wsplit), so
+    ! the use_wsplit=.true. path (incl. the FCT adv_tra_vert_impl of do_oce_adv_tra) is
+    ! not byte-comparable here; its nets are test_wsplit / test_wimpl_tra and the
+    ! fesom_conserve wsplit gate configs. With .false. the explicit/implicit split is
+    ! trivial (w_e=w, w_i=0) AFTER vert_vel_ale; impl_vert_visc_ale still runs on the
+    ! prescribed w_i (it precedes compute_Wvel_split), so vertical momentum advection is
+    ! exercised.
     dyn%use_wsplit    = .false.
     dyn%wsplit_maxcfl = 1.0_WP
 
@@ -201,17 +205,17 @@ program fesom_stepdump
 
     !===========================================================================
     ! tracer advection machinery: valuesAB / valuesold (cold start = values) + the FCT
-    ! work arrays + muscl_adv_init, and the pi FCT config (MFCT/QR4C/FCT, opth=0/optv=1).
+    ! work arrays + muscl_adv_init, and the pi FCT config (MUSCL/QR4C/FCT, opth=0/optv=1).
     tracers%num_tracers = 2
     do tr_num = 1, 2
         allocate(tracers%data(tr_num)%valuesAB(nl-1, mesh%nod2D))
         allocate(tracers%data(tr_num)%valuesold(2, nl-1, mesh%nod2D))
         tracers%data(tr_num)%ID         = tr_num
         tracers%data(tr_num)%AB_order   = 2
-        tracers%data(tr_num)%tra_adv_hor = 'MFCT'
+        tracers%data(tr_num)%tra_adv_hor = 'MUSCL'
         tracers%data(tr_num)%tra_adv_ver = 'QR4C'
         tracers%data(tr_num)%tra_adv_lim = 'FCT'
-        tracers%data(tr_num)%tra_adv_ph  = 0.0_WP    ! MFCT
+        tracers%data(tr_num)%tra_adv_ph  = 0.0_WP    ! MUSCL
         tracers%data(tr_num)%tra_adv_pv  = 1.0_WP    ! QR4C
         tracers%data(tr_num)%i_vert_diff = .true.
         tracers%data(tr_num)%valuesAB        = 0.0_WP
@@ -228,7 +232,7 @@ program fesom_stepdump
     allocate(tracers%work%del_ttf         (nl-1, mesh%nod2D))
     allocate(tracers%work%del_ttf_advhoriz(nl-1, mesh%nod2D))
     allocate(tracers%work%del_ttf_advvert (nl-1, mesh%nod2D))
-    call muscl_adv_init(tracers%work, mesh)     ! nboundary_lay, edge_up_dn_tri, edge_up_dn_grad
+    call muscl_adv_init(tracers%work, mesh)     ! edge_up_dn_tri
 
     !===========================================================================
     ! forcing inputs (D7 explicit args; M2.10 forcing / M4 resolution will source them).

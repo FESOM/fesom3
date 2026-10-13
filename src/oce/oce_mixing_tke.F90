@@ -385,13 +385,13 @@ end subroutine integrate_tke
 ! (gen_modules_cvmix_tke.F90:378-660), library-free + optional-partit. Per OWNED node:
 ! assemble vshear2/bvfreq2/dz_trr/normstress + tke_old, call integrate_tke (the prognostic
 ! column solve), zero the tke_Av/tke_Kv endpoints; then exchange_nod(tke_Kv);Kv=tke_Kv and
-! exchange_nod(tke_Av) BEFORE the node->elem 3-vertex average into Av. tke is the prognostic
+! exchange_nod(tke_Av) BEFORE the node->elem kite-weighted (elem_w) average into Av. tke is the prognostic
 ! field carried step->step in dynamics%work%tke (tke_old copy -> integrate_tke -> tke_new in
 ! the same slab). IDEMIX/Langmuir are off (tke_only=.true.) -> iw_diss/E_iw/alpha_c/tke_plc
 ! are passed as length-(nlev+1) ZERO arrays; forc_rho_surf=0. The 10 diagnostics are computed
 ! into discarded local scratch (NOT load-bearing for tke/Av/Kv; no diagnostics-output bloat).
 subroutine calc_cvmix_tke(dynamics, stress_node_surf, dt, mesh, partit)
-    use mod_mesh,        only: t_mesh
+    use mod_mesh,        only: t_mesh, MAX_NV
     use mod_dyn,         only: t_dyn
     use mod_partit,      only: t_partit
     use mod_part_bounds, only: owned_bounds, is_multirank
@@ -403,17 +403,16 @@ subroutine calc_cvmix_tke(dynamics, stress_node_surf, dt, mesh, partit)
     type(t_mesh),   intent(in),    target   :: mesh
     type(t_partit), intent(in),    optional :: partit
 
-    integer :: node, nz, nln, nun, nlev, elem, elnodes(3)
+    integer :: node, nz, nln, nun, nlev, elem, elnodes(MAX_NV)
     integer :: nNodO, nNodL, nEdgeO, nElemO
     real(kind=WP) :: forc_surf
-    real(kind=WP), dimension(:,:,:), pointer :: UVnode
-    real(kind=WP), dimension(:,:),   pointer :: bvfreq, tke, tke_Av, tke_Kv, Kv, Av
+    real(kind=WP), dimension(:,:),   pointer :: bvfreq, tke, tke_Av, tke_Kv, Kv, Av, shear2
     real(kind=WP), dimension(mesh%nl) :: vshear2, bvfreq2, dz_trr, tke_old_col, dzw_col, zero_col
     ! discarded diagnostic scratch (integrate_tke requires them; not load-bearing here)
     real(kind=WP), dimension(mesh%nl) :: dg_tbpr, dg_tspr, dg_tdif, dg_tdis, dg_twin, &
                                          dg_tiwf, dg_tbck, dg_ttot, dg_lmix, dg_pr
 
-    UVnode => dynamics%uvnode
+    shear2 => dynamics%work%shear2
     bvfreq => dynamics%work%bvfreq
     tke    => dynamics%work%tke
     tke_Av => dynamics%work%tke_Av
@@ -433,12 +432,12 @@ subroutine calc_cvmix_tke(dynamics, stress_node_surf, dt, mesh, partit)
         forc_surf = sqrt( stress_node_surf(1,node)**2 + stress_node_surf(2,node)**2)/density_0
 
         ! 3D vertical velocity shear (zero the full nl column, then fill nun+1..nln)
+        ! shared shear (oce_vert_spline::compute_shear2). NOTE this differs from the
+        ! previous TKE-local form in the LAST BITS even at shear_splines=.false.: TKE
+        ! divided by (Z(nz-1)-Z(nz))**2 once, the shared producer multiplies by dz_inv
+        ! twice (the PP / ri_iwmix operand order). Same value, different rounding.
         vshear2=0.0_WP
-        do nz=nun+1,nln
-            vshear2(nz)=(( UVnode(1, nz-1, node) - UVnode(1, nz, node))**2 + &
-                         ( UVnode(2, nz-1, node) - UVnode(2, nz, node))**2)/ &
-                         ((mesh%Z_3d_n(nz-1,node)-mesh%Z_3d_n(nz,node))**2)
-        end do
+        vshear2(nun+1:nln) = shear2(nun+1:nln, node)
 
         ! square of Brunt-Vaisala frequency (bvfreq already holds N^2)
         bvfreq2        = 0.0_WP
@@ -500,9 +499,9 @@ subroutine calc_cvmix_tke(dynamics, stress_node_surf, dt, mesh, partit)
     if (is_multirank(partit)) call exchange_nod(tke_Av, partit)
     Av = 0.0_WP
     do elem=1, nElemO
-        elnodes=mesh%elem2D_nodes(1:3,elem)
+        elnodes=mesh%elem2D_nodes(:,elem)
         do nz=mesh%ulevels(elem)+1,mesh%nlevels(elem)-1
-            Av(nz,elem) = sum(tke_Av(nz,elnodes))/3.0_WP    ! (elementwise)
+            Av(nz,elem) = sum(mesh%elem_w(:,elem)*tke_Av(nz,elnodes))    ! (elementwise, kite-weighted)
         end do
     end do
 end subroutine calc_cvmix_tke

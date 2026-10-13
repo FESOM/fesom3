@@ -52,7 +52,7 @@ contains
         a%ocean_area = 1234.5_MP
         allocate(a%coord_nod2D(2, a%nod2D), a%elem2D_nodes(4, a%elem2D))
         allocate(a%elem2D_nnodes(a%elem2D), a%nlevels(a%elem2D))
-        allocate(a%area(a%nl, a%nod2D), a%hnode(a%nl, a%nod2D))
+        allocate(a%area(a%nod2D), a%hnode(a%nl, a%nod2D))   ! area is 1-D (bottom at vertices)
         allocate(a%ssh_stiff%rowptr(a%nod2D+1), a%ssh_stiff%values(13))
         a%ssh_stiff%dim = a%nod2D; a%ssh_stiff%nza = 13
         do j = 1, a%nod2D
@@ -66,8 +66,8 @@ contains
                 a%elem2D_nodes(i, j) = i + j
             end do
         end do
-        a%area = reshape([(real(i, MP)*1.5_MP, i=1, a%nl*a%nod2D)], [a%nl, a%nod2D])
-        a%hnode = a%area * 2.0_MP
+        a%area  = [(real(i, MP)*1.5_MP, i=1, a%nod2D)]
+        a%hnode = reshape([(real(i, MP)*3.0_MP, i=1, a%nl*a%nod2D)], [a%nl, a%nod2D])
         a%ssh_stiff%rowptr = [(i, i=1, a%nod2D+1)]
         a%ssh_stiff%values = [(real(i, MP)*3.0_MP, i=1, 13)]
 
@@ -106,6 +106,10 @@ contains
         allocate(a%com_nod2D%rlist(4), a%com_nod2D%slist(2))
         a%com_nod2D%rlist = [10, 11, 12, 13]
         a%com_nod2D%slist = [20, 21]
+        a%eXDim_nod2D = 1; a%dist_format = 1
+        a%com_edge2D%rPEnum = 1; a%com_edge2D%rptr(1:2) = [1, 3]
+        allocate(a%com_edge2D%rlist(2), a%com_edge2D%slist(0))
+        a%com_edge2D%rlist = [5, 7]
 
         u = scratch_write_open(); write(u, iostat=ios) a; close(u)
         u = scratch_read_open();  read(u,  iostat=ios) b; close(u)
@@ -120,6 +124,9 @@ contains
         if (any(b%com_nod2D%rptr(1:3) /= a%com_nod2D%rptr(1:3))) call fail('partit com rptr')
         if (any(b%com_nod2D%rlist /= a%com_nod2D%rlist)) call fail('partit com rlist')
         if (any(b%com_nod2D%slist /= a%com_nod2D%slist)) call fail('partit com slist')
+        if (b%eXDim_nod2D /= a%eXDim_nod2D .or. b%dist_format /= a%dist_format) &
+            call fail('partit eXDim_nod2D/dist_format')
+        if (any(b%com_edge2D%rlist /= a%com_edge2D%rlist)) call fail('partit com_edge2D rlist')
     end subroutine
 
     subroutine test_dyn()
@@ -128,6 +135,8 @@ contains
         integer, parameter :: ne = 5, nn = 7, nl = 4
         a%opt_visc = 7; a%momadv_opt = 2; a%AB_order = 2
         a%visc_gamma0 = 0.025_WP
+        ! the w split parameters, all NON-default (type defaults .false. / 0.5 / 1.0)
+        a%use_wsplit = .true.; a%wsplit_mincfl = 0.3_WP; a%wsplit_maxcfl = 0.8_WP
         allocate(a%uv(2, nl-1, ne), a%uv_rhsAB(2, nl-1, ne, 2))
         allocate(a%uvnode(2, nl-1, nn), a%w(nl, nn))
         allocate(a%eta_n(nn), a%ssh_rhs(nn))
@@ -147,6 +156,9 @@ contains
 
         if (b%opt_visc /= a%opt_visc .or. b%momadv_opt /= a%momadv_opt) call fail('dyn config ints')
         if (b%visc_gamma0 /= a%visc_gamma0) call fail('dyn visc_gamma0')
+        if (b%use_wsplit .neqv. a%use_wsplit) call fail('dyn use_wsplit')
+        if (b%wsplit_mincfl /= a%wsplit_mincfl) call fail('dyn wsplit_mincfl')
+        if (b%wsplit_maxcfl /= a%wsplit_maxcfl) call fail('dyn wsplit_maxcfl')
         if (maxval(abs(b%uv - a%uv)) /= 0.0_WP) call fail('dyn uv')
         if (maxval(abs(b%uv_rhsAB - a%uv_rhsAB)) /= 0.0_WP) call fail('dyn uv_rhsAB (4D)')
         if (maxval(abs(b%uvnode - a%uvnode)) /= 0.0_WP) call fail('dyn uvnode')
@@ -164,14 +176,13 @@ contains
         allocate(a%data(2))
         allocate(a%data(1)%values(nl-1, nn), a%data(2)%values(nl-1, nn))
         allocate(a%data(2)%valuesold(nl-1, nn, 2))
-        allocate(a%work%del_ttf(nl-1, nn), a%work%nboundary_lay(nn))
+        allocate(a%work%del_ttf(nl-1, nn))
         a%data(1)%ID = 1; a%data(1)%tra_adv_hor = 'MUSCL'; a%data(1)%tra_adv_lim = 'FCT'
         a%data(2)%ID = 2; a%data(2)%tra_adv_ver = 'QR4C'
         a%data(1)%values = reshape([(real(i, WP)*0.4_WP, i=1, (nl-1)*nn)], [nl-1, nn])
         a%data(2)%values = a%data(1)%values * (-1.0_WP)
         a%data(2)%valuesold = reshape([(real(i, WP)*0.05_WP, i=1, (nl-1)*nn*2)], [nl-1, nn, 2])
         a%work%del_ttf = a%data(1)%values + 100.0_WP
-        a%work%nboundary_lay = [(i, i=1, nn)]
 
         u = scratch_write_open(); write(u, iostat=ios) a; close(u)
         u = scratch_read_open();  read(u,  iostat=ios) b; close(u)
@@ -184,7 +195,6 @@ contains
         if (maxval(abs(b%data(1)%values - a%data(1)%values)) /= 0.0_WP) call fail('tracer data(1)%values')
         if (maxval(abs(b%data(2)%valuesold - a%data(2)%valuesold)) /= 0.0_WP) call fail('tracer data(2)%valuesold (3D)')
         if (maxval(abs(b%work%del_ttf - a%work%del_ttf)) /= 0.0_MP) call fail('tracer work%del_ttf')
-        if (any(b%work%nboundary_lay /= a%work%nboundary_lay)) call fail('tracer work%nboundary_lay')
     end subroutine
 
     subroutine test_ice()

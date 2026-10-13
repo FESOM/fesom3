@@ -6,7 +6,7 @@ module oce_adv_tra_fct
     ! adf_v by the o_init_zero=.false. HO kernel calls) so that adding them to the
     ! low-order solution `lo` does not create new extrema. Steps (FESOM2 labels):
     !   a1  per-node max/min of (lo, ttf)                         -> fct_ttf_max/min
-    !   a2  per-element admissible bounds over its 3 nodes        -> AUX(1:2,nz,elem)
+    !   a2  per-element admissible bounds over its 4 vertex slots -> AUX(1:2,nz,elem)
     !       (layers at/below the element bottom set to -/+bignumber: unconstrained)
     !   a3  cluster (node + vertical nz-1:nz+1) bounds            -> tvert_max/min
     !       then admissible increment w.r.t. lo                   -> fct_ttf_max/min
@@ -25,9 +25,10 @@ module oce_adv_tra_fct
     !    a3 only reads AUX(:,nz,elem) for nz in [ulevels_nod2D(n), nlevels_nod2D(n)-1];
     !    with ulevels==1 everywhere (no cavity) every read entry is written first, so
     !    the (uninitialised) initial AUX values never reach a result. On a CAVITY mesh
-    !    a node can read AUX(:,nz,elem) at nz < ulevels(elem) (unwritten) -> FESOM2
-    !    reads stale edge_up_dn_grad there; reproducing that bit-for-bit is impossible
-    !    with a fresh array, so this path must be re-gated on a cavity mesh (M2+).
+    !    a node could read AUX(:,nz,elem) at nz < ulevels(elem) (unwritten) -> FESOM2
+    !    read stale edge_up_dn_grad there. FIXED (FESOM2 d8dcdfb): the a2 loop now pads
+    !    ABOVE the cavity too, so every entry a3 can reach is written. Bit-unchanged
+    !    without a cavity; the cavity path still wants a gate on a cavity mesh (M2+).
     !  - exchange_nod(fct_plus,fct_minus) (FESOM2 b2->b3) is a no-op at 1 rank, dropped.
     !  - dmax1/dmin1 -> generic max/min: identical IEEE result on real(WP=8) at the
     !    anchor, and portable to a single-precision build.
@@ -35,7 +36,7 @@ module oce_adv_tra_fct
     ! Runtime divisors areasvol / hnode_new (b2) match FESOM2 because both codes divide
     ! by byte-identical operands (geom-proven areasvol; gated hnode_new); cf. LESSONS L7.
     use mod_precision,   only: WP
-    use mod_mesh,        only: t_mesh
+    use mod_mesh,        only: t_mesh, MAX_NV
     use mod_partit,      only: t_partit
     use mod_part_bounds, only: owned_bounds, is_multirank
     use mod_halo,        only: exchange_nod
@@ -63,7 +64,7 @@ contains
         real(kind=WP), intent(inout) :: fct_minus(mesh%nl-1, mesh%nod2D)
         type(t_partit), intent(in), optional :: partit
 
-        integer :: n, nz, elem, enodes(3), el(2), nl1, nl2, nu1, nu2, nl12, nu12, edge
+        integer :: n, nz, elem, enodes(MAX_NV), el(2), nl1, nl2, nu1, nu2, nl12, nu12, edge
         real(kind=WP) :: flux, ae
         real(kind=WP), allocatable :: tvert_max(:,:), tvert_min(:,:), AUX(:,:,:)
         real(kind=WP) :: flux_eps=1e-16
@@ -92,12 +93,25 @@ contains
         !     at/below the element bottom (nz>=nlevels(elem)-1) are set to -/+bignumber
         !     so a shallow element does not constrain a deeper node's bounds.
         do elem=1, nElemO
-            enodes = mesh%elem2D_nodes(1:3, elem)
+            enodes = mesh%elem2D_nodes(:, elem)   ! a triangle's slot 4 repeats slot 1 (no effect on max/min)
             nu1 = mesh%ulevels(elem)
             nl1 = mesh%nlevels(elem)
+            ! FESOM2 d8dcdfb: pad ABOVE a cavity element as well as below it. a3 reads
+            ! AUX at nz in [ulevels_nod2D(n), nlevels_nod2D(n)-1], which on a cavity mesh
+            ! reaches nz < ulevels(elem) -- never written, so an UNINITIALISED value used
+            ! to enter the max/min reduction (first-timestep NaNs upstream; AUX is a fresh
+            ! local allocatable here, so it is uninitialised rather than stale). Neutral
+            ! fill, same convention as the below-bottom pad. Zero iterations without a
+            ! cavity, so core2/pi are bit-unchanged.
+            do nz=1, nu1-1
+                AUX(1,nz,elem)=-bignumber
+                AUX(2,nz,elem)= bignumber
+            end do
             do nz=nu1, nl1-1
-                AUX(1,nz,elem)=max(fct_ttf_max(nz,enodes(1)), fct_ttf_max(nz,enodes(2)), fct_ttf_max(nz,enodes(3)))
-                AUX(2,nz,elem)=min(fct_ttf_min(nz,enodes(1)), fct_ttf_min(nz,enodes(2)), fct_ttf_min(nz,enodes(3)))
+                AUX(1,nz,elem)=max(fct_ttf_max(nz,enodes(1)), fct_ttf_max(nz,enodes(2)), fct_ttf_max(nz,enodes(3)), &
+                                   fct_ttf_max(nz,enodes(4)))
+                AUX(2,nz,elem)=min(fct_ttf_min(nz,enodes(1)), fct_ttf_min(nz,enodes(2)), fct_ttf_min(nz,enodes(3)), &
+                                   fct_ttf_min(nz,enodes(4)))
             end do
             if (nl1<=mesh%nl-1) then
                 do nz=nl1, mesh%nl-1
@@ -167,7 +181,7 @@ contains
             nu1=mesh%ulevels(el(1))
             nl2=0
             nu2=0
-            if (el(2)>0) then
+            if (el(2)/=el(1)) then
                 nl2=mesh%nlevels(el(2))-1
                 nu2=mesh%ulevels(el(2))
             end if
@@ -188,9 +202,9 @@ contains
             nu1=mesh%ulevels_nod2D(n)
             nl1=mesh%nlevels_nod2D(n)
             do nz=nu1, nl1-1
-                flux=fct_plus(nz,n)*dt/mesh%areasvol(nz,n)/mesh%hnode_new(nz,n)+flux_eps
+                flux=fct_plus(nz,n)*dt/mesh%areasvol(n)/mesh%hnode_new(nz,n)+flux_eps
                 fct_plus(nz,n)=min(1.0_WP,fct_ttf_max(nz,n)/flux)
-                flux=fct_minus(nz,n)*dt/mesh%areasvol(nz,n)/mesh%hnode_new(nz,n)-flux_eps
+                flux=fct_minus(nz,n)*dt/mesh%areasvol(n)/mesh%hnode_new(nz,n)-flux_eps
                 fct_minus(nz,n)=min(1.0_WP,fct_ttf_min(nz,n)/flux)
             end do
         end do
@@ -240,7 +254,7 @@ contains
             nl1=mesh%nlevels(el(1))-1
             nl2=0
             nu2=0
-            if(el(2)>0) then
+            if(el(2)/=el(1)) then
                 nu2=mesh%ulevels(el(2))
                 nl2=mesh%nlevels(el(2))-1
             end if

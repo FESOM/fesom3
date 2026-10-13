@@ -92,9 +92,35 @@ module mod_param_phys
     real(kind=WP) :: epsilon = 0.1_WP              ! oce_modules.F90:92 AB2 offset (shadows intrinsic, faithful)
 
     ! --- N2 smoothing (oce_modules.F90:104-106) ---
-    logical       :: N2smth_v    = .false.
+    ! FESOM2's N2smth_v (a thickness-weighted 1-2-1 vertical filter on N^2) is NOT ported:
+    ! it defaulted .false., was never switched on by any driver, and N2_splines supersedes
+    ! it -- a spline RECONSTRUCTS the derivative at the interface where the schemes need it,
+    ! where the filter only smeared the two-point estimate over neighbouring levels.
     logical       :: N2smth_h    = .true.
     integer       :: N2smth_hidx = 1
+
+    ! --- vertical shear reconstruction (oce_vert_spline) ---
+    ! .false. = two-point difference of uvnode across the level pair, the historical form
+    !           (bit-identical for PP and KPP's ri_iwmix).
+    ! .true.  = cubic-spline d(uvnode)/dz evaluated AT the interface depth -- FESOM's
+    !           analogue of ROMS RI_SPLINES. Restores the order of accuracy that the
+    !           two-point form loses where the grid stretches (core2: dz 10 m -> 250 m).
+    logical       :: shear_splines = .false.
+    ! .true. = N^2 from the same cubic spline: N2 = g*(beta*dS/dx - alpha*dT/dx) at the
+    !          interface, x = depth, alpha/beta (McDougall 1987, the sw_alpha_beta
+    !          polynomial GM/Redi already uses for sigma_xy) at the spline-interpolated
+    !          interface T,S. The chain rule IS the exact derivative of rho(T(z),S(z),p)
+    !          at fixed p; the two-point difference is the approximation to it. Pair with
+    !          shear_splines so Ri and the neutral slope divide like by like.
+    logical       :: N2_splines    = .false.
+    ! Upwind blending of the face relative-vorticity reconstruction in the vector-
+    ! invariant momentum advection (momadv_opt==1, oce_dyn_vinv). Range [0,1]:
+    !   0 = the plain 3-vertex average (bit-identical default; no upwind code executes)
+    !   1 = fully upwind: the face value comes from the 1-2 inflow neighbours, weighted
+    !       by inflow strength (d+|d| normalised).
+    ! Energy-neutral for ANY value (u.[(f+zeta) x u] == 0 identically); acts on the
+    ! vorticity/enstrophy dynamics only. VALUE-based env FESOM3_RVO_UPWIND.
+    real(kind=WP) :: rvo_upwind    = 0.0_WP
 
     ! --- &tracer_phys: PP background diffusivity + mo_convect enhancements ---
     ! Members of the FESOM2 &tracer_phys namelist group (oce_modules.F90 cites below)
@@ -108,7 +134,14 @@ module mod_param_phys
     real(kind=WP) :: momix_lat     = -50.0_WP      ! oce_modules.F90:147 apply mo where lat<momix_lat
     real(kind=WP) :: momix_kv      = 0.01_WP       ! oce_modules.F90:148 mixing within MO length
     logical       :: use_instabmix = .true.        ! oce_modules.F90:152 convective adjustment
-    real(kind=WP) :: instabmix_kv  = 0.1_WP        ! oce_modules.F90:153 Kv/Av floor where N^2<0
+    real(kind=WP) :: instabmix_kv  = 0.1_WP        ! oce_modules.F90:153 convective Kv/Av amplitude
+    ! Width of the convective ramp (= ROMS lmd_bvfcon). MUST be negative: the convective
+    ! enhancement ramps 0 -> instabmix_kv as N^2 falls from 0 to instabmix_n2ref, and
+    ! saturates below it (see oce_mo_conv). ROMS uses -2.0e-5 in an LMD/KPP model where the
+    ! boundary-layer scheme already handles convection; mo_convect is the ONLY convection
+    ! treatment under PP, so the default here is narrower, chosen so that an ordinary ocean
+    ! instability (N^2 ~ -1e-6) is treated in full rather than at <1% of instabmix_kv.
+    real(kind=WP) :: instabmix_n2ref = -1.0e-6_WP  ! [s^-2] convective ramp width
     logical       :: use_windmix   = .false.       ! oce_modules.F90:156 enhanced near-surface wind mixing
     real(kind=WP) :: windmix_kv    = 1.0e-3_WP     ! oce_modules.F90:157
     integer       :: windmix_nl    = 2             ! oce_modules.F90:158 # near-surface levels

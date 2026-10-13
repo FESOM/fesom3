@@ -1,0 +1,43 @@
+Bottom implementation for FESOM3
+September 10, 2026
+
+1 Introduction
+
+In FESOM2, the bottom depth is defined at elements (triangles), but the elevation is at vertices. The drawback of this representation is that a scalar cell has its bottom at several levels. This complicates the implementation of surface and bottom exchange processes (i. e. ice sheets or resuspension of sediments). It is therefore desirable to have a model with the bottom specified at vertices and related to scalar control volumes.
+
+The implication of this scheme is that velocities touching topography should be set to zero.
+
+2 Implementation
+
+We used levels, but it would be perhaps more sound to switch to layers, as in most cases we are using them, and are subtracting one from the number of levels.
+
+We introduce tlayer and blayer. They are vertex arrays describing the position of the top and bottom water layers for each vertex column. They are determined based on the depth data in the code, or computed outside and supplied with mesh files. In addition, we introduce hnode with the thickness (vertical size) of all scalar cells. Thicknesses at elements or edges of the mesh are enslaved to nodal thicknesses. Three nodes of mesh triangle may have different depths in this scheme. This means that a full triangular prisms will exist only between tlayer_elem=max(tlayer(elnodes) and blayer_elem=min(blayer(elnodes), where elnodes are the vertices of triangle. Triangular prisms outside these layers will be partly occupied with land. Velocities in such prisms will be located at land corners and should be therefore set to zero. One should take care about this. As a result, a cycle over velocities is limited only to full prisms.
+
+A cycle over edges should be limited to layers between tlayer_edge=max(tlayer(ednodes)) and ulayer_edge=min(blayer(ednodes)), where ednodes are the vertices of edge.
+
+We can introduce helem and hedge for convenience, but their entries are always related to hnode, and can be calculated in an elementary way. This should be decided.
+
+3 Other mesh modification
+
+Horizontal areas of scalar volumes do not change with depth, the array is area(1:myDim+eDim). While areas of triangular prisms may vary with depth, we are not interested in the prisms that include land, as velocity is zero there and they do not contribute. Therefore, the array elem_area remains without changes.
+
+In FESOM2, the array edge_dxdy was stored in radian measure. We will store it now in physical measure, using mean cosine of two elements on both sides of the edge (or one element if the second is not available). In addition, we introduce the array edge_len storing the length of edges in meters.
+
+The name of array edge_tri will be replaced by edge_elem. In contrast to FESOM2, in the cases when the second element is absent, we put the first one instead of zero. Simultaneously, we will ensure that edge_cross_dxdy(3:4,edge)=0.0 for boundary edges. This will allow to eliminate multiple if-statements. However, this will require that in the code in instances such as
+
+el=edge_elem(:,edge)
+U_rhs(nz,el)=...
+
+the second line is replaced by the explicit cycle.
+
+The array of element neighbors is filled using the same agreement: missing neighbors for boundary elements are substituted by the element itself, with a similar requirement for coding. This will be automatically offering no-slip treatment where needed.
+
+4 Other modifications compared to FESOM2
+
+- Bottom drag will be applied at the bottom of the last full cell, i.e. at the bottom of blayer_elem.
+
+- In the assembly of the stiffness matrix, the vertical integration is over elements, which means that the thickness will be from the top of tlayer_elem to the bottom of blayer_elem.
+
+- Scalar cells around boundary vertices will generally have a smaller area (same as in the current FESOM). However, we can artificially increase their area, thinking that they are full quasi-hexagonal cells that intrude into the land. This will reduce vertical velocities at such locations. Effectively, this presents a simple way to implement the bottom assuming that the lateral walls are drawn through the velocity points (the velocities at these points are zero, and need not be considered). This can be delayed for the next step or dropped altogether.
+
+- Horizontal diffusion and Redi implementation: We ignore horizontal diffusion for a while, and we need some adjustments for the Redi part. I will work on them.

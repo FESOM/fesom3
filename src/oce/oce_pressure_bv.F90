@@ -37,10 +37,11 @@ module oce_pressure_bv
     ! initialize the below-bottom entries either) — the CALLER must zero them so the
     ! dump's below-bottom region is a deterministic 0 on both sides of the gate.
     use mod_precision,   only: WP
-    use mod_mesh,        only: t_mesh
+    use mod_mesh,        only: t_mesh, MAX_NV
     use mod_constants,   only: density_0, g, pi
     use mod_config,      only: which_ALE
-    use mod_param_phys,  only: state_equation, N2smth_h, N2smth_v, N2smth_hidx, &
+    use oce_vert_spline, only: spline_eval
+    use mod_param_phys,  only: state_equation, N2smth_h, N2smth_hidx, N2_splines, &
                                scaling_ODM95, ODM95_Scr, ODM95_Sd, scaling_LDD97, &
                                LDD97_c, LDD97_rmin, LDD97_rmax, Fer_GM, Redi, Redi_Ktaper
     use mod_partit,      only: t_partit
@@ -55,7 +56,7 @@ module oce_pressure_bv
 contains
 
     !===========================================================================
-    subroutine pressure_bv(temp, salt, density_ref, mesh, density_m_rho0, hpressure, bvfreq, partit, dbsfc)
+    subroutine pressure_bv(temp, salt, density_ref, mesh, density_m_rho0, hpressure, bvfreq, partit, dbsfc, bvfreq_raw)
         ! temp/salt/density_ref: (nl-1, nod2D) inputs. density_m_rho0: (nl-1, nod2D)
         ! out. hpressure/bvfreq: (nl, nod2D) out (only 1..nzmax used). The caller
         ! pre-zeros the three outputs (see header).
@@ -75,13 +76,21 @@ contains
         real(kind=WP), intent(inout) :: bvfreq(mesh%nl, mesh%nod2D)
         type(t_partit), intent(in), optional :: partit
         real(kind=WP), intent(inout), optional :: dbsfc(mesh%nl, mesh%nod2D)
+        ! M?: optional copy of N^2 BEFORE the horizontal smoother, for consumers whose
+        ! answer depends on the true local sign (mo_convect). Absent -> nothing written.
+        real(kind=WP), intent(inout), optional :: bvfreq_raw(mesh%nl, mesh%nod2D)
 
         integer       :: node, nz, nzmax, nzmin
         integer       :: nNodO, nNodL, nEdgeO, nElemO
         real(kind=WP) :: zmean, dz_inv, a, rho_up, rho_dn, t, s, smin
         real(kind=WP) :: bulk_up, bulk_dn, rho_surf
         real(kind=WP) :: rhopot(mesh%nl), bulk_0(mesh%nl), bulk_pz(mesh%nl)
-        real(kind=WP) :: bulk_pz2(mesh%nl), rho(mesh%nl), bv1(mesh%nl), dbsfc1(mesh%nl)
+        real(kind=WP) :: bulk_pz2(mesh%nl), rho(mesh%nl), dbsfc1(mesh%nl)
+        ! N2_splines scratch (one column)
+        integer       :: n_sp, k_sp
+        real(kind=WP) :: alpha_sp, beta_sp
+        real(kind=WP) :: xc_sp(mesh%nl), xi_sp(mesh%nl), tc_sp(mesh%nl), sc_sp(mesh%nl)
+        real(kind=WP) :: ti_sp(mesh%nl), si_sp(mesh%nl), dt_sp(mesh%nl), ds_sp(mesh%nl)
 
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
 
@@ -190,25 +199,59 @@ contains
                 bvfreq(nz,node)  = -g*dz_inv*(rho_up-rho_dn)/density_0
             end do
 
+            !___________________________________________________________________
+            ! N2_splines: overwrite the interior levels with the spline form
+            !     N2 = g*(beta*dS/dx - alpha*dT/dx),   x = depth (increasing downward)
+            ! evaluated AT the interface zbar (the two-point form above is centred on the
+            ! midpoint of the two layer centres, which on this stretched grid sits up to
+            ! ~17% of the local dz away from the interface). There is no single rho(z)
+            ! column to spline -- each interface re-references both parcels to its own
+            ! zmean -- so the derivative is taken through the chain rule with alpha/beta at
+            ! the interface state. Sign check: T decreasing with depth -> dT/dx<0 -> N2>0.
+            ! Same natural cubic spline as the shear (oce_vert_spline), for like-by-like
+            ! ratios downstream. Columns with a single layer have no interior level.
+            if (N2_splines) then
+                n_sp = nzmax - nzmin
+                if (n_sp >= 2) then
+                    do k_sp = 1, n_sp
+                        xc_sp(k_sp) = -mesh%Z_3d_n(nzmin+k_sp-1, node)
+                        tc_sp(k_sp) =  temp(nzmin+k_sp-1, node)
+                        sc_sp(k_sp) =  salt(nzmin+k_sp-1, node)
+                    end do
+                    do k_sp = 1, n_sp-1
+                        xi_sp(k_sp) = -mesh%zbar_3d_n(nzmin+k_sp, node)
+                    end do
+                    call spline_eval(n_sp, xc_sp(1:n_sp), tc_sp(1:n_sp), xi_sp(1:n_sp-1), ti_sp(1:n_sp-1), dt_sp(1:n_sp-1))
+                    call spline_eval(n_sp, xc_sp(1:n_sp), sc_sp(1:n_sp), xi_sp(1:n_sp-1), si_sp(1:n_sp-1), ds_sp(1:n_sp-1))
+                    do k_sp = 1, n_sp-1
+                        call sw_alpha_beta_point(ti_sp(k_sp), si_sp(k_sp), xi_sp(k_sp), alpha_sp, beta_sp)
+                        bvfreq(nzmin+k_sp, node) = g*(beta_sp*ds_sp(k_sp) - alpha_sp*dt_sp(k_sp))
+                    end do
+                end if
+            end if
+
             bvfreq(nzmin,node)=bvfreq(nzmin+1,node)
             bvfreq(nzmax,node)=bvfreq(nzmax-1,node)
-
-            !___________________________________________________________________
-            ! optional vertical N^2 smoothing (pinned .false. on the gate)
-            if (N2smth_v) then
-                do nz=nzmin+1,nzmax-1
-                    bv1(nz)=        (mesh%zbar_3d_n(nz-1,node)-mesh%zbar_3d_n(nz,  node))*(bvfreq(nz-1,node)+bvfreq(nz,  node))
-                    bv1(nz)=bv1(nz)+(mesh%zbar_3d_n(nz,  node)-mesh%zbar_3d_n(nz+1,node))*(bvfreq(nz,  node)+bvfreq(nz+1,node))
-                    bv1(nz)=0.5_WP*bv1(nz)/(mesh%zbar_3d_n(nz-1,node)-mesh%zbar_3d_n(nz+1,  node))
-                end do
-                do nz=nzmin+1,nzmax-1
-                    bvfreq(nz,node)=bv1(nz)
-                end do
-            end if
         end do
 
         !_______________________________________________________________________
-        ! apply horizontal smoothing of the N^2 buoyancy frequency
+        ! hand out the UNSMOOTHED N^2 first -- smooth_nod overwrites bvfreq in place, and
+        ! its 1/3-own + 2/3-neighbour stencil can flip the SIGN of N^2 near convection,
+        ! which is exactly what a static-instability test must not see.
+        ! BOUNDED BY nNodL, NOT a whole-array assignment: the dummy is declared with the
+        ! GLOBAL mesh%nod2D while the MR drivers allocate (nl, nNodL) with nNodL =
+        ! myDim+eDim. The over-declared dummy is only a view, safe as long as every access
+        ! stays inside nNodL like the rest of this routine -- `bvfreq_raw = bvfreq` did not,
+        ! and wrote nl*nod2D elements into an nl*nNodL array (heap corruption at 512 ranks,
+        ! invisible at np=1 where nNodL == nod2D).
+        if (present(bvfreq_raw)) then
+            do node = 1, nNodL
+                bvfreq_raw(:, node) = bvfreq(:, node)
+            end do
+        end if
+
+        ! apply horizontal smoothing of the N^2 buoyancy frequency (GM/Redi + the
+        ! mixing schemes consume this smoothed field)
         if (N2smth_h) call smooth_nod(bvfreq, N2smth_hidx, mesh, partit)
 
     end subroutine pressure_bv
@@ -271,9 +314,13 @@ contains
     subroutine smooth_nod(arr, N_smooth, mesh, partit)
         ! Mass-matrix horizontal smoother, transcribed from FESOM2 g_support
         ! smooth_nod3D (gen_support.F90:99-198): applies the lumped P1 mass matrix
-        ! N_smooth times. M2.12c: optional partit -> owned-node loops + the per-sweep
-        ! exchange_nod(arr) (the patch accumulation reads arr at an owned node's owned-
-        ! element nodes, which can be halo nodes, so arr must be halo-valid each sweep).
+        ! N_smooth times. Hybrid meshes: node value = the kite-share-weighted mean
+        ! (elem_area*nod_in_elem2D_w) of the kite-weighted element means (elem_w) of the
+        ! wet elements around the node -- FESOM2's sum(A*(a1+a2+a3))/(3*sum(A)) on
+        ! triangles (weights 1/3), equal to roundoff. M2.12c: optional partit ->
+        ! owned-node loops + the per-sweep exchange_nod(arr) (the patch accumulation
+        ! reads arr at an owned node's owned-element nodes, which can be halo nodes, so
+        ! arr must be halo-valid each sweep).
         ! Per-level patch areas vary with the bathymetry (a deep node's shallower
         ! neighbour elements drop out level by level). elem_area is geom-proven; the
         ! nod_in_elem2D / elem2D_nodes order is area-gate-proven (L9).
@@ -283,6 +330,7 @@ contains
         type(t_partit), intent(in), optional :: partit
         integer :: n, q, el, nz, j, nlev, uln, nln, ule, nle
         integer :: nNodO, nNodL, nEdgeO, nElemO
+        real(kind=WP) :: wa
         real(kind=WP), allocatable :: vol(:,:), work_array(:,:)
 
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
@@ -297,17 +345,16 @@ contains
             work_array(1:nln,n) = 0._WP
             do j=1, mesh%nod_in_elem2D_num(n)
                 el  = mesh%nod_in_elem2D(j,n)
+                wa  = mesh%elem_area(el)*mesh%nod_in_elem2D_w(j,n)
                 ule = max( uln, mesh%ulevels(el) )
                 nle = min( nln, min(nlev, mesh%nlevels(el)) )
                 do nz=ule, nle
-                    vol(nz,n) = vol(nz,n) + mesh%elem_area(el)
-                    work_array(nz,n) = work_array(nz,n) + mesh%elem_area(el) * (arr(nz, mesh%elem2D_nodes(1,el)) &
-                                                                              + arr(nz, mesh%elem2D_nodes(2,el)) &
-                                                                              + arr(nz, mesh%elem2D_nodes(3,el)))
+                    vol(nz,n) = vol(nz,n) + wa
+                    work_array(nz,n) = work_array(nz,n) + wa * elem_mean(nz, el)
                 end do
             end do
             do nz=uln,nln
-                vol(nz,n) = 1._WP / (3._WP * vol(nz,n))  ! inverse, scaled by 1/3
+                vol(nz,n) = 1._WP / vol(nz,n)  ! inverse
             end do
         end do
         do n=1, nNodO
@@ -327,12 +374,11 @@ contains
                 work_array(1:nln,n) = 0._WP
                 do j=1, mesh%nod_in_elem2D_num(n)
                     el  = mesh%nod_in_elem2D(j,n)
+                    wa  = mesh%elem_area(el)*mesh%nod_in_elem2D_w(j,n)
                     ule = max( uln, mesh%ulevels(el) )
                     nle = min( nln, min(nlev, mesh%nlevels(el)) )
                     do nz=ule, nle
-                        work_array(nz,n) = work_array(nz,n) + mesh%elem_area(el) * (arr(nz, mesh%elem2D_nodes(1,el)) &
-                                                                                  + arr(nz, mesh%elem2D_nodes(2,el)) &
-                                                                                  + arr(nz, mesh%elem2D_nodes(3,el)))
+                        work_array(nz,n) = work_array(nz,n) + wa * elem_mean(nz, el)
                     end do
                 end do
             end do
@@ -347,6 +393,17 @@ contains
         end do
 
         deallocate(vol, work_array)
+
+    contains
+        pure real(kind=WP) function elem_mean(nz, el)
+            ! kite-weighted element mean of arr at level nz (4 slots; a triangle's slot 4
+            ! has weight 0)
+            integer, intent(in) :: nz, el
+            elem_mean = mesh%elem_w(1,el)*arr(nz, mesh%elem2D_nodes(1,el)) &
+                      + mesh%elem_w(2,el)*arr(nz, mesh%elem2D_nodes(2,el)) &
+                      + mesh%elem_w(3,el)*arr(nz, mesh%elem2D_nodes(3,el)) &
+                      + mesh%elem_w(4,el)*arr(nz, mesh%elem2D_nodes(4,el))
+        end function elem_mean
     end subroutine smooth_nod
 
     !===========================================================================
@@ -442,39 +499,56 @@ contains
             nzmin = mesh%ulevels_nod2D(n)
             nzmax = mesh%nlevels_nod2D(n)
             do nz = nzmin, nzmax-1
-                t1 = temp(nz,n)*1.00024_WP
-                s1 = salt(nz,n)
-                p1 = abs(mesh%Z_3d_n(nz,n))
-                t1_2 = t1*t1; t1_3 = t1_2*t1; t1_4 = t1_3*t1
-                p1_2 = p1*p1; p1_3 = p1_2*p1
-                s35  = s1-35.0_WP; s35_2 = s35*s35
-                sw_beta(nz,n) = 0.785567e-3_WP - 0.301985e-5_WP*t1 &
-                     + 0.555579e-7_WP*t1_2 - 0.415613e-9_WP*t1_3 &
-                     + s35*(-0.356603e-6_WP + 0.788212e-8_WP*t1 &
-                     + 0.408195e-10_WP*p1 - 0.602281e-15_WP*p1_2) &
-                     + s35_2*(0.515032e-8_WP) &
-                     + p1*(-0.121555e-7_WP + 0.192867e-9_WP*t1 - 0.213127e-11_WP*t1_2) &
-                     + p1_2*(0.176621e-12_WP - 0.175379e-14_WP*t1) &
-                     + p1_3*(0.121551e-17_WP)
-                a_over_b = 0.665157e-1_WP + 0.170907e-1_WP*t1 &
-                     - 0.203814e-3_WP*t1_2 + 0.298357e-5_WP*t1_3 &
-                     - 0.255019e-7_WP*t1_4 &
-                     + s35*(0.378110e-2_WP - 0.846960e-4_WP*t1 &
-                     - 0.164759e-6_WP*p1 - 0.251520e-11_WP*p1_2) &
-                     + s35_2*(-0.678662e-5_WP) &
-                     + p1*(0.380374e-4_WP - 0.933746e-6_WP*t1 + 0.791325e-8_WP*t1_2) &
-                     + p1_2*t1_2*(0.512857e-12_WP) &
-                     - p1_3*(0.302285e-13_WP)
-                sw_alpha(nz,n) = a_over_b*sw_beta(nz,n)
+                call sw_alpha_beta_point(temp(nz,n), salt(nz,n), abs(mesh%Z_3d_n(nz,n)), &
+                                         sw_alpha(nz,n), sw_beta(nz,n))
             end do
         end do
     end subroutine sw_alpha_beta
 
     !===========================================================================
+    pure subroutine sw_alpha_beta_point(t, s, p, alpha, beta)
+        ! One (T, S, p) -> (alpha, beta). McDougall 1987, the polynomial sw_alpha_beta
+        ! used inline before it was factored out here; the N2_splines path calls it at the
+        ! INTERFACE state (spline-interpolated T,S, p = interface depth) so that the vertical
+        ! density gradient is linearised exactly the way compute_sigma_xy linearises the
+        ! horizontal one -- the neutral slope then divides like by like.
+        ! t in ITS-90 degC (the 1.00024 IPTS-68 factor is applied here), s in psu, p in db
+        ! (= depth in m, as the callers pass |Z|).
+        real(kind=WP), intent(in)  :: t, s, p
+        real(kind=WP), intent(out) :: alpha, beta
+        real(kind=WP) :: t1, t1_2, t1_3, t1_4, p1, p1_2, p1_3, s35, s35_2, a_over_b
+        t1 = t*1.00024_WP
+        p1 = p
+        t1_2 = t1*t1; t1_3 = t1_2*t1; t1_4 = t1_3*t1
+        p1_2 = p1*p1; p1_3 = p1_2*p1
+        s35  = s-35.0_WP; s35_2 = s35*s35
+        beta = 0.785567e-3_WP - 0.301985e-5_WP*t1 &
+             + 0.555579e-7_WP*t1_2 - 0.415613e-9_WP*t1_3 &
+             + s35*(-0.356603e-6_WP + 0.788212e-8_WP*t1 &
+             + 0.408195e-10_WP*p1 - 0.602281e-15_WP*p1_2) &
+             + s35_2*(0.515032e-8_WP) &
+             + p1*(-0.121555e-7_WP + 0.192867e-9_WP*t1 - 0.213127e-11_WP*t1_2) &
+             + p1_2*(0.176621e-12_WP - 0.175379e-14_WP*t1) &
+             + p1_3*(0.121551e-17_WP)
+        a_over_b = 0.665157e-1_WP + 0.170907e-1_WP*t1 &
+             - 0.203814e-3_WP*t1_2 + 0.298357e-5_WP*t1_3 &
+             - 0.255019e-7_WP*t1_4 &
+             + s35*(0.378110e-2_WP - 0.846960e-4_WP*t1 &
+             - 0.164759e-6_WP*p1 - 0.251520e-11_WP*p1_2) &
+             + s35_2*(-0.678662e-5_WP) &
+             + p1*(0.380374e-4_WP - 0.933746e-6_WP*t1 + 0.791325e-8_WP*t1_2) &
+             + p1_2*t1_2*(0.512857e-12_WP) &
+             - p1_3*(0.302285e-13_WP)
+        alpha = a_over_b*beta
+    end subroutine sw_alpha_beta_point
+
+    !===========================================================================
     subroutine compute_sigma_xy(temp, salt, sw_alpha, sw_beta, mesh, sigma_xy, partit)
         ! Density gradient sigma_xy (FESOM2 oce_ale_pressure_bv.F90:2851). Per owned node:
-        ! accumulate element T/S gradients (gradient_sca) x elem_area over nod_in_elem2D,
-        ! then sigma_xy(1/2) = (-sw_alpha*Tgrad + sw_beta*Sgrad)/vol*density_0. The /vol is
+        ! accumulate element T/S gradients (gradient_sca, 4 slots) x the node's kite share
+        ! elem_area*nod_in_elem2D_w over nod_in_elem2D (vol = the sum of the wet shares; on
+        ! triangles FESOM2's elem_area weighting, both scaled by 1/3), then
+        ! sigma_xy(1/2) = (-sw_alpha*Tgrad + sw_beta*Sgrad)/vol*density_0. The /vol is
         ! an array divide -> SIMD-divide trap (L29): gate then NOVECTOR if codegen vectorizes.
         ! The owned-node element neighbourhood is complete (M2.12a invariant) -> loop owned +
         ! exchange (oracle uses the 3x MPI_BARRIER aux dance; the rank-3 exchange_nod is the
@@ -484,7 +558,8 @@ contains
         real(kind=WP), intent(in)    :: sw_alpha(mesh%nl-1, mesh%nod2D), sw_beta(mesh%nl-1, mesh%nod2D)
         real(kind=WP), intent(inout) :: sigma_xy(2, mesh%nl-1, mesh%nod2D)
         type(t_partit), intent(in), optional :: partit
-        integer       :: n, nz, k, el, nln, uln, nle, ule, nNodO, nNodL, nEdgeO, nElemO
+        integer       :: n, nz, k, el, nln, uln, nle, ule, nNodO, nNodL, nEdgeO, nElemO, en(MAX_NV)
+        real(kind=WP) :: wa
         real(kind=WP) :: tx(mesh%nl-1), ty(mesh%nl-1), sx(mesh%nl-1), sy(mesh%nl-1), vol(mesh%nl-1)
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
         do n = 1, nNodO
@@ -497,20 +572,18 @@ contains
                 el  = mesh%nod_in_elem2D(k, n)
                 nle = mesh%nlevels(el)-1
                 ule = mesh%ulevels(el)
+                wa  = mesh%elem_area(el)*mesh%nod_in_elem2D_w(k, n)   ! kite share of el at n
+                en  = mesh%elem2D_nodes(:, el)
                 do nz = ule, nle
-                    vol(nz) = vol(nz) + mesh%elem_area(el)
-                    tx(nz) = tx(nz) + (mesh%gradient_sca(1,el)*temp(nz,mesh%elem2D_nodes(1,el)) &
-                                     + mesh%gradient_sca(2,el)*temp(nz,mesh%elem2D_nodes(2,el)) &
-                                     + mesh%gradient_sca(3,el)*temp(nz,mesh%elem2D_nodes(3,el)))*mesh%elem_area(el)
-                    ty(nz) = ty(nz) + (mesh%gradient_sca(4,el)*temp(nz,mesh%elem2D_nodes(1,el)) &
-                                     + mesh%gradient_sca(5,el)*temp(nz,mesh%elem2D_nodes(2,el)) &
-                                     + mesh%gradient_sca(6,el)*temp(nz,mesh%elem2D_nodes(3,el)))*mesh%elem_area(el)
-                    sx(nz) = sx(nz) + (mesh%gradient_sca(1,el)*salt(nz,mesh%elem2D_nodes(1,el)) &
-                                     + mesh%gradient_sca(2,el)*salt(nz,mesh%elem2D_nodes(2,el)) &
-                                     + mesh%gradient_sca(3,el)*salt(nz,mesh%elem2D_nodes(3,el)))*mesh%elem_area(el)
-                    sy(nz) = sy(nz) + (mesh%gradient_sca(4,el)*salt(nz,mesh%elem2D_nodes(1,el)) &
-                                     + mesh%gradient_sca(5,el)*salt(nz,mesh%elem2D_nodes(2,el)) &
-                                     + mesh%gradient_sca(6,el)*salt(nz,mesh%elem2D_nodes(3,el)))*mesh%elem_area(el)
+                    vol(nz) = vol(nz) + wa
+                    tx(nz) = tx(nz) + (mesh%gradient_sca(1,el)*temp(nz,en(1)) + mesh%gradient_sca(2,el)*temp(nz,en(2)) &
+                                     + mesh%gradient_sca(3,el)*temp(nz,en(3)) + mesh%gradient_sca(4,el)*temp(nz,en(4)))*wa
+                    ty(nz) = ty(nz) + (mesh%gradient_sca(5,el)*temp(nz,en(1)) + mesh%gradient_sca(6,el)*temp(nz,en(2)) &
+                                     + mesh%gradient_sca(7,el)*temp(nz,en(3)) + mesh%gradient_sca(8,el)*temp(nz,en(4)))*wa
+                    sx(nz) = sx(nz) + (mesh%gradient_sca(1,el)*salt(nz,en(1)) + mesh%gradient_sca(2,el)*salt(nz,en(2)) &
+                                     + mesh%gradient_sca(3,el)*salt(nz,en(3)) + mesh%gradient_sca(4,el)*salt(nz,en(4)))*wa
+                    sy(nz) = sy(nz) + (mesh%gradient_sca(5,el)*salt(nz,en(1)) + mesh%gradient_sca(6,el)*salt(nz,en(2)) &
+                                     + mesh%gradient_sca(7,el)*salt(nz,en(3)) + mesh%gradient_sca(8,el)*salt(nz,en(4)))*wa
                 end do
             end do
             sigma_xy(1,uln:nln,n) = (-sw_alpha(uln:nln,n)*tx(uln:nln)+sw_beta(uln:nln,n)*sx(uln:nln))/vol(uln:nln)*density_0

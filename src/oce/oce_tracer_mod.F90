@@ -9,9 +9,10 @@ module oce_tracer_mod
     !        AB2: valuesAB = -(0.5+eps)*valuesold(1) + (1.5+eps)*values
     !        AB3: valuesAB = (5*valuesold(2) - 16*valuesold(1) + 23*values)/12
     !   3. rolls the history valuesold
-    !   4. rebuilds the MUSCL up/downwind edge gradient edge_up_dn_grad, from the
-    !      ELEMENTAL gradient of `values` (NOT valuesAB — FESOM2 commented the AB
-    !      variant out at oce_tracer_mod.F90:126-127; see LESSONS L11).
+    !   4. rebuilds the ELEMENTAL gradient of `values` (NOT valuesAB — FESOM2 commented
+    !      the AB variant out at oce_tracer_mod.F90:126-127; see LESSONS L11), from which
+    !      the MUSCL kernels take the up/downwind reconstruction on the fly (FESOM2
+    !      stores a per-edge array edge_up_dn_grad instead).
     !
     ! The AB2 offset `eps` is FESOM2's o_PARAM `epsilon = 0.1` (oce_modules.F90:92),
     ! a runtime module VARIABLE there (not a parameter). It is kept non-parameter here
@@ -22,8 +23,8 @@ module oce_tracer_mod
     ! SCOPE / clean-architecture deviations (D7, "USE-globals -> explicit args"):
     !  * 1-rank only (myDim_* == global). FESOM2's halo exchanges of tr_xy / tr_z and
     !    the begin/end overlap are no-ops at 1 rank and are dropped; multi-rank is M1.5.
-    !  * tr_xy (FESOM2 o_ARRAYS global) is a local scratch here, passed explicitly to
-    !    fill_up_dn_grad. The redundant SECOND tracer_gradient_elements(values) call
+    !  * tr_xy (FESOM2 o_ARRAYS global) is twork%tr_xy here (also reused by the
+    !    horizontal diffusion of the same tracer). The redundant SECOND tracer_gradient_elements(values) call
     !    (FESOM2 line 142, "redefine to current timestep") is omitted: `values` is
     !    unchanged across init_tracers_AB, so it recomputes the identical tr_xy.
     !  * tracer_gradient_z -> tr_z (FESOM2 line 131) is omitted: tr_z is the vertical
@@ -37,7 +38,6 @@ module oce_tracer_mod
     use mod_part_bounds,  only: owned_bounds, is_multirank
     use mod_halo,         only: exchange_elem_full
     use oce_tracer_grad,  only: tracer_gradient_elements
-    use oce_muscl_adv,    only: fill_up_dn_grad
     implicit none
     private
     public :: init_tracers_AB
@@ -48,15 +48,15 @@ contains
         ! M2.12b: optional partit. The del_ttf zero / AB interpolation / history roll
         ! run over OWNED+HALO nodes (values/valuesold are halo-consistent so valuesAB is
         ! valid at the halo the HO kernels read). tr_xy is built on OWNED elements then
-        ! exchanged over the FULL element halo (FESOM2 init_tracers_AB:128-132) before
-        ! fill_up_dn_grad reads it at the halo elements of a halo node's element list.
+        ! exchanged over the FULL element halo (FESOM2 init_tracers_AB:128-132): the MUSCL
+        ! kernels read it at the up/downwind elements of owned edges (halo elements of a halo node's
+        ! element list.
         integer,        intent(in)    :: tr_num
         type(t_mesh),   intent(in)    :: mesh
         type(t_tracer), intent(inout) :: tracers
         type(t_partit), intent(in), optional :: partit
         integer :: n, nz
         integer :: nNodO, nNodL, nEdgeO, nElemO, nElemA
-        real(kind=WP), allocatable :: tr_xy(:,:,:)
 
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
 
@@ -98,17 +98,20 @@ contains
             end do
         end if
 
-        ! rebuild the MUSCL up/downwind edge gradient from grad(values). tr_xy spans
-        ! the FULL element halo at multi-rank so fill_up_dn_grad can read it at the halo
-        ! elements reached through a halo node's element list.
+        ! elemental gradient of values over the FULL element halo: the MUSCL kernels take
+        ! the up/downwind reconstruction from it on the fly (the reference RK3 rule, no
+        ! stored per-edge array), and the horizontal diffusion / Redi of this tracer reuses
+        ! it (solve_tracers_ale). Persistent scratch, allocated on first use. Zeroed once:
+        ! tracer_gradient_elements writes only wet levels, and the dry ones are never read.
         nElemA = mesh%elem2D
         if (is_multirank(partit)) &
             nElemA = partit%myDim_elem2D + partit%eDim_elem2D + partit%eXDim_elem2D
-        allocate(tr_xy(2, mesh%nl-1, nElemA))
-        call tracer_gradient_elements(tracers%data(tr_num)%values, tr_xy, mesh, partit)
-        if (is_multirank(partit)) call exchange_elem_full(tr_xy, partit)
-        call fill_up_dn_grad(tracers%work, tr_xy, mesh, partit)
-        deallocate(tr_xy)
+        if (.not. allocated(tracers%work%tr_xy)) then
+            allocate(tracers%work%tr_xy(2, mesh%nl-1, nElemA))
+            tracers%work%tr_xy = 0.0_WP
+        end if
+        call tracer_gradient_elements(tracers%data(tr_num)%values, tracers%work%tr_xy, mesh, partit)
+        if (is_multirank(partit)) call exchange_elem_full(tracers%work%tr_xy, partit)
     end subroutine init_tracers_AB
 
 end module oce_tracer_mod

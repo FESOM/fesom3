@@ -291,11 +291,11 @@ Unlike M1.1–M1.3 (the shim INLINED the orchestration), M1.4 drives FESOM2's OW
   scalar constant in a SUM is usually fold-safe, but the only proof is the oracle gate.
 
 - **pi runs `use_wsplit=.true.`; the gate must FORCE `.false.` on both sides.** With w-split on,
-  the FCT path calls `adv_tra_vert_impl` (implicit vertical, NOT ported until M2) + recomputes the
-  LO vertical on full `w`. Forcing `dynamics%use_wsplit=.false.` in the shim (= the FESOM3 `t_dyn`
-  default) gates the matched EXPLICIT path (`w==w_e`, both passed the single prescribed wvel). Do
-  not gate against the production `.true.` setting — it would hit an unported kernel / the FESOM3
-  `error stop` guard. The implicit w-split path is a separate M2 gate.
+  the FCT path calls `adv_tra_vert_impl` (implicit vertical, not ported until 2026-10-02 — L58) +
+  recomputes the LO vertical on full `w`. Forcing `dynamics%use_wsplit=.false.` in the shim (= the
+  FESOM3 `t_dyn` default) gates the matched EXPLICIT path (`w==w_e`, both passed the single
+  prescribed wvel). Do not gate against the production `.true.` setting — at the time it would have
+  hit the unported kernel's FESOM3 `error stop` guard. The implicit w-split path is a separate gate.
 
 - **Non-FCT (`do_zero_flux`) + per-tracer order knobs closed in the same gate.** A second config
   on tracer 1 (MUSCL/QR4C/NON, ph=pv=0.75) exercises the `do_zero_flux=.true.` dispatch (HO scheme
@@ -926,8 +926,8 @@ kernel reads the PREVIOUS kernel's output, not a prescribed input — and gates 
   thickness-redistribution branch is taken (hnode/helem/zbar_3d_n/Z_3d_n fixed), only `exchange_elem(helem)` —
   a 1-rank no-op. The `hnode` THICKNESS dump equals the init value on both sides.
 - **`use_wsplit=.false.` is FORCED (M1.4 precedent).** `do_oce_adv_tra`'s `use_wsplit=.true.` path needs the FCT
-  implicit vertical-advection correction `adv_tra_vert_impl` (a distinct unported kernel; guarded with an explicit
-  `error stop`). With `.false.` the explicit/implicit split is trivial (`w_e=w`, `w_i=0`) AFTER `vert_vel_ale`, but
+  implicit vertical-advection correction `adv_tra_vert_impl` (a distinct kernel, unported until 2026-10-02 — L58 —
+  and until then guarded with an explicit `error stop`). With `.false.` the explicit/implicit split is trivial (`w_e=w`, `w_i=0`) AFTER `vert_vel_ale`, but
   `impl_vert_visc_ale` runs BEFORE `compute_Wvel_split` so it still consumes the PRESCRIBED `w_i` ≠ 0 (vertical
   momentum advection IS exercised). The w-split itself is gated at M2.7. Porting `adv_tra_vert_impl` +
   `use_wsplit=.true.` is a scoped follow-up.
@@ -1500,7 +1500,7 @@ free-running × many-steps*, and it immediately exposed two latent bugs the sing
   single-copy mechanism for large messages; on levante it falls back to **KNEM** (CMA needs ptrace, blocked by
   `kernel.yama.ptrace_scope=3`), and KNEM here CORRUPTS messages above the eager limit. Proof: same binary, same
   buffers — under `--mca btl self,tcp` `total-diff=0`; under `--mca btl_vader_single_copy_mechanism none` (forces the
-  copy-in/copy-out two-copy path) `total-diff=0`; only default `vader`+KNEM corrupts. **Fix:** `env.sh` exports
+  copy-in/copy-out two-copy path) `total-diff=0`; only default `vader`+KNEM corrupts. (Mechanism found in L61: the knem registration cache misses glibc heap trims -> stale pages.) **Fix:** `env.sh` exports
   `OMPI_MCA_btl_vader_single_copy_mechanism=none` (levante branch) → the CORE2 dist_2 free-running lifecycle is
   `max|Δ|=0` (195 records), with no 1-rank/pi regression (ctest 13/13, step gates 65/65 `=0`). RULED OUT (correctly, in
   the end): eXDim halo ordering (`myList_elem2D` is read VERBATIM from the same `my_list*.out` as FESOM2 — identical
@@ -2244,3 +2244,632 @@ The transferable lessons:
   speed confirmation waits for `compute`.
 - **The permanent `mod_timer` breakdown (L-infra) is what made this legible** — it localizes the gap to one
   component and is directly comparable to F2's `rtime_*` (after the unit conversion).
+
+## L53 — Bottom at vertices: the min∘max asymmetry that decided the bathymetry, the "pure alias" that was a wetness guard, and the regression net that was a step counter
+
+**Context.** Moving the bottom from elements to vertices (`nlevels(e) = min` over the element's
+vertex columns, `elvls.out` no longer read). Four things bit, and the first three are the kind that
+look settled until you measure them.
+
+**1. `min ∘ max` and `min ∘ min` are not two flavours of the same choice.** The element reduction is
+fixed at `min` by the physics — velocity must vanish at a land corner — so it is not negotiable.
+That makes `blayer = max over adjacent elvls` compose as `min ∘ max`, a morphological **closing**
+where the dilation and erosion cancel; and `blayer = min over adjacent elvls` compose as `min ∘ min`,
+a **double erosion** with nothing to undo it. Measured on core2: `+0.38 %` volume, 0 stagnant cells
+versus `-9.27 %` volume, 3966 nodes whose deepest cell has no wet adjacent element and can only
+exchange vertically. The "conservative" option was the destructive one. **Always compose the two
+reductions on paper before picking the vertex rule, and measure both on the real mesh.**
+
+**2. "It becomes a pure alias" is a claim about values, so measure it.** `nlevels_nod2D_min` looked
+like it would collapse onto `nlevels_nod2D` under the vertex bottom — both mean "the range where the
+cell is a full prism", surely. On pi they differ by **mean -4.0 levels, min -30, at 88% of nodes**.
+Worse, at `oce_muscl_adv.F90:303` the array is not a range at all but the **only wetness guard** on
+```fortran
+edge_up_dn_grad(1:2,nz,edge) = tr_xy(1, nz, edge_up_dn_tri(:,edge))
+```
+which has no wetness test of its own and reads `tr_xy` — an `intent(out)` array written only over
+`ulevels(elem)..nlevels(elem)-1`, so uninitialised heap below an element's bottom. Substituting the
+node column would have read past the up/downwind triangles' bottoms on ~85% of pi's interior edges.
+**Before retiring an array as redundant, grep its consumers for the one that is using it as a guard
+rather than as a bound.**
+
+**3. A latent inequality flipped and took `helem` with it.** `update_thickness_ale` rebuilt `helem`
+one layer short of the element's bottom, which was safe because `nlevels_nod2D_min(n) <= nlevels(e)`
+meant no node ever stretched that layer. The vertex bottom reverses it to
+`nlevels(e) <= nlevels_nod2D(n)`, so the deepest layer *is* stretched at the element's deeper nodes
+while `helem` stays frozen — silently putting the SSH/continuity budget and the tracer volume out of
+agreement under zstar. **When a scheme inverts a producer, enumerate the inequalities that held
+between the old and new quantities; the loop bounds that quietly relied on them are the bugs.**
+
+**4. The regression net was a step counter.** `fesom_analytic` was written into the plan as "the
+single most valuable free check" — flat-bottom, so bit-identical across the change. It runs no
+physics: `model_step` is `model%nsteps_done = model%nsteps_done + 1` (`mod_step_oce`'s real step is
+`model_ocean_step`, which that driver never calls). Five tasks were going to gate on it. **Open the
+driver and read its step function before calling anything a regression net.**
+
+**What replaced it.** A conservation gate (`tools/run_conserve_pi.sh`) built and baselined *before*
+any behaviour changed, checking total heat/salt content plus three invariants per step. Building it
+first is what made every later task measurable — and it earned its keep immediately: reverting just
+the `helem` loop bound reproduces
+`helem VIOLATED elem 1 nz 18 helem/mean= 6.0000000000000000E+01 6.0000195317207513E+01`.
+
+**5. A gate that never runs the code path proves nothing — check the feature flags.** The
+`tr_xynodes` denominator was the one change flagged as a physics judgement, yet every gate run
+against it had `Redi = .false.`: `diff_ver_part_redi_expl` is its only caller, it is guarded by
+`if (Redi)` (`oce_ale_tracer.F90:225`), and the driver inherited the `.false.` default because it
+was derived from a *reduced-config* lifecycle driver that had no GM/Redi knobs. Zero coverage, and
+nothing failed to say so. **After building a gate, list the `if (feature)` guards around the code
+you changed and confirm the gate actually turns them on.**
+
+And when it did run: conservation still could not tell right from wrong, because the Redi tendency
+is a telescoping flux divergence (`del_ttf += (vd_flux(nz)-vd_flux(nz+1))*dt/areasvol`) that
+conserves for *any* `tr_xynodes`. The discriminating test is a value test, not a budget test — feed
+a constant element gradient and require the node average to return it: wet-area `4.4e-16`, `areasvol`
+off by `8.6e-01`. **A conservative operator launders a wrong coefficient; budget checks cannot see
+inside one.**
+
+**And one thing that is not a trap.** `linfs` drifts `-2.2e-04` in heat over 20 unforced pi steps
+and that is correct behaviour, not a leak: the linear free surface freezes `hnode`, so the surface
+vertical advective flux `-w*T*area` at `nzmin` (`oce_adv_tra_ver.F90:66`) is a real source/sink with
+no thickness change to balance it. The drift is non-monotone — a free-surface adjustment transient.
+Gate conservation on **zstar** (round-off, `~1e-15`) and run `linfs` for the invariants only.
+
+## L54 — A ported scheme with no oracle needs an EXACT analytic test, not a plausible one
+
+`momadv_opt==1` (vector-invariant momentum advection, `oce_dyn_vinv`) has **no FESOM2
+oracle**: the v2.7.3 branch exists but aborts with *"not adapted mom_adv advection typ for
+ALE"*, and the only implementation (`/home/a/a270029/qq/oce_vinv_mom_adv.F90`) is pre-ALE
+research code that was never tested upstream. So the usual byte-gate is unavailable and
+correctness has to be designed in.
+
+What worked, and what did not:
+
+- **A tautology is worse than no test.** The first design gated on
+  `u . [(f+zeta) x u] == 0`. That is identically — in fact *bitwise* — zero for ANY value
+  of `zeta`, because `(f+zeta)*zhat x u` is perpendicular to `u` by construction. It would
+  have reported `0.0` forever and manufactured confidence. Before trusting an invariant,
+  check it can actually FAIL.
+- **An exact analytic case is worth more than a global budget.** `u = alpha*y` on a
+  `cartesian=.true.` mesh gives `zeta == -alpha` to relative 5e-13 over 81729 node-levels.
+  That one case pins the magnitude, the sign, AND the `area(nz,n) -> area(n)` deviation,
+  because `zeta = circulation/area` only reproduces `-alpha` if `area(n)` equals the sum of
+  `elem_area/3` over the node's WET adjacent elements.
+- **Build analytic fields in `coord_nod2D`, not `geo_coord_nod2D`.** Meshes are read with
+  `force_rotation=.true.`, so the geometry (`elem_area`, `edge_cross_dxdy`, element
+  centres) lives in the ROTATED frame. A field linear in geographic latitude is not linear
+  there; the test failed worst at the rotated pole (mean `zeta/(-alpha)` = 0.836) and the
+  cause looked like a metric bug in the operator for some time.
+- **`cartesian=.true.` is a legitimate unit-test device.** It sets `elem_cos = 1` AND
+  `ay = 1` in `compute_elem_area`, so the metric stays self-consistent and the median-dual
+  contour closes; the discrete curl then becomes exact for a linear field. On the spherical
+  metric `edge_cross_dxdy(1:2)` carries `elem_cos(el1)` and `(3:4)` carries
+  `elem_cos(el2)` at the same edge midpoint, so no exactness assertion is possible.
+- **Design the test so the known bug fails it.** `qq` sets `uvert(nl1+1) = 0`, which under
+  bottom-at-vertices leaves a spurious bottom tendency (`nlevels(e)` is the `min` over the
+  element's nodes, while `vert_vel_ale` zeroes `Wvel` only at `nlevels_nod2D(n)`). The
+  originally planned test — "`w == 0` gives zero contribution" — is blind to it, since
+  every vertical term is proportional to `w`. The test that sees it is **uniform `u` with
+  NONZERO `w`**: 5.4e-2 relative with `qq`'s bottom face, 2.6e-16 with the fix.
+
+## L55 — Element-local geometry beats per-edge arrays at MR; per-rank invariants beat global tallies
+
+Three lessons from the rvo_upwind face-vorticity blend (`oce_dyn_vinv`):
+
+- **Per-edge geometry is owned-edges-only** (`edge_dxdy`/`edge_cross_dxdy`/`edge_len` over
+  `nEdgeO`), and an owned element can carry ONE halo edge — so an element-wise consumer of
+  per-edge geometry breaks at MR. The safe pattern: rebuild edge vectors from the element's
+  OWN vertices (`coord_nod2D` + `trim_cyclic` + its `elem_cos`), and take neighbour VALUES
+  through `exchange_elem`-filled element fields rather than neighbour vertex lists
+  (`elem2D_nodes` is owned-only). Bonus: the inward normal oriented "toward the third
+  vertex" needs no edge_tri left/right convention at all, and `test_vinv` V10 PROVES it
+  geometrically (neighbour centroid on the outward side, same metre metric — a positive
+  diagonal rescaling does not preserve dot-product signs, so never mix metrics in such a
+  test).
+- **FESOM element ownership OVERLAPS at partition seams** (`myDim` elements = elements
+  touching an owned node), so summing per-owned-element counts across ranks double-counts
+  boundary-strip items (pi dist_2: 6 boundary edges counted twice). Write per-rank
+  invariants; a cross-rank tally mismatch there is NOT a bug. A ground-truth probe against
+  the global mesh files settles such alarms in minutes — run it before redesigning.
+- **A stencil-widening feature moves "interior" one ring inward in constant-field tests.**
+  The blend reads the NEIGHBOURS' vertex vorticity, so constant-zeta inertness holds only
+  where the element AND its neighbours avoid boundary nodes (`elem_int2`). The V9 failures
+  at 0.89 relative were the mask, not the physics.
+
+## L56 — The two element halo rings: eDim is the EDGE-sharing ring, eXDim the node-only ring; a receiver-side reading of the halo code raised a false seam alarm that the sender-side definition plus a 2/8-rank probe settled
+
+**Context.** Revalidating `6e38cf6` (rvo_upwind), reading only our side of the halo
+machinery: `exchange_elem` fills `com_elem2D` (the eDim block) and never the eXDim block;
+`build_elem_adjacency` stores whatever `edge_tri` holds, which can be a halo id; the one
+test that walks neighbours (V11) skips every halo neighbour as "no local data". From that
+alone the inference was: an owned element's far neighbour across its halo edge may be
+eXDim, `omega_e(nz,nb)` stays at its initialised 0 there, the blend silently treats that
+neighbour as zero vorticity, and results depend on the partition at seams. No bounds error
+would ever fire (the array spans `nElemF`), so nothing in the suite could see it.
+
+**What settled it.** The DEFINITION of the rings lives in the partitioner, not in the
+receiver: FESOM2 `gen_comm.F90` builds `com_elem2D` as the non-owned elements "only those
+sharing an edge" with an owned element, and `com_elem2D_full` as "all neighbors" (sharing
+a node). So an edge-neighbour of an owned element is in eDim *by construction*; an eXDim
+element is never across an edge. A probe at np=2 and np=8 (now permanent as `test_vinv`
+A5): 17–35 halo-neighbour slots per rank, every one inside the eDim ring, every one
+holding its owner's value after one standard `exchange_elem`. No defect. Switching to
+`exchange_elem_full` "to be safe" would have bought nothing except larger receive lists
+on every momentum step.
+
+**Lessons.**
+- **Choose the exchange by the stencil, not by fear.** Element across an EDGE
+  (`elem_neighbors`, `edge_tri`) → `exchange_elem`. All elements around a NODE
+  (`nod_in_elem2D` patches, MUSCL's `tmp` field) → `exchange_elem_full`. The ring names
+  are not "near/far"; they are "edge/node".
+- **A halo alarm from the receiver's code alone is a hypothesis, not a finding.** The
+  sender-side definition (partitioner) is the ground truth; read it before changing the
+  exchange. Same move as L55's global-mesh probe, and again it took minutes.
+- **A blind test does not justify changing production — it justifies a test.** V11 was
+  blind by design; A5 reuses the exact production pattern (owned fill → one
+  `exchange_elem` → read at every `elem_neighbors` id) with a sentinel, and PRINTS the
+  number of slots that pass only because the exchange filled them. That printed count is
+  the test's teeth; at npes>1 it must be >0 on every rank, which A5 asserts.
+- **A guard built on partition metadata must handle the serial identity partition
+  explicitly.** In a test that never calls `set_partition`, `partit%myDim_elem2D` is 0 and
+  `myList_elem2D` is unallocated at npes==1; the first A5 draft crashed serially for
+  exactly that reason while passing at np=2/8.
+
+## L57 — An implicit operator inherits the FORM of the explicit scheme it completes: flux form for a flux-form scheme, advective form for a vector-invariant one — the split `w_i` was silently the wrong one
+
+**Context.** `use_wsplit` moves the part of `w` above the vertical CFL limit into the
+momentum TDMA (`impl_vert_visc_ale`), transcribed from FESOM2 in upwind FLUX form:
+`a += min(0,wu)·zinv, b += max(0,wu)·zinv − min(0,wd)·zinv, c −= max(0,wd)·zinv`, row
+sums `(wu − wd)·zinv`. Applied to a uniform `u` that is `−u·∂w_i/∂z`. The scalar scheme
+is flux form everywhere, so the piece is balanced by the horizontal `u·∇·u` through
+continuity. The vector-invariant scheme is advective form everywhere (`ζ×u + ∇KE`;
+Block C builds `w_e ∂u/∂z` as `δ(w_e u) − u δw_e`), and nothing balances the implicit
+`u ∂w_i/∂z`: wherever the split is active, a uniform column with divergent `w_i` is
+accelerated — O(1) relative to the vertical advection there, invisible everywhere else,
+and invisible in every production driver because they all pin `use_wsplit=.false.`.
+
+**The fix is a row-sum correction, not a new operator.** Subtract `(wu − wd)·zinv` from
+the diagonal (the bottom row drops `wd`, so there `wu·zinv`): the operator becomes the
+upwind ADVECTIVE form with the inflow-face velocity, row sums vanish, constants are
+preserved implicitly, diagonal dominance is kept, and the Thomas sweep is unchanged.
+Gated on `momadv_opt == 1`, so the FESOM2-pinned path is structurally untouched.
+
+**Lessons.**
+- **Check the row sums.** Flux form ⇔ row sums `= δw·zinv`; advective form ⇔ row sums
+  `= 0`. That one line of algebra tells which form an implicit operator is, faster than
+  reading its stencil. A uniform-`u` test with divergent `w_i` is the executable version.
+- **Operator splitting must split one operator.** Explicit `w_e` part and implicit `w_i`
+  part only add up to the scheme if both have the same form. When a new explicit scheme
+  is dropped in (momadv_opt=1), every implicit completion it relies on (here the TDMA)
+  must be re-derived, not inherited.
+- **Pin both branches with closed forms.** A single-face `w_i` gives exact per-column
+  solutions for BOTH forms (I3/I4); the flux-form closed form is the regression pin that
+  the untouched path really is untouched, which the gate on `momadv_opt==2` alone
+  cannot say (it only sees conservation).
+- **Run the gate config before claiming the gate.** The planned `wsplit` conserve
+  configs (with a split-face count so they could not be vacuous) died before the first
+  step: `use_wsplit=.true.` error-stops in `do_oce_adv_tra` because the tracer-side
+  `adv_tra_vert_impl` is unported. The momentum fix is therefore pinned at unit level
+  only (I1-I4) and is dormant in every driver; the end-to-end gate belongs to the
+  `adv_tra_vert_impl` port, and the driver hook was reverted rather than left as a
+  knob that always aborts. (Superseded 2026-10-02: `adv_tra_vert_impl` is ported, the
+  hook is back as `FESOM3_WSPLIT`, and the `wsplit` / `momadv-vinv-wsplit` gate configs
+  run — L58.)
+
+## L58 — "Smooth vs hard" CFL switching is ONE parameter, not two schemes; the FCT low-order explicit/implicit upwind pair is EXACTLY split-invariant, so a smoothness test needs operators that differ at first order; the constancy test is the consistency proof of an operator split; and a cold-start gate needs a MEASURED cap or it is vacuous
+
+**Context.** `use_wsplit` (FESOM2 `compute_Wvel_split`) sends the part of `w` above a
+vertical Courant cap to the implicit upwind solves (momentum TDMA, tracer-diffusion TDMA,
+FCT `adv_tra_vert_impl`). FESOM2's split is a hard switch (`w_e = w·C/CFL_z` above
+`C = wsplit_maxcfl`): `d(w_e)/d(CFL_z)` jumps from 1 to 0 at `C`, so a face oscillating
+around the threshold flips between high-order explicit and partly first-order implicit
+treatment. The port (`docs/plans/completed/2026-10-02-wsplit-smooth.md`, commits
+431e3e7..bf73965) replaced it by Shchepetkin's (2015, Ocean Modelling 91, Sec. 3.1) C¹
+limiting function `oce_wsplit::wsplit_implicit_fraction(Cu, Cu_min, Cu_max)` — `f = 0`
+below `Cu_min`, the bend `x²/(F + x²)` with `x = Cu − Cu_min`, `F = 4·Cu_max·(Cu_max −
+Cu_min)`, and `f = (Cu − Cu_max)/Cu` above `Cu_cut = 2·Cu_max − Cu_min` — and ported the
+one missing consumer, the FCT `adv_tra_vert_impl`, so `use_wsplit=.true.` runs end to end
+for the first time (L57's dormant momentum correction is live). There is no FESOM2 oracle
+for the smooth split; the tests are the specification (L54).
+
+**What settled it.**
+- *One parameter.* At `Cu_min = Cu_max`, `F = 0` and `Cu_cut = Cu_max`: the function
+  collapses to FESOM2's switch in exact arithmetic. The hard switch is the corner `(1,1)`
+  of the parameter space, not a second scheme — it needs no mode flag and serves as the
+  positive control of the smoothness test (`test_wsplit` X2). Plumbing the new parameter
+  through the old `dd` branch first (TDD stage 2) failed S1/S2 by 2 ulp / non-bitwise and
+  X1 by 10x — the same numbers the final positive control reproduces.
+- *Split invariance of the LO pair.* Explicit upwind with `w_e` followed by implicit
+  upwind with `w_i` across ONE face leaves the donor cell at
+  `T₂·(h₂ − dt·w_e)/(h₂ − dt·w + dt·w_i) = T₂` and the receiver at `T₁h₁ + dt·w·T₂`, for
+  ANY `f`. The FCT low-order pair therefore has no first-order kink to show: the smoothness
+  test the plan first put there would have passed for the hard switch too (a tautology,
+  L54). The kink is first order only where the explicit and implicit operators differ at
+  first order — the non-FCT path, QR4C (centred) on `w_e` plus the upwind TDMA on `w_i`,
+  where the tendency's derivative with respect to `w` jumps by `J = [UPW − QR4C](T)` for
+  a `T` with curvature. `test_wsplit` X runs there (`Kv = 0`, quadratic `T`, 601-point
+  `Cu` scan): second-difference ratio `max|D2|/(ΔCu·max|D1|)` 0.96 / 1.17 (`w ≷ 0`) for
+  the smooth function, 100.3 / 64.1 for the `(1,1)` control (bound 10), and the control's
+  kink equals the closed form `J = cq·h²·(1+Cu_c)/2` per unit `Cu` to 0.25 %
+  (`D2/(J·ΔCu) = 1.0025`; the factor `(1+Cu_c)` is the explicit pre-advection
+  `T* = T + w_c·P_q T` the TDMA then acts on — the shorthand `cq·h²/2` would have read
+  2.005, and the 0.25 % is the predicted `ΔCu/(1+Cu_c)` curvature of the implicit branch).
+- *The constancy test is the proof.* `hnode_new` is advanced by the FULL `w`; for uniform
+  `T` the explicit LO step with `w_e` gives
+  `T* = T·(1 + dt·δw_i·area/(areasvol·hnode_new))` and the implicit step solves
+  `(hnode_new + dt·δw_i·area/areasvol)·T^{n+1} = hnode_new·T*`, so `T^{n+1} = T` exactly,
+  for any split with `w_e + w_i = w`. One test (`test_wimpl_tra` C2/C2b: ≤ 5.3e-16 for
+  three parameter sets, both signs, non-uniform layers, open surface) pins the split
+  identity, the flux-form coefficients, the unsigned surface row and the `hnode_new`
+  usage at once.
+- *The wiring bug a conservation gate cannot see.* The antidiffusive flux must be
+  `HO(w) − LO(w)`, the LO flux RECOMPUTED on the full `w` after the implicit step;
+  `HO(w) − LO(w_e)` double-counts the `w_i` transport yet still telescopes, so heat and
+  salt conserve to round-off either way. `test_wimpl_tra` C6 calls `do_oce_adv_tra` itself
+  and compares with the test's own assembly from the public parts: bitwise equal at
+  np 1/2, while the wrong assembly differs by 29.9 / 58.8 K·m — exactly the predicted
+  double-counted transport `(−w_i(nz)·T(nz) + w_i(nz+1)·T(nz+1))·area·dt/areasvol` to
+  5e-14 — and the whole step matches a closed form to 1.4e-14 K.
+- *A cap must be measured.* The 20-step pi cold start from rest has max `CFL_z` =
+  2.76e-2 (owned faces above 0.005 / 0.01 / 0.02 / 0.04: 2568 / 499 / 26 / 0). At the
+  default cap 1.0 a `wsplit` conserve config splits NOTHING and would have passed as a
+  no-op; with `FESOM3_WSPLIT_EXPECT_SPLIT` set it exits 1 (the positive control, now the
+  ctest `fesom_conserve_zstar_wsplit_vacuous_np1`; the guard is value-based: ≥ N split
+  faces and ≥ 1 at `f ≥ 0.5`). The gate cap 0.005 (onset 0.0025) gives 8632 split faces,
+  1130 on the capped branch `CFL_z ≥ Cu_cut = 2·maxcfl − mincfl = 0.0075` (where `Cu_e`
+  saturates — NOT at `maxcfl` itself, where a face is still on the bend), 500 at
+  `f ≥ 0.5`, max `f` 0.82; 0.01 would have left 26 faces at `f ≥ 0.5`, a margin a small
+  dynamics shift erases. `fesom_conserve` prints one statistics line for every config
+  with exactly those three counts (`w_i ≠ 0` is by construction the count above
+  `mincfl`, `f ≥ 0.5` the count above `2·maxcfl`; a first version printed both members
+  of each pair and labelled the `> maxcfl` count "the cap" — the review caught it).
+
+**Lessons.**
+- **Before adding a "mode", check whether it is a corner of the parameter space.** The
+  hard switch is `Cu_min = Cu_max`; "smooth vs hard" is one knob. A degenerate corner is a
+  free positive control and needs no flag.
+- **A smoothness (or any sensitivity) test needs operators that differ at FIRST order.**
+  Work out what the kink is proportional to before choosing the path: the obvious pair
+  (the LO explicit/implicit upwind pair) is exactly invariant and would have passed for
+  the broken scheme. Derive the closed-form jump and require the positive control to
+  REPRODUCE it (1.0025·J), not merely to fail the bound.
+- **A free-stream/constancy identity is the consistency proof of an operator split.** It
+  holds for every split that sums to `w` and only with the right `hnode_new`, so it fails
+  on any coefficient, surface-row or thickness mistake. Run it first; a conservation test
+  proves less (column sums alone).
+- **A conservation gate is blind to telescoping wiring bugs.** Assert the ASSEMBLY against
+  an independent assembly from the public parts — bitwise where the parts are the same
+  calls — and make the wrong assembly's difference equal its predicted value.
+- **A gate config that may fire nothing must prove it fired.** Measure the quantity the
+  switch keys on (max `CFL_z` 2.8e-2 here), set the threshold from the measurement with a
+  margin, print the counts, and make an empty count a FAILURE (`EXPECT_SPLIT`).
+- **Tolerance lessons from the review.** (i) Test C⁰ at a joint by evaluating BOTH branch
+  formulas at the joint and requiring agreement (`test_wsplit` W4): a value check of the
+  function alone cannot tell continuity from a lucky branch selection. (ii) At a joint
+  whose closed-form slope is 0 a relative tolerance is meaningless; bound the one-sided
+  difference quotients ABSOLUTELY (`|q| ≤ 2h/F`, W5). (iii) Above the cap `1 − f =
+  Cu_max/Cu` is formed by cancellation, so the error of `Cu·(1−f)` scales as `eps·Cu`,
+  not with ulps of `Cu_max`: the first "4 ulp of `Cu_max`" bound failed at `Cu ≈ 17.5`
+  (measured 1.23 eps·Cu), the error-model bound `4·eps·Cu` passes with a 3x margin (W6).
+
+## L59 — The cost was the RULE, not the storage: keeping FESOM2's node-averaged fallback made the on-the-fly MUSCL barely faster; adopting the reference RK3 rule (triangle gradient or zero) made it ~43 % faster
+
+**Context.** Goal: drop FESOM2's stored per-edge MUSCL gradient `edge_up_dn_grad` as the
+reference RK3 code does (`qq/oce_stepRK3.F90`). First attempt: keep results bit-identical,
+so the Miura node average FESOM2 uses at coasts / bathymetry steps became its own per-node
+array `gnod`. Measured on core2: the first version was ~20 % SLOWER than the stored array;
+after shaping the lookup (one branch per level) and computing `gnod` only where read it was
+~9 % faster. The user then asked for the reference implementation proper: triangle gradient
+where the up/downwind triangle is wet, ZERO increment otherwise -- no node average at all.
+That kernel is ~43 % faster than FESOM2's fill + kernel (np 4: 42 vs 74 ms), and the
+results differ from FESOM2 only at coast/step levels (core2: max |Δflux| 0.4 % of max).
+
+**Lessons.**
+- **Profile what the stored array encodes, not just that it is stored.** The expensive part
+  was the node-averaged fallback (gathers over the node's elements, per edge in FESOM2 /
+  per node in the bit-identical port), not the array itself.
+- **Bit-identity is a choice with a price; state it as one.** Equivalence pinned the old
+  rule's cost into the new code. When the user wants the reference scheme, test it EXACTLY
+  instead: the production kernels must equal the stored-array kernels fed with the new
+  rule's array (bitwise), and must equal FESOM2 bitwise where the two rules coincide, and
+  differ elsewhere (teeth) -- test_muscl_onthefly parts R and S.
+- **pi is too small to decide performance:** the 13 MiB array sits in cache there; core2
+  changed the ranking of the intermediate versions. Time on the production mesh (the test
+  binary takes `FESOM3_MESH_DIR`; run it with `ulimit -s unlimited`).
+- **A bit-identity test on synthesised cavities caught a wrong claim within minutes:**
+  FESOM2's `nl12 = 0` at boundary edges makes segment (D) start at level 1, above a cavity
+  roof (the velocity is 0 there).
+
+## L60 — A "roundoff" regression gate must make the solver converge to roundoff, and a cross-np comparison must start from one common state: the CG tolerance and the IC extrapolation each hid the roundoff behind 1e-4..1e-2 differences
+
+**Context.** Hybrid-mesh plan, Task 7 follow-up. The first triangle regression gate (new
+geometry vs frozen pre-Task-7 binary) could only be 1e-2 after the first SSH solve, and the
+frozen binary itself differed between pi np 1 and np 2 at step 1 (density 4.7e-3).
+
+**Lessons.**
+- **An iterative solver stopped at a relative residual turns roundoff into tolerance-sized
+  noise.** The SSH CG stops at soltol = 1e-5: the SAME binary at 1e-5 vs 1e-14 differs by
+  3.5e-4 in d_eta on pi. Solve both runs to 1e-14 (env `FESOM3_SSH_SOLTOL`, ~3x iterations)
+  and pi steps 1-3 agree to <= 1e-12. Before trusting a "roundoff" gate, run the reference
+  against itself with the tolerance changed: that shows the noise floor the gate can see.
+- **What is left is physics amplifying roundoff, and it is local in time and space.** CORE2
+  T differs by 2e-9 after step 1 only at ice-covered nodes (EVP at rest is stiff); pi jumps at
+  step 4, the first forcing record refresh. Find the event, then tier the gate (early steps
+  tight, later steps / ice / TKE-driven fields at their measured floors) instead of one loose
+  tolerance for everything.
+- **A cold start is not partition-independent when the IC is built by an order-dependent
+  sweep.** FESOM2's `extrap_nod3D` Gauss-Seidel fills land-masked IC points with per-rank halo
+  snapshots, so np 1 and np N start from different T/S at exactly the extrapolated points
+  (pi: 513 (node, level), all of them dummy after the bilinear step). Check the step-0 fields
+  before suspecting halo bugs; compare decompositions from ONE checkpoint (restart at np 1 and
+  np N) -- then np 1/2/8 agree to 1e-14 at step 1.
+
+
+## L61 — Login-node MPI (Open MPI 4.1.2, ob1 + vader + knem) delivered STALE payloads: its knem registration cache misses glibc heap trims (an MPI-library bug, not a halo-code bug)
+
+**Context.** Hybrid-mesh plan, Task 10. `test_vinv` on the NEMO quad cut-out at np 2 failed
+V9b/V11/V12 with garbage-sized errors while np 1, the mixed cut-out and pi passed; a
+bounds-checked build was clean and the failure was deterministic. Per-call logging of
+`core_3D_r` showed every count matching and the sender's buffer correct, yet the receiver got
+the payload of the exchange FOUR calls earlier (the previous KE exchange).
+
+**Root cause (Task 10 follow-up, proven).** `pml ob1` sends a message above 32 KB
+(`btl_vader_rndv_eager_limit`) as a copied 32 KB prefix plus a single-copy RGET of the rest; with
+knem the receiver's kernel copies from a knem region the SENDER registered. vader caches these
+registrations in an rcache keyed by virtual address (`mpi_leave_pinned` = auto -> on, because the
+memory patcher claims hook support) and relies on memory hooks to invalidate them. glibc's
+`free()` shrinks the heap top with `brk` (trim threshold), the next `allocate` re-grows it at the
+SAME virtual address with fresh pages -- and the cache still hands out the old region, whose
+pages knem keeps pinned with the data of the last message sent from there. Right count, correct
+first 32 KB, stale tail. Evidence:
+- `tools/run_mpi_knem_stale_repro.sh` (standalone, `tools/mpi_knem_stale_repro.F90`: contiguous
+  allocatable buffers passed by first element, `MPI_Waitall` before `deallocate`, one message per
+  pair and call): with `MALLOC_TRIM_THRESHOLD_=0 MALLOC_TOP_PAD_=0` 788 of 800 receives are stale
+  under knem; 0 without the trim, 0 with `single_copy_mechanism none` or `emulated`, 0 with knem
+  and `--mca mpi_leave_pinned 0` (no cache), 0 under `pml ucx` (`UCX_TLS` mm,knem / mm,cma,
+  `UCX_RNDV_THRESH=1024`). An explicit `madvise(MADV_DONTNEED)` from user code IS caught (0 stale);
+  strace shows the FESOM test does 45 `brk` and no `madvise` per rank.
+- `test_vinv` nemo025q_cut np 2 under knem: FAILS by default, PASSES (1e-16) with
+  `MALLOC_TRIM_THRESHOLD_=100000000000`, with `--mca mpi_leave_pinned 0`, with `--mca memory
+  ^patcher`, with single-copy `none`/`emulated`, and under `pml ucx` (incl. knem, rndv 1 KB).
+  (`cma` is not offered on Levante: `kernel.yama.ptrace_scope`; the value is ignored -> knem.)
+- The code is clean: every non-blocking call in `src/` is in `mod_halo`'s four cores (contiguous
+  local buffers passed by element, alive until after `MPI_Waitall(nreq, ...)` over exactly the
+  posted requests, no exchange overlaps another, so the shared tag is matched in order). A build
+  with `-check arg_temp_created -warn interfaces` creates NO argument temporary anywhere while
+  running `test_vinv` np 2 and the production driver on pi np 2 and CORE2 np 8.
+
+**Lessons.**
+- **"Right count, payload of an earlier message of the same size" has two classic causes**: a
+  copy-in temporary at a non-blocking call (code) or a stale registration cache (library). Tell
+  them apart with `-check arg_temp_created` and with the transport knobs that disable only the
+  cache (`mpi_leave_pinned 0`, `MALLOC_TRIM_THRESHOLD_` huge) -- a code bug survives those.
+- **Every login-node `mpiexec --mca pml ob1 --mca btl self,vader` run needs
+  `--mca btl_vader_single_copy_mechanism none`** (or `OMPI_MCA_btl_vader_single_copy_mechanism=none`,
+  which `env.sh` has exported since M2.12 for the SAME bug: L35's `tr_xy` "correct for 134656
+  bytes, then garbage" was this stale tail). The ctest launcher (`FESOM3_MPI_LAUNCH_FLAGS`),
+  `tools/run_tri_regression.sh`, `run_conserve_pi.sh` and `run_bottom_audit.sh` pass it
+  explicitly because they run without `env.sh`. `mpi_leave_pinned 0` is an
+  equivalent alternative. It hits ANY point-to-point or collective payload above 32 KB, not only
+  halos; reusing persistent buffers in `mod_halo` would hide it there only.
+- **Batch runs are not affected**: `env.sh`/`env/levante.dkrz.de/shell.intel` select `pml ucx`
+  (vader unused, `btl self`), and UCX's own memory hooks catch the trim (tested intra-node with
+  its knem and cma transports; inter-node IB not testable on a login node).
+- **It hid for months** because whether a buffer lands on trimmed-and-regrown heap pages depends
+  on the allocation history of the whole program (2-D fields, pi np 2 rarely hit it); earlier
+  "transient MPI failures" of login-node ctest runs without `env.sh` may have been this.
+
+
+## L62 — A faithful port of a MATLAB mesh script is only byte-checkable if it keeps MATLAB's precision rules: float32 inputs stay float32 and every single/double mix is computed in single ("single wins")
+
+**Context.** Hybrid-mesh plan, Task 1 (`tools/mesh/nemo_meshq.py`, commit `d4c6f8d`). The MATLAB
+outputs of `nemo_meshq.m` (`nod2d.out`, `elem2d.out`, `depth.out`, saved to
+`/work/ab0995/a270029/meshes/nemo025q/ref_matlab/` before anything could overwrite them) were the
+byte oracle. The NEMO inputs are float32 (`nav_lon/lat/lev`, `glamf/gphif`), int16 (`mbathy`) and int8.
+
+**Lessons.**
+- **Port the arithmetic types, not only the statements.** In MATLAB `single op double` is single, so
+  the `levels` recursion and the f-point corrections run in float32; numpy promotes to float64 and
+  prints different 4th decimals. Emulating "single wins" made `elem2d.out` and `depth.out`
+  byte-identical and left ONE line of `nod2d.out` (node 711389, a fold point: -83.6347 vs -83.6348).
+- **The last ulp of a transcendental function is not portable -- list it, do not chase it.** That
+  line is 1 float32 ulp of `atan2` straddling the print rounding; correctly-rounded cos/atan2/acos
+  variants and double-precision semantics matched WORSE. The test (`tools/mesh/test_nemo_meshq.sh`)
+  allows <= 20 listed coordinate lines differing by <= 1e-4 and requires the rest byte-identical.
+- **Save the oracle first and keep order-dependent loops sequential.** Land removal edits `bathy`
+  while scanning; quad creation and node compaction define the numbering -- vectorising them changes
+  the mesh, not just the speed. Order-independent loops may be vectorised.
+
+
+## L63 — One code path for triangles and quads (4 slots, triangle 4th = 1st) removes every branch only if each USE of the repeated slot is classified: weighted sums and max/min are safe, counts and per-vertex updates are not -- and the boundary convention changes everywhere in one commit
+
+**Context.** Hybrid-mesh plan, Tasks 6-16. Storage: `elem2D_nodes(4,·)` with a triangle repeating
+its 1st vertex; degenerate-slot conventions so that no kernel needs `if (nv == 3)`: gradient slot 4 =
+0, kite weight `elem_w(4)` = 0, a missing neighbour = the element itself, a missing `edge_tri(2)` =
+`edge_tri(1)` with `edge_cross_dxdy(3:4) = 0`, a triangle's side 4 has zero length (normal 0).
+
+**What it took.**
+- **Weighted sums are safe** (slot 4 adds exactly 0: gradients, `elem_w` means, the SSH and ice-TG
+  scatters, `stress2rhs`), **max/min are safe** (the repeated value changes nothing: FCT bounds,
+  `mo_convect`), but **anything that counts or updates per vertex is not**: the ice FCT limiter over 4
+  slots visits vertex 1 twice (mutation check: `test_ice_mass` F5 fails by 0.15-0.25), the IC
+  extrapolation would average vertex 1 twice. Those loops run over `elem2D_nnodes` (Task 16, Task 11).
+- **The boundary tests must change in the SAME commit as the convention** (Task 7): every
+  `el(2) > 0`, `el(i) < 1`, `nb <= 0` in src AND tests became `el(2) /= el(1)` / `nb == el`;
+  half-converted, a boundary edge counts twice. The grep afterwards must find only the convention
+  builders.
+- **A grep for element means (`/3`, `1:3`) does not find node gathers.** FESOM2 writes the node gather
+  as `sum(A_e*x_e)/(3*area)` -- the 1/3 is the triangle kite weight hidden in a `3*` (`UVnode`,
+  `w*du/dz`, `tr_xynodes`, `compute_sigma_xy`, `smooth_nod`, the node area itself). The discovery
+  grep had to look for `3*` and `/(3` too; they became `nod_in_elem2D_w` gathers.
+- **Invariant checks in drivers are formulas too**: `fesom_conserve` asserted `helem == sum(hnode)/3`,
+  wrong on quads once zstar `helem` is the `elem_w` mean (Task 12); the coupling assigned the 4-slot
+  `elem2D_nodes(:,e)` to `elnodes(3)` (shape bug, Task 13).
+
+**How to apply.** For a unified-slot data structure write the per-use rule down (sum / extremum /
+count) and review each loop against it; add a mutation test that runs the "wrong" variant on a quad
+or mixed patch -- the triangle patch alone does not see these bugs.
+
+
+## L64 — When bit-identity is retired, freeze the reference at the last bit-identical commit, and raise a tolerance only after a control run without the amplifier (mEVP for EVP, PP for TKE)
+
+**Context.** Hybrid-mesh plan, Tasks 6-17. From Task 7 on triangle results change at roundoff, so
+the FESOM2 byte gates were retired and `tools/run_tri_regression.sh` compares against a frozen
+binary. Twice a level had to move: CORE2 EARLY 2.1e-9 -> 2.2e-8 when the EVP became 4-slot (Task 15),
+and the cut-out 1-vs-N reached 1e-4 after 5 days with TKE (Task 17).
+
+**Lessons.**
+- **Freeze before you change the arithmetic, and change the reference only by the test knob.**
+  `frozen_task6` = all binaries of `5b2a7f3` (last bit-identical state, proven by every dump and log
+  of pi/CORE2 runs being byte-identical to the previous commit); `frozen_task6_soltol` = the same tree
+  + ONLY the `FESOM3_SSH_SOLTOL` patch, checked byte-identical to `frozen_task6` with the knob unset.
+  Build everything in scratch trees; the user's `build_intel_dp` runs production jobs directly from
+  `bin/` and was never touched.
+- **A tolerance increase needs a control that removes the suspected amplifier.** Same case with mEVP
+  in both runs: CORE2 EARLY 1.1e-15 (vs EVP 2.2e-8) -- the converted ice code is right, the standard
+  EVP (unstable for ice at rest, Task 15) amplifies roundoff that now enters inside each of the 120
+  subcycles. Same case with PP instead of TKE: 1-vs-N <= 1.1e-7 over 5 days (vs 1e-4) -- TKE
+  thresholds switch on roundoff. Only then raise the tier, keeping the same margin (x5 in Task 15).
+- **Keep the per-mesh tolerance table and the measured levels in the gate's header** and update them
+  with each change (`run_tri_regression.sh` header, HANDOFF "Gate migration for hybrid meshes"); a
+  gate whose measured level is not recorded cannot tell a regression from noise.
+
+
+## L65 — An exact null mode passes every consistency test: test the operator's kernel directly -- the Green-Gauss checkerboard is a null mode on EVERY all-quad mesh, not only on parallelograms
+
+**Context.** Hybrid-mesh plan, Task 9 (`test_ssh_stiff` S8) and Task 17. The plan expected an
+"almost exact" checkerboard null mode of the SSH operator on the nearly rectangular ORCA quads.
+
+**What the kernel test showed.** The Green-Gauss coefficient of vertex j is proportional to
+x_{j+1} - x_{j-1}, so c1 = -c3 and c2 = -c4 on ANY quad: the pattern (+1,-1,+1,-1) has zero gradient
+in every quad, and on any 2-colourable all-quad mesh it is an EXACT null mode of the stiffness part
+(|K f|/|K| = 1.8e-16 on the NEMO quad cut-out, not just on the parallelogram patch). Linear-exactness,
+symmetry, row-sum and convergence tests (S1-S7) all pass for such an operator. Only the mass part
+controls the mode. In the 10-day cut-out runs the SSH null mode stayed flat, but the TRACER grid-scale
+energy grew (SST x6, SSS x11-12, faster at quad and interface nodes) -- a design question for the user.
+
+**How to apply.** For every new discrete operator on a new element type, apply it to the candidate
+spurious patterns (checkerboard, stripes, per-element alternation) on a real mesh of that class and
+assert the result, so the property is known and cannot change silently; then measure the same
+patterns in a run (`tools/cutout_diag.py checker`: global 2-colouring projection, per-quad energy,
+linear-exact neighbour residual by node class).
+
+
+## L66 — Exact ingredients do not make an exact scheme on mixed meshes: test the ASSEMBLED node tendency per node class (all-triangle, all-parallelogram, interface, general quad)
+
+**Context.** Hybrid-mesh plan, Tasks 10-11. The plan asked for "linear tracer advected exactly" and
+"exact linear shear" on mixed patches. Every ingredient was exact: element gradients (<= 1.2e-13), the
+MUSCL face values at the edge midpoints on every edge (<= 2.2e-12), the element velocities.
+
+**What happened.** The median-dual edge scheme assembles the node tendency from face values at the
+edge MIDPOINT, while the dual face runs midpoint -> centroid; the errors cancel edge by edge only when
+the dual cell is all triangles (Galerkin-P1 equivalence) or all parallelograms. At triangle-quad
+interface nodes and on general quads the node tendency of a linear tracer in uniform flow has an O(1)
+local relative error (0.22 NEMO-mixed interface, 0.24 jittered patch). Same for the vorticity of a
+linear shear: exact on triangles and parallelograms, 6e-2 (first order) on jittered quads.
+
+**Lessons.**
+- **Split exactness tests by node class** and assert roundoff only where the scheme is exact
+  (`test_updown_mixed` L2, `test_vinv` V2/V9a), with a first-order bound elsewhere -- one global
+  tolerance either fails for a scheme property or hides a kernel bug.
+- **Test patches must contain the irregular case on purpose**: the NEMO quads are lon/lat rectangles,
+  so the real meshes alone never show it; the jittered `generate_mixed_patch` does.
+- A scheme property found this way is a finding for the user (remedy = design decision, e.g. face
+  values at the dual-segment midpoints), not something to "fix" inside a conversion task.
+
+
+## L67 — A consistent mass matrix brings its own lumped mass: an FCT must divide by the row sums in EVERY step and conservation must be measured with the same weights -- on quads they are not the geometric node area
+
+**Context.** Hybrid-mesh plan, Tasks 16-17 (the user's specification). Ice FCT element mass
+contributions: triangle S/6 diagonal, S/12 off-diagonal; quad (S/36)(4,2,1,2) rotated per row. Row
+sums: S/3 per triangle vertex (= the kite node area), S/4 per quad vertex (NOT the kite share of a
+non-square quad). FESOM2 divided by the node area `mesh%area` in the low-order step, the high-order
+iteration and the antidiffusive fluxes.
+
+**Lessons.**
+- **Store the row sums once (`ice%work%fct_lumpedmass`) and use them in all FCT steps**; the
+  antidiffusive operator is consistent - lumped (`ice_acoef`: triangle (-2,1,1)/12, quad (-5,2,1,2)/36),
+  as compile-time tables per vertex count, so both element types share one code path and no runtime
+  `/12`, `/36` appears (L7). Exchange it to the halo: owned elements divide by it at halo vertices.
+- **Conserved is sum(lumped*m), not sum(area*m).** The conservation gate (`fesom_conserve` with
+  `FESOM3_CONSERVE_ICE`, seeded ice) measures the lumped sums; the mutation "low-order step with
+  `mesh%area`" drifts by 1e-6 to 7e-6 and fails, the correct code drifts <= 2.8e-15. For triangles
+  lumped == node area, so triangle meshes could never have shown the difference.
+- **Check the CSR column search**: the mass matrix lives on the SSH pattern, and a missing column used
+  to be silent; it now stops with global ids (`test_ice_mass_missing_col_np1`).
+
+
+## L68 — Element geometry in lon/lat needs ONE cyclic-wrapped embedding per element (relative to vertex 1): per-pair trimming and FESOM2's plain vertex mean are wrong across the rotated dateline and at the pole
+
+**Context.** Hybrid-mesh plan, Tasks 7 and 14. The 4-slot geometry (`src/mesh/mod_mesh_areas.F90`)
+computes centroids, areas, kite weights and Green-Gauss gradients in rotated lon/lat.
+
+**What happened.**
+- Trimming each vertex-pair difference separately gave inconsistent embeddings for elements spanning
+  > 180 deg in longitude; taking all longitudes relative to vertex 1 (one planar embedding, as FESOM2's
+  gradient did) keeps the gradient exact for linear fields and consistent with `elem_area`.
+- FESOM2's output element coordinate was the plain unwrapped mean of the 3 rotated vertices: on the
+  wrong side of the globe for the 77 (pi) / 566 (CORE2) elements across the rotated dateline, and the
+  element velocities there were rotated to geographic with the wrong angle. Output now uses
+  `elem_center` (area-weighted, wrapped); the regression compares element vectors there by speed.
+- The UNROTATED pi has elements around the geographic pole, where no lon/lat embedding is meaningful:
+  geometry tests (`test_geom_mixed`) read pi rotated (`FESOM3_TEST_ROTATE=1`, as the model does);
+  the NEMO cut-outs are read unrotated.
+
+**How to apply.** One helper for the element centroid used by geometry AND output; test geometry on
+a mesh that crosses the (rotated) dateline; when an output coordinate changes, check that the change
+is a > 1 deg jump at a few % of elements and < 1e-10 deg elsewhere before calling it roundoff.
+
+
+## L69 — A setup tool's exit status and the reader's array sizes are not checks: verify every derived mesh and partition against the MODEL's invariants and limits
+
+**Context.** Hybrid-mesh plan, Tasks 2-6 and 18.
+
+**What happened.**
+- `fesom_ini` (FESOM2's `mesh_part`) STOPs with exit status 0 also on errors; only `Total time` in its
+  log and `dist_N/rpart.out` tell success. It also KEEPS existing edge/level files, so a changed mesh
+  needs them deleted first. `tools/mesh/check_dist.py` re-derives ownership, halos, edge order and
+  every communication list (incl. the appended hybrid ones) independently.
+- The model reads com lists into fixed `MAX_NEIGHBOR_PARTITIONS = 32` arrays and `read_com` has no
+  guard; fesom_ini's new lists are allocatable and unchecked too. ORCA025 needs <= 16 at 128 and 1024
+  parts -- fine, but only because it was counted (Task 18).
+- Derived meshes broke model invariants the generating tool did not know: the cut-outs left 23/17
+  nodes with a layer count above every remaining element (the model's bottom invariant stops in
+  `read_mesh`; Task 6 fixed `cut_region.py`), and splitting coastal quads along the shorter diagonal
+  made 838 dead-end triangles that FESOM's setup rejects (`split_quads.py` takes the other diagonal).
+
+**How to apply.** After producing a mesh or partition, run `check_mesh.py`, `check_dist.py` AND the
+model's own reader on it (ctest `test_mesh_read`); count neighbours against the reader's fixed limits
+before using very high part counts; do not trust exit codes of ported Fortran setup tools.
+
+
+## L70 — A shared element is a duplicated prognostic variable: an order-dependent sum makes the copies differ by roundoff, a branchy operator makes it O(1), and the duplicated border fluxes turn it into a mass leak -- test the global divergence sum at np>1
+
+**Context.** CORE2 runs results7/11/17/21 (2-12 Oct 2026); plan
+`docs/plans/completed/20261012-shared-element-sync.md`.
+
+**What happened.**
+- FESOM2's partition rule gives an element to every rank that owns one of its vertices; dist_512 has
+  24,798 such shared elements out of 244,659. Each owner updated its own copy of `uv` in `update_vel`,
+  and nothing made the copies equal again: `exchange_elem(UV)` refreshes only the eDim halo.
+- The viscosity filter adds each edge's contribution in the rank's own local edge order, so the copies
+  differed by roundoff every step. The `rvo_upwind` blend of the vector-invariant scheme switches when
+  the inflow `u.n` through an edge changes sign, which can turn a roundoff difference into O(1).
+- The two ranks then computed different fluxes across their common edges, `ssh_rhs_old` no longer
+  summed to zero over the globe, and the linear free surface created water: the global-mean SSH
+  drifted and the salt trend was +1.4e-5 to +2.3e-5 psu/yr instead of about -2e-6. results5 (before
+  `rvo_upwind`) was clean, results7 (with it) leaked; each restart re-synced the copies (every owner
+  reads the one written value) and paused the leak for about six months.
+- No gate saw it. The conservation gates ran at np 1 (no shared elements) or at np 2 with zstar and
+  without the blend for 20 steps, where the roundoff never got amplified. The restart gate's np>1
+  "FESOM2-inherent 1-ULP floor" was the same defect seen from the other side and had been accepted as
+  a caveat.
+- Fix: one designated owner per shared element (the highest vertex-owner rank, whose copy the restart
+  writer keeps); `update_vel` syncs `uv` every step. The `uv_rhsAB` and sigma copies then stay bitwise
+  equal by themselves (guards `test_vinv` V13, `test_ice_dyn_mixed` D6). `test_shared_elem` S3: the
+  divergence-sum ratio is ~1e-17 with the sync and 7e-6 to 4e-4 without it; np>1 restarts are exact.
+
+**How to apply.** Treat every field stored on multiply-owned entities as duplicated state: compute it
+once and send it, or test that the copies stay bitwise equal. At np>1, test the global divergence sum
+`|sum ssh_rhs_old| / sum|ssh_rhs_old|` and the copy spreads (`FESOM3_STEP_DIAG`, `fesom_conserve`
+`FESOM3_DIVSUM_TOL`), not only conservation at np 1. When a gate needs a "harmless ULP floor" at
+np>1, find the duplicated state behind it before accepting it.

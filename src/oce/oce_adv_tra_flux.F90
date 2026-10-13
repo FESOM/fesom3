@@ -59,7 +59,7 @@ contains
             nu1 = mesh%ulevels_nod2D(n)
             nl1 = mesh%nlevels_nod2D(n)
             do nz = nu1, nl1-1
-                dttf_v(nz,n) = dttf_v(nz,n) + (flux_v(nz,n)-flux_v(nz+1,n))*dt/mesh%areasvol(nz,n)
+                dttf_v(nz,n) = dttf_v(nz,n) + (flux_v(nz,n)-flux_v(nz+1,n))*dt/mesh%areasvol(n)
             end do
         end do
         ! Horizontal edge-flux scatter -> del_ttf_advhoriz
@@ -69,7 +69,7 @@ contains
             nl1 = mesh%nlevels(el(1))-1
             nu1 = mesh%ulevels(el(1))
             nl2 = 0; nu2 = 0
-            if (el(2) > 0) then
+            if (el(2) /= el(1)) then
                 nl2 = mesh%nlevels(el(2))-1
                 nu2 = mesh%ulevels(el(2))
             end if
@@ -77,8 +77,8 @@ contains
             nu12 = nu1
             if (nu2 > 0) nu12 = min(nu1, nu2)
             do nz = nu12, nl12
-                dttf_h(nz,enodes(1)) = dttf_h(nz,enodes(1)) + flux_h(nz,edge)*dt/mesh%areasvol(nz,enodes(1))
-                dttf_h(nz,enodes(2)) = dttf_h(nz,enodes(2)) - flux_h(nz,edge)*dt/mesh%areasvol(nz,enodes(2))
+                dttf_h(nz,enodes(1)) = dttf_h(nz,enodes(1)) + flux_h(nz,edge)*dt/mesh%areasvol(enodes(1))
+                dttf_h(nz,enodes(2)) = dttf_h(nz,enodes(2)) - flux_h(nz,edge)*dt/mesh%areasvol(enodes(2))
             end do
         end do
     end subroutine oce_tra_adv_flux2dtracer

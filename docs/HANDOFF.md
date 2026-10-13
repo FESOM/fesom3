@@ -5,6 +5,21 @@ Full pre-M2.12 milestone detail + the per-gate recipes live in [`HANDOFF-archive
 
 ## Where we are
 
+- **Shared-element velocity sync ✅ DONE (2026-10-12, plan `plans/completed/20261012-shared-element-sync.md`,
+  on `bottom-at-vertices`):** a border element is owned by every rank that owns one of its vertices;
+  `update_vel` now gives every such element one owner for `uv` (the highest vertex-owner rank, whose copy
+  the restart writer keeps), every step (`FESOM3_SHARED_SYNC`, default 1). Fixes the linfs volume and
+  salt leak of the CORE2 runs results7/11/17/21 and makes np>1 restarts exact. np 1 is bit-identical,
+  np>1 changes at roundoff. Next for the user: rebuild the production binary and resume results17 or
+  results21 with `FESOM3_STEP_DIAG=1` → section "Shared elements: one owner for `uv`" → "Production check".
+- **Hybrid (mixed triangle + quad) meshes ✅ DONE (2026-10-09, plan `plans/completed/2026-10-08-hybrid-meshes.md`,
+  commits `d4c6f8d`…`d07f44f` + the docs commit, on `bottom-at-vertices`, unpushed):** model, `fesom_ini`
+  (FESOM2's `mesh_part`, ported) and the Python mesh tools run triangle, quad and mixed meshes (NEMO
+  ORCA025 → `nemo025q_fesom`, `nemo025mix`); unified 4-slot kernels, so triangle runs are no longer
+  bit-identical (roundoff gate `tools/run_tri_regression.sh`); ctest 153/153 (after the review fixes); full NEMO 0.25° 2-day runs
+  at np 8 finite. Next for the user: rebuild `build_intel_dp` from this branch, first full-size NEMO run
+  (`work/job_levante_nemo025`), the open design questions → section "Hybrid (mixed triangle + quad)
+  meshes" → "Known findings / open questions for the user".
 - **Milestone:** M2 (minimal ocean dynamical core) — **multi-rank MVP byte-match ACHIEVED (tag `m2-mvp`).**
   **→ M3 (sea ice EVP) ✅ COMPLETE 2026-06-23 (all M3a–M3f DONE, `max|Δ|=0` 1-rank AND multi-rank) — ✅ COMMITTED
   (`b591153`, tag `m3`).**
@@ -262,6 +277,7 @@ A compact list; full per-milestone detail + the gate recipes are archived in
 - **M2.12b** Multi-rank tracer advection gate — pi dist_2 + dist_8, 13 fields every rank (`tools/run_advhor_gate_multirank.sh`): the `find_neighbors` halo dance + `exchange_elem_full(tr_xy/elem_area)` + `exchange_nod(fct_LO/fct_plus/minus)` + owned/halo loop bounds, all byte-exact; `del_ttf` (FCT + MUSCL) `max|Δ|=0` (LESSONS **L31**). Detail in "Next task".
 - **M2.12c-1** Multi-rank pre-SSH DYNAMICS chain — pi dist_2 + dist_8, `max|Δ|=0` (25 records: density/pressure/bvfreq/Kv/ssh_rhs) (`tools/run_stepdyn_gate_multirank.sh`). Lifted the whole chain `compute_vel_nodes → pressure_bv(+smooth_nod) → pressure_force_4_linfs → oce_mixing_pp → mo_convect → compute_vel_rhs(+momentum_adv_scalar) → viscosity_filter(visc_filt_bidiff) → impl_vert_visc_ale → compute_ssh_rhs_ale` to multi-rank via the M2.12b OPTIONAL-`partit` pattern: `mod_part_bounds.local_dims` (owned/halo/full bounds) + the FESOM2 exchanges (`exchange_nod` UVnode/bvfreq-per-smooth-sweep/UVnode_rhs/ssh_rhs, `exchange_elem` U_c/V_c) + the visc interior-edge test on the GLOBAL id (`myList_edge2D(ed)>edge2D_in`). New `exchange_nod` rank-3 node-block variant in `mod_halo`. **NO 1-rank regression** (step 65 + advhor 40 + lifecycle 195 + 13/13 ctest all `max|Δ|=0`). See LESSONS **L32**. Detail in "Next task".
 - **M2.12c-2** Multi-rank SSH stiffness + free-surface CG — pi dist_2 + dist_8, `max|Δ|=0` on `d_eta` (30 records = the 25 c-1 + 5 `d_eta`; `tools/run_stepdyn_gate_multirank.sh`, substep 9 now compared). The FIRST multi-rank ITERATIVE solver (38 CG iters on 8 ranks, byte-exact). Lifted `init_stiff_mat_ale` + `solve_ssh_ale` (`ssh_solve_preconditioner`/`ssh_solve_cg`) via the same OPTIONAL-`partit` pattern: owned loops (`nNodO`), arrays `nNodL`, `exchange_nod(diag_values)` in the precond + `exchange_nod(pp/rr/x)` in the CG + new `allreduce_sum` (in `mod_halo`) for the dot-products; `rtol`/convergence denominators stay GLOBAL (`mesh%nod2D`). **KEY FINDING: NO mesh-infra extension was needed** — the HANDOFF/L32 hypothesis (extend `elem2D_nodes`/`gradient_sca` to the halo + `enforce_cw` on owned+eDim) was WRONG; the stiffness owned rows assemble FULLY LOCALLY (verified partition invariant: for owned edges both triangles are owned — FESOM2's own `elem2D_nodes`/`gradient_sca` are owned-only too). **NO 1-rank regression** (step 65 + pressure 57 + advhor MR + 13/13 ctest all `max|Δ|=0`). See LESSONS **L33**. Detail in "Next task".
+  - **SSH solver now (`28af61c`, 2026-10-08): diagonal (Jacobi) preconditioner** — `pr_values` = 1/diag of the owned rows (length nNodO) instead of FESOM2's MITgcm symmetrised-Jacobi matrix, so M⁻¹r is local and the per-iteration `exchange_nod(rr)` (and the setup exchange of `diag_values`) is gone; one `exchange_nod(pp)` + two allreduces per iteration remain; CG loops fused. NOT bit-identical to FESOM2 any more (header of `src/oce/oce_ssh_solve.F90`). Env knobs (hybrid plan, `e4dd8d2`): `FESOM3_SSH_SOLTOL` (soltol, default 1e-5) and `FESOM3_SSH_MAXITER` (default 2000), read once at the first solve (`ssh_solve_env_overrides`); `tools/run_tri_regression.sh` solves to 1e-14 with them (L60).
 - **M2.12c-3** Multi-rank post-SSH ALE update + tracer SOLVE + the WHOLE assembled step — pi dist_2 + dist_8, `max|Δ|=0` on ALL **65 substep records** (density/pressure/bvfreq/Kv/ssh_rhs/d_eta/hbar/eta_n/hnode_new/w/T/S/hnode; `tools/run_step_gate_multirank.sh`). **The whole multi-rank ocean step byte-matches FESOM2 — the architectural MVP.** Lifted `update_vel`/`compute_hbar_ale`/`update_eta_n`/`vert_vel_ale`(+`compute_CFLz`/`compute_Wvel_split`)/`update_thickness_ale` (`oce_ale.F90`) + `solve_tracers_ale`/`diff_tracers_ale`/`diff_part_hor_redi`/`diff_ver_part_impl_ale` (`oce_ale_tracer.F90`; the FCT advection was M2.12b) via the OPTIONAL-`partit` pattern (`owned_bounds`/`local_dims` + the FESOM2 exchanges), and threaded the optional `partit` through `mod_step_oce::step_oce` (absent ⇒ 1-rank verbatim; the 1-rank callers `fesom_stepdump`/`fesom_lifecycle` unchanged). New whole-step MR driver `fesom_stepfull_mr` (= `step_oce` through `partit`, gid-keyed per-rank dumps); the FESOM2 oracle is UNCHANGED (`fesom_step_dump` npes>1 already drives the whole `oce_timestep_ale` + dumps all substeps). pi ships only dist_1/2/8 (no dist_32; dist_2+dist_8 = the c-1/c-2 coverage). **NO 1-rank regression** (step 65 + pressure 57 + advhor MR dist_2/8 + stepdyn MR dist_2/8 + 13/13 ctest all `max|Δ|=0`). See LESSONS **L34**. Detail in "Next task".
 
 ## Build
@@ -317,11 +333,628 @@ end-of-`ocean_setup` prescribe-and-stop shim, the FADVHDMP dump format), the M1 
 kernel-gate recipe, the M2.1–M2.9a dynamics-kernel recipe (+ every per-kernel extension), the
 M2.10 forcing gate, and the M2.11b IC gate — are in [`HANDOFF-archive.md`](HANDOFF-archive.md).
 The live "Oracle" section above + the "M2.12 entry notes" below cover what the current work needs.
+The hybrid-mesh gate migration (which FESOM2-oracle gates are retired, the roundoff gate
+`tools/run_tri_regression.sh` that replaces them) is in "Hybrid (mixed triangle + quad) meshes" →
+"Gate migration for hybrid meshes" below.
+
+## Shared elements: one owner for `uv` (plan `plans/completed/20261012-shared-element-sync.md`, 2026-10-12)
+
+**Ownership rule (FESOM2's, unchanged).** A rank owns every element that has at least one vertex it
+owns, so an element on a partition border is owned by two or three ranks (CORE2: 562 at dist_2, 24,798
+of 244,659 at dist_512). Each owner updates its own copy of the element fields.
+
+**The CORE2 leak (9–12 Oct 2026).**
+- Leaking: results7, results11, results17 from July 1965, results21. Global salt +1.4e-5 to +2.3e-5
+  psu/yr, global-mean SSH drifting. Clean: results_orig, results, results2, results3, results5,
+  results17 up to June 1965 (salt −1.6e-6 to −2.1e-6 psu/yr, mean SSH flat).
+- Volume rules differ by code: f2 runs (results_orig, results_2.0) `nod_area(k,n) × hnode`, f3 runs
+  `area(n) × hnode` (`src/mesh/mod_mesh_areas.F90:515`). Report: artifact `Gdj6DMQ4n2BQVZ4Si6cAUD` v2,
+  figures and scripts in `/work/ab0995/a270029/fesom3_hybrid/runs_report/core2/`.
+- Mechanism: the viscosity filter adds edge contributions in each rank's own edge order, so the `uv`
+  copies of a shared element differed by roundoff; the `rvo_upwind` blend (results7 on, results5 before
+  it) can turn that into O(1); the two ranks then computed different fluxes across their common edges and
+  `ssh_rhs_old` no longer summed to zero. Evidence: in the leaking checkpoints the stored u, v disagree
+  with the stored `ssh_rhs_old` at 86–107 nodes, all on dist_512 borders next to shared elements (clean
+  checkpoints agree to 4e-11 everywhere); a restart re-synced the copies and paused the leak for about
+  six months. LESSONS L70.
+
+**The fix.**
+- `partit%com_elem2D_shared` (`src/types/mod_partit.F90`), built by `build_com_elem2D_shared`
+  (`src/infra/mod_shared_elem.F90`) at the end of `read_mesh_local` from the owned elements and the
+  vertex owners in `com_nod2D` (no file format change, no MPI for the lists). The **designated owner**
+  is the highest rank among the vertex owners: `decomp_redistribute_2d_r`
+  (`src/io/mod_io_decomp.F90:220-237`) writes in rank order, so this is the copy restart and output keep.
+  Blocks are sorted by global id with partners ascending. One-time checks: an `MPI_Alltoall` of the
+  pairwise counts, a global-id self-check through the exchange, and the rule itself (an owned element
+  without an owned vertex stops). Every stop goes through `die` (`MPI_Abort`).
+- Startup log on rank 0: `shared-element sync: ON, <n> shared elements, <c> extra copies, max per rank:
+  recv <r>, send <s>`. Production dist_512 (checked offline): `24798 shared elements, 25512 extra
+  copies, max per rank: recv 139, send 136`.
+- `update_vel` (`src/oce/oce_ale.F90`) calls `exchange_elem_shared(UV)` right after the owned update and
+  before `exchange_elem(UV)`, every step, under the subset timer "(of which) shared sync" of
+  "dynamics ssh". `FESOM3_SHARED_SYNC`: unset or `1` = on, `0` = off (the old unsynced copies, for A/B
+  comparisons; the list is still built), any other value stops.
+- Only `uv` is synced. `uv_rhsAB` and the EVP/mEVP stresses are computed from equal inputs (nodal fields
+  their owners compute and exchange, per-element geometry from the same global coordinates) and stay
+  bitwise equal; guards `test_vinv` V13 and `test_ice_dyn_mixed` D6. If a guard ever fails, the plan's
+  "Fields" fallback says where to sync that field.
+
+**Diagnostics.**
+- `FESOM3_STEP_DIAG=1` (production driver): the step line gets, after `Smax`, `divsum=` (the ratio
+  `|Σ ssh_rhs_old| / Σ|ssh_rhs_old|` over owned nodes; a linfs leak shows above ~1e-12; zstar adds the
+  freshwater term, so there it is only a report), `dUV=`, `dAB=`, `dsig=` (max|copy − designated copy|
+  of `uv`, `uv_rhsAB`, sigma; all 0 with the sync). `tools/run_cutout_short.sh` keeps its field numbers.
+- `fesom_conserve`: one end-of-run line `shared elements (sync ON|OFF): max divsum= … dUV= … dAB= …
+  dsig= …`; `FESOM3_DIVSUM_TOL` (unset = report only) stops the run if the max ratio exceeds it or, with
+  the sync on, any spread is nonzero.
+
+**Tests and gates.**
+- `test_shared_elem`: S1 the list against an allgather oracle, S2 the exchange and the probes, S3 the
+  mechanism through `update_vel` + `compute_hbar_ale` (ratio 9e-20 to 2e-17 with the sync, 7e-6 to
+  4e-4 without, on pi np 1/2/8, pi_w np 2/4, the NEMO cut-outs np 2, core2_w np 8), plus the error cases
+  (corrupt owner map, `FESOM3_SHARED_SYNC=2`) and the OFF log. `fesom_conserve_linfs_vinv_shsync_np2`
+  (linfs, vinv, `rvo_upwind` 1, sea ice, `FESOM3_DIVSUM_TOL=1e-12`). ctest 167/167.
+- `tools/run_conserve_pi.sh` SHARED block (linfs + ice, np 2 and 8): max ratio 1.6e-16 to 3.1e-16,
+  spreads 0. Sync off: `uv` spread 6.9e-18 after 20 steps, already amplified to 5.8e-11 in `uv_rhsAB`.
+- Bitwise against the frozen pre-change build (`run_tri_regression.sh` with all `TOL_*=0`): np 1 pi and
+  CORE2, and np 2 pi with `FESOM3_SHARED_SYNC=0`, every printed d = 0. The default
+  `run_tri_regression.sh` cases pass 7/7; the np>1 differences stay at their earlier levels.
+- Restart: `tools/run_restart_gate_core2.sh` is strict at every np now (floor 1e-12 only with
+  `FESOM3_SHARED_SYNC=0`): CORE2 np 1 and np 2, mid-run and month-boundary splits, checkpoint (full
+  state incl. ice, sigma, velocity, AB) and live dumps all `max|Δ| = 0`, with the default physics and
+  with `FESOM3_MOMADV_OPT=1 FESOM3_RVO_UPWIND=1.0`. Before the sync the np 2 boundary case needed the
+  floor (temp 2.2e-16). `run_restart_gate_multirank.sh` (np 2 → np 8): `max|Δ| = 0`.
+- Cost (CORE2 np 8, 48 steps, production physics of `tools/prod_env.sh`, no output, login node): "(of
+  which) shared sync" 0.51 ms/step (max 0.66) of a 974 ms loop, 0.05 %; with `FESOM3_SHARED_SYNC=0` the
+  loop took 960 ms (login-node noise is larger than the sync). The same runs: sync on, `divsum` <= 1.4e-15
+  and `dUV = dAB = dsig = 0` in all 48 steps; sync off, `dUV` grows to 3.9e-16 and `dAB` to 5.8e-11 (the
+  ratio is still at roundoff after one day).
+
+**Production check (the user's runs).** Rebuild the production binary when you decide. Resume
+results17 from `fesom.1967.001.00000` (or results21 from `fesom.1959.001.00000`) with the same settings,
+at least into autumn 1967 (the leak paused for about six months after each restart). With
+`FESOM3_STEP_DIAG=1` expect `divsum` around 1e-15 to 1e-13 and `dUV = dAB = dsig = 0`; the global-mean
+SSH should stay at its restart value (0.0888 m for results17) and the salt trend return to about −2e-6
+psu/yr. Optional A/B from the same restart: `FESOM3_SHARED_SYNC=0` (`dUV` > 0, the leak returns) and
+`FESOM3_RVO_UPWIND=0` (the trigger).
+
+## Hybrid (mixed triangle + quad) meshes (plan `plans/completed/2026-10-08-hybrid-meshes.md`, 2026-10-08/09)
+
+The model, its setup tool `fesom_ini` and the Python mesh tools handle triangle, quad and mixed meshes
+in ONE code path: every element has 4 vertex slots (a triangle repeats its 1st vertex), clockwise, and
+every kernel uses unified 4-slot formulas — there is no triangle/quad branch in any kernel. Commits
+`d4c6f8d` (Task 1) … `d07f44f` (Task 19) on `bottom-at-vertices`, `hybrid:` commits, one or more per
+task (the messages list what changed), unpushed. Triangle results are NOT bit-identical to FESOM2 or to the
+pre-hybrid code any more (roundoff, gated by `tools/run_tri_regression.sh`, see "Gate migration for
+hybrid meshes" below). Scratch work, logs and the frozen reference binaries of the plan:
+`/work/ab0995/a270029/fesom3_hybrid/` (task log `progress-hybrid-meshes.txt`); test meshes in
+`/work/ab0995/a270029/meshes/` (list under the setup workflow). Order of the subsections: file formats →
+arrays and conventions → geometry → kernels → exchanges → SSH matrix and checkerboard → sea ice → tests
+and tools → setup workflow → CORE2 throughput → NEMO job → gate migration → open findings. Lessons
+from the plan: `LESSONS.md` L60–L69.
+
+### File formats
+
+- **`elem2d.out`**: count, then 3 OR 4 node ids per line; the column count is taken from the first
+  line and every line must match (`read_elem_line`, `src/mesh/mod_mesh_read.F90:122`; a malformed line →
+  message + error stop, ctest `test_mesh_read_malformed_np1`); 3 columns → 4th := 1st. Triangle ⇔
+  `elem2D_nodes(4,e) == elem2D_nodes(1,e)`. `enforce_cw_orientation` (`:228`) turns an anticlockwise
+  quad by swapping 2↔4 (a triangle 2↔3, as before); `fesom_ini` checks the same in `test_tri_ini`
+  (sub-triangles (1,2,3), (1,3,4); flips reported and fixed in memory, a bow-tie/degenerate quad stops).
+- **Depth**: `fesom_ini`'s `namelist.config` keeps FESOM2's `use_depthfile='aux3d'` (`aux3d.out`: nl,
+  zbar, node depths) and gains `use_depthfile='nemo'`: `depth.out` = nl, the positive levels, the
+  positive node depths (= levels(count+1)), then the per-node layer counts → `nlvls.out` = count + 1 as
+  given, `elvls.out` = min over the vertices, no thresholding or isolated-cell iteration. The model
+  takes node levels ONLY from `nlvls.out` and zbar from `aux3d.out`, or from `depth.out` when
+  `aux3d.out` is absent (`open_depth_file`, `:169`; depth.out node depths stored negated, unused).
+  Element levels: `nlevels(e)` = min, `ulevels(e)` = max over the vertices.
+- **`nod2d.out`** of the NEMO meshes: 4th column = land-boundary flag (as `nemo_meshq.m`).
+- **Edge files** `edges.out`, `edge_tri.out`, `edgenum.out` (edge2D, edge2D_in): FESOM2 layout,
+  interior edges first (viscosity and the ice boundary conditions rely on that order); `edge_tri.out`
+  keeps FESOM2's on-disk encoding (missing 2nd element ≤ 0) — the model converts it at read time
+  (`mod_mesh_read.F90:93` 1-rank, `:535` multi-rank).
+- **`dist_N/`**: `rpart.out`, `my_list%05d.out`, `com_info%05d.out` keep their exact FESOM2 layout
+  (FESOM2 and `tools/make_dist1.py` still read them). `dist_N/format.out` (one integer, version 1 =
+  `DIST_FORMAT_VERSION` of module `dist_ext`, `mesh_part/src/oce_local.F90:14-283`) announces the
+  APPENDED sections: `my_list` + `eXDim_nod2D` and the global ids of the double-halo nodes (vertices of
+  the local elements 1..myDim+eDim+eXDim_elem2D that are not among the nodes 1..myDim+eDim_nod2D;
+  grouped by owner, ascending within; local numbers myDim+eDim+1, …); `com_info` + `com_nod2D_full`
+  then `com_edge2D`, each in FESOM2's 8-record com-struct layout, per peer both sides ordered by global
+  id. The model reads them when `format.out` exists (`partit%dist_format`, 0 = FESOM2 layout; an
+  unknown version stops) in `read_dist_partition` (`src/infra/mod_partitioning.F90:125`); the 1-rank
+  synthesis `synthesize_1rank` (`:86`) and `make_dist1.py` provide empty lists (dist_format = 1). An old
+  `dist_N` without `format.out` still runs; only the two new exchanges then stop with a message.
+- **Output** (Task 14): `face_nodes`/`face_edges` with 4 columns and the UGRID `_FillValue` −1 for a
+  triangle's 4th, element coordinates = wrapped centroids — see "Gate migration for hybrid meshes" →
+  "Output format changes".
+
+### Mesh arrays and conventions (`src/types/mod_mesh.F90`, `src/types/mod_partit.F90`)
+
+- `MAX_NV = 4`, `MAX_ADJACENT = 32` (`mod_mesh.F90:30-31`). `elem2D_nodes(MAX_NV,·)` clockwise,
+  triangle 4th = 1st; `elem2D_nnodes(·)` = 3 or 4 — used only where a repeated vertex would matter
+  (unique-vertex loops, plain counts: IC extrapolation, SSH assembly index set, ice mass matrix and FCT
+  limiter).
+- `elem_edges(MAX_NV,·)` (sides 1-2, 2-3, 3-4, 4-1) and `elem_neighbors(MAX_NV,·)` (neighbour across
+  side k), owned elements, built in `build_elem_adjacency` (`src/mesh/mod_mesh_areas.F90:358`): a
+  triangle's slot 4 repeats slot 1; a MISSING neighbour is the element ITSELF (no zero index anywhere).
+- `edge_tri(2,·)`: a missing 2nd element = the 1st, and `edge_cross_dxdy(3:4,e) = 0` there, so a term
+  weighted by the cross vector vanishes without a test. Boundary tests are `edge_tri(2,e) /=
+  edge_tri(1,e)` and `nb == el`; every former `el(2) > 0` / `el(i) < 1` / `nb <= 0` test (src and test)
+  was converted in the same change as the convention (Task 7), otherwise boundary edges count twice.
+- `gradient_sca(2*MAX_NV,·)`: x-coefficients in rows 1:4, y in 5:8 (FESOM2: 6 rows, x 1:3 / y 4:6); a
+  triangle's slot 4 = 0; OWNED elements only. `gradient_vec` is still not computed; when it comes it
+  must respect "missing neighbour = self".
+- `elem_w(MAX_NV,·)` (owned elements): kite (median-dual) weight of each vertex, Σ = 1, a triangle
+  exactly (1/3, 1/3, 1/3, 0). `nod_in_elem2D_w(MAX_ADJACENT,·)`: kite weight of node n in its k-th
+  element `nod_in_elem2D(k,n)`, computed for owned nodes and halo-exchanged (`compute_nod_weights`,
+  `:301`). Both are in the binary mesh layout.
+- **The two rules every kernel follows:** element mean = `sum(elem_w(:,e)*f(elem2D_nodes(:,e)))`;
+  node gather = `Σ_k elem_area(e_k)·nod_in_elem2D_w(k,n)·x(e_k) / area(n)` (FESOM2's `Σ A·x /
+  (3·area)` hid the 1/3 in the 3; every such gather was converted); gathers over WET elements
+  only normalise by the wet kite shares `Σ A·w` instead (`compute_sigma_xy`, `smooth_nod`, ice
+  `ocean2ice` — FESOM2's partial-patch normalisation).
+- Node arrays keep size nNodL = myDim+eDim. The mesh FILE arrays (`coord_nod2D`, `geo_coord_nod2D`,
+  `bc_index_nod2D`, `depth`, `nlevels_nod2D`) and `myList_nod2D` hold myDim+eDim+eXDim_nod2D entries;
+  `owned_bounds(…, nNodX=)` (optional, `src/infra/mod_part_bounds.F90:53`) returns that size (npes 1:
+  nod2D).
+
+### Geometry (`src/mesh/mod_mesh_areas.F90`, Task 7)
+
+- Centroid and area from the sub-triangles (1,3,4) + (1,2,3) (qq), area-weighted and cyclic-wrapped
+  (`elem_center`, `:181`, public — also the output element coordinate); `elem_area` = lon/lat area ×
+  `elem_cos` (cosine of the centroid latitude). For a triangle both sub-triangles coincide with the
+  plain formulas.
+- Kite weights (`compute_elem_weights`, `:267`): ½·[A(j, j−1, c) + A(j, j+1, c)] normalised by the
+  sum of the 4 side triangles (= the element area for a convex quad, so Σ `elem_w` = 1 to roundoff);
+  node area = Σ `elem_area·elem_w` (`compute_node_areas`, `:472`).
+- `gradient_sca` Green–Gauss (`compute_gradient_sca`, `:326`): coefficient of vertex j ∝
+  (x_{j+1} − x_{j−1})/(2A) over the nv vertices, longitudes relative to vertex 1 (one planar embedding,
+  as FESOM2). Exact for linear fields on every convex element; for triangles = P1 to roundoff
+  (`test_geom_mixed` G4, G7).
+- `compute_mesh_resolution` (`:556`) with kite-weighted means. `mod_mesh_rotate.F90` needed no change.
+- Analytic test patches (`src/mesh/mod_mesh_analytic.F90`): `generate_mixed_patch` (quads + triangle
+  pairs, jittered interior nodes), `generate_quad_patch` (parallelograms, optional skew); `build_edges`
+  orients edges as FESOM (edge_tri(1) left of edges(1)→edges(2)) and puts interior edges first.
+
+### Kernels: unified 4-slot formulas (Tasks 10–16)
+
+Every kernel loops over the 4 slots with `gradient_sca(1:4|5:8)`, `elem_w` means and `nod_in_elem2D_w`
+gathers; a triangle's slot 4 contributes exactly 0 (gradient 0, weight 0) or repeats a value where only
+max/min is taken (FCT bounds, `mo_convect`). Converted: ocean dynamics (`oce_ale.F90`
+`compute_vel_nodes`, `update_vel`, `dhe`, zstar `helem`; `oce_dyn_velrhs.F90`; `oce_pgf.F90` incl. the
+Shchepetkin per-vertex loops over MAX_NV; `oce_dyn_ivertvisc.F90`; `oce_dyn_vinv.F90`: KE and vorticity
+with `elem_w`, `rvo_upwind` side normals oriented toward the centroid, a triangle's degenerate side 4
+has normal 0); tracers (`oce_tracer_grad.F90`, `oce_ale_tracer.F90` `tr_xynodes`, `oce_adv_tra_fct.F90`
+bounds, `oce_pressure_bv.F90` `compute_sigma_xy`/`smooth_nod`, `oce_initial_state.F90` extrapolation
+over the unique vertices); the MUSCL up/downwind search `find_up_downwind_elements`
+(`src/oce/oce_muscl_adv.F90:57`; helper `elem_sides`: b = next, c = previous vertex for both types; the
+exact collinearity compares became |·| < 1e-10 rad; the array name `edge_up_dn_tri` was kept); mixing
+and GM (`oce_fer_gm.F90` `fer_uv`, KPP `viscAE`, TKE/PP `Av`, `oce_mo_conv.F90`); forcing and coupling
+element stress (`mod_forcing_bulk.F90`, `mod_ice_oce_coupling.F90` — its `elnodes(3)` shape bug went
+with it). The edge-based kernels (`oce_dyn_visc.F90`, `oce_adv_tra_hor/flux/driver.F90`) needed only
+the boundary-test conversion. Exceptions left in `src/` (Task 19 greps, all documented in the plan):
+`mod_geom_dump` (FESOM2 layout, stops on quads), the analytic generator, the sub-triangle centroid
+`/(3(s1+s2))`, the exact triangle kite 1/3, the spline and the KPP cube roots; `fesom_ini` keeps literal
+`/3.0`, `/4.0` divisors (L7).
+
+### Exchanges and halo rings (Task 8, `src/infra/mod_halo.F90:159-203`)
+
+- **Rings.** Nodes: 1..myDim (owned) | eDim_nod2D (FESOM2 halo) | eXDim_nod2D (NEW double halo: the
+  remaining vertices of all local elements, i.e. of the eDim edge-sharing and the eXDim node-only
+  element rings, L56). Edges: FESOM2's 1..myDim_edge2D holds EVERY edge with an owned node, so a shared
+  edge lies in the owned range of two ranks; then eDim_edge2D.
+- **`exchange_edge`** (2D/3D real, over `com_edge2D`): the UNIQUE owner = owner of `edges(1,edge)` sends
+  to every other rank holding the edge, also where it lies in that rank's owned range.
+  **`exchange_nod_full`** (2D/3D real, over `com_nod2D_full`): every halo node eDim + eXDim from its
+  owner; arrays sized nNodX. Both run on the existing broadcast-only cores (`core_2D_r`/`core_3D_r`) like
+  `exchange_nod`; `require_dist_format` aborts with "<list> is not available: dist_N has no format.out"
+  on a FESOM2-layout `dist_N`; at 1 rank the lists are empty (no-op). No kernel uses them yet (added for
+  future developments). Test `test_halo_ext` (round trips at np 2/4/8 on pi_w, core2_w and the cut-outs,
+  edges in two owned ranges > 0 required, no-format error case).
+
+### SSH stiffness matrix and the checkerboard null mode (Task 9)
+
+- `init_stiff_mat_ale`/`update_stiff_mat_ale` (`src/oce/oce_ssh_rhs.F90:87`, `:252`): CSR row = self
+  FIRST (the Jacobi preconditioner reads the diagonal there), the edge neighbours in edge order (as
+  before), then the remaining vertices of the elements around the node (quad diagonals); the row length
+  is counted first (no fixed `n_pos(12,·)`); scatter over the 4 slots. Triangle meshes keep the
+  IDENTICAL CSR and bitwise-equal values (`test_ssh_stiff` S5). The ice mass matrix reuses this pattern.
+  The solver itself (diagonal preconditioner, `FESOM3_SSH_SOLTOL`/`FESOM3_SSH_MAXITER`) is described
+  under the M2.12c-2 milestone above.
+- **Checkerboard property.** Green–Gauss gives c₁ = −c₃ and c₂ = −c₄ on ANY quad, so the pattern
+  (+1,−1,+1,−1) has zero gradient in every quad: on a 2-colourable all-quad mesh the checkerboard is an
+  EXACT null mode of the stiffness part of the SSH operator (|K f|/|K| ≈ 1e-16 on the parallelogram
+  patch AND on the NEMO quad cut-out — not only on parallelograms, as the plan first assumed) and of the
+  pressure gradient; only the mass (area/dt) part controls it. Asserted in `test_ssh_stiff` S8 so that
+  it cannot change silently. Measured over 10 days on the cut-outs (`tools/cutout_diag.py checker`): the
+  SSH null mode does not grow, the tracer grid-scale energy does (open findings below).
+
+### Sea ice (Tasks 15–16)
+
+- **EVP/mEVP** (`src/ice/mod_ice_dyn.F90`): strain rates over `gradient_sca(1:4|5:8)` with
+  kite-weighted metric terms (`metric_factor·sum(elem_w·v)`); `stress2rhs` node shares
+  `elem_area·elem_w(k)` (the exact negative adjoint of the strain rates, `test_ice_dyn_mixed` D2); SSH
+  tilt `g·elem_area·elem_w(k)`; `ocean2ice` gather `Σ A·w·UV / Σ A·w` over the wet elements.
+- **FCT with the user's mass matrix** (`src/ice/mod_ice_fct.F90:73-98` tables,
+  `src/ice/mod_ice_setup.F90:189` `ice_mass_matrix_fill`): consistent mass matrix from the element
+  contributions `elem_area·ice_mcoef(·,·,nv)` — triangle S/6 diagonal, S/12 off-diagonal; quad
+  (regular-square simplification) row n1 (S/36)·(4, 2, 1, 2) for (n1, n2, n3, n4), rotated per row. **Lumped mass**
+  `ice%work%fct_lumpedmass` = row sums (S/3 per triangle vertex, S/4 per quad vertex), exchanged to the
+  halo; it REPLACES `mesh%area` in ALL FCT steps (low order, the high-order iteration, the antidiffusive
+  fluxes); a row without wet elements keeps the node area. Antidiffusive operator `ice_acoef` =
+  consistent − lumped: triangle (−2, 1, 1)·S/12, quad (−5, 2, 1, 2)·S/36; `fct_fluxes(elem, MAX_NV)`;
+  flux, sum, limiter and update loops over `elem2D_nnodes` (a 4-slot limiter would visit vertex 1 twice).
+  TG rhs: `dx(n)·(M_e u)_q`, diffusion over the 4 gradient slots, TG term with ū = Σ `elem_w`·u. A CSR
+  column missing from the SSH pattern → message with global ids + MPI_Abort (ctest
+  `test_ice_mass_missing_col_np1`). Ice mass is conserved as Σ `fct_lumpedmass`·m; on quads the lumped
+  mass S/4 differs from the kite node area the dynamics use (accepted by the user). For triangles
+  lumped = node area and every term equals FESOM2 to roundoff (`test_ice_mass` F5).
+
+### Tests and tools of the plan
+
+- **ctest** (153 in all, ~50 s with `-j 8`): `test_mesh_read` (+ flipped elements, 5 malformed
+  `elem2d.out` cases), `test_geom_mixed` (+ quad kite weights / centroid vs independent shoelace
+  formulas, `mesh_resolution`), `test_halo_ext`, `test_ssh_stiff` (+ quadratic-field values on the
+  parallelogram patch), `test_pgf_mixed` (+ `compute_sigma_xy`, `smooth_nod`, `fer_gamma2vel`,
+  `extrap_nod3D`), `test_updown_mixed`, `test_coupling_mixed`, `test_ice_dyn_mixed`, `test_ice_mass`
+  (+ FCT bounds), `test_partit_*` (`FESOM3_EXPECT_FORMAT=1`), `fesom_ini_*` (`tools/check_fesom_ini.sh`:
+  FESOM2 level finder on quads, the 'nemo' error stops, non-convex quad),
+  `meshdiag_{mixed,quad,pi_w}`, `fesom_conserve_mixcut_*` (PP/KPP/TKE/GM/REDI) and
+  `fesom_conserve_{q,mix}cut_ice_*` (driver knobs `FESOM3_CONSERVE_ICE`, `FESOM3_WHICHEVP`), plus mixed
+  and quad cases of `test_vinv`, `test_ivertvisc`, `test_muscl_onthefly`. The hybrid tests share
+  `test/test_util.F90` (mesh setup, check/finish, reductions). Kernel tests pick the mesh with
+  `FESOM3_MESH_DIR`, the analytic patches with `FESOM3_TEST_PATCH=mixed|quad`, and `FESOM3_TEST_ROTATE`
+  (0: NEMO cut-outs unrotated; 1: pi_w rotated — the unrotated pi has elements around the geographic
+  pole). The launcher flags `FESOM3_MPI_LAUNCH_FLAGS` (`CMakeLists.txt:157`) include the knem workaround
+  (L61). Every mesh-dependent hybrid ctest reads its mesh from the HARD-CODED root
+  `/work/ab0995/a270029/meshes` (`test/CMakeLists.txt`, not a cache variable); a case whose mesh is
+  absent at configure time (`if(EXISTS <meshes>/<mesh>/nod2d.out)`) is registered DISABLED ("Not Run
+  (Disabled)"), and a missing `dist_N`/`com_info` file in an existing mesh directory FAILS — so
+  "153/153" holds only on a filesystem with these meshes (this account's).
+- **Scripts:** `tools/mesh/test_nemo_meshq.sh`, `tools/mesh/test_mesh_tools.sh`,
+  `tools/run_ini_compare.sh` (fesom_ini == FESOM2's own mesh_part build on pi/CORE2),
+  `tools/run_ini_mixed.sh` (NEMO meshes + `tools/mesh/check_dist.py` + error cases),
+  `tools/run_tri_regression.sh` (triangle roundoff gate; tiers incl. ICE_EARLY = the sea-ice output
+  of the first steps), `tools/run_cutout_short.sh` (5-day prod/prodpp/cons runs on both
+  cut-outs, np 1 vs 2/8 from one checkpoint, prodpp gated at the tight TOL_PP = 1e-5, checkerboard
+  time series via `tools/cutout_diag.py`; its ICE class is vacuous -- the tropical cut-outs stay
+  ice-free and ice seeded into the checkpoint melts within 2 steps, so a 1-vs-N sea-ice compare on
+  quads needs a run that keeps ice, which no driver switch provides yet),
+  `tools/check_meshdiag.py`, `tools/run_mpi_knem_stale_repro.sh` (L61). Shared: `tools/prod_env.sh`
+  (the production physics env of the two run scripts), `tools/lib_ini.sh` (the run_ini harness).
+
+### Mixed-mesh setup workflow (triangle, quad and mixed meshes)
+
+Every command below was run as written on 2026-10-09 (scratch copy, script
+`/work/ab0995/a270029/fesom3_hybrid/t18_workflow/run_workflow.sh`, log `t18_workflow.log` there);
+times and peak memory are login-node values for the full ORCA025 mesh. The Python tools need numpy:
+`source /usr/share/Modules/init/bash; module load python3; hash -r` (the system `python3` has none).
+
+1. **NEMO → FESOM quad mesh** — `python3 tools/mesh/nemo_meshq.py <nemo_dir> <out_dir>`, e.g.
+   `python3 tools/mesh/nemo_meshq.py /work/ab0995/a270029/meshes/nemo025q <scratch>/nemo025q_py`.
+   Reads `mesh_hgr.nc`, `mesh_zgr.nc`, `mask.nc`; writes `nod2d.out` (4th column = land-boundary
+   flag), `elem2d.out` (4 columns, SW-NW-NE-SE), `depth.out` (47 positive levels, node depths, layer
+   counts). Faithful port of `nemo_meshq.m` (identical to the MATLAB output except one fold point,
+   1 float32 ulp; `tools/mesh/test_nemo_meshq.sh`). 5 s, 0.7 GB. The output still holds 40 dead-end
+   quads, which fesom_ini rejects.
+2. **Dead ends** — `python3 tools/mesh/remove_deadends.py <in_dir> <out_dir>`: iterative, 46
+   elements / 90 nodes removed → 915 866 nodes, 902 408 quads (`nemo025q_fesom`). 12 s, 0.9 GB.
+   `depth.out` layer counts are kept; a node left above the bottom invariant is reported (none here).
+   The mesh tools write into `<out_dir>` and remove fesom_ini outputs already there (edge/level files,
+   `dist_*`), which belong to the old elements.
+3. **Mixed mesh (optional)** — `python3 tools/mesh/split_quads.py <in_dir> <out_dir> --band -5 5
+   --every 5`: every quad with centroid latitude in the band plus every 5th other quad split into two
+   triangles (shorter diagonal; the longer one where the shorter leaves a dead-end triangle) →
+   `nemo025mix`, 685 452 quads + 433 912 triangles, same nodes and `depth.out`. 5 s, 0.8 GB.
+4. **Regional cut-out for tests (optional)** — `python3 tools/mesh/cut_region.py <in_dir> <out_dir>
+   --lon -20 -5 --lat -2 12` → `nemo025q_cut` / `nemo025mix_cut` (2 509 nodes; largest connected
+   piece, dead ends removed, boundary flag recomputed, layer counts at the cut lowered to keep the
+   model's bottom invariant). 3 s.
+5. **Check every mesh** — `python3 tools/mesh/check_mesh.py <mesh_dir>`: prints a `SUMMARY` line
+   (nodes, elems, quads, tris, edges, bedges, ccw, nonconvex, degenerate, unused, multiedge,
+   deadends, layers, area; `layers` = `depth.out` nodes above the bottom invariant) and PASS/FAIL;
+   exit 1 on any error incl. dead ends (the raw `nemo_meshq.py` output fails with `deadends=40`).
+   4 s, 0.9 GB.
+6. **Partition: `fesom_ini`** (FESOM2's `mesh_part`, ported: sources `mesh_part/src/`, METIS 5.1.0 in
+   `lib/metis-5.1.0/`). Built together with the model by `./configure.sh` / `cmake --build` as
+   `<build>/bin/fesom_ini` (`build_intel_dp/bin/fesom_ini` once the user rebuilds from this branch;
+   scratch: `/work/ab0995/a270029/fesom3_hybrid/build/bin/fesom_ini`). Serial; run it in a work
+   directory holding `namelist.config`:
+   ```
+   &paths
+   MeshPath="<mesh_dir>/"
+   /
+   &geometry
+   use_depthfile="nemo"
+   /
+   &run_config
+   /
+   &machine
+   n_levels=1
+   n_part=<N>
+   /
+   ```
+   (`use_depthfile="nemo"` = NEMO `depth.out`; FESOM triangle meshes leave it out = `'aux3d'`; the
+   rotation defaults 50/15/−90 equal the model's hard-coded ones), then
+   `cd <work_dir> && <build>/bin/fesom_ini > fesom_ini.out 2>&1` (inside a batch job
+   `srun -n 1 -N 1 …`). It STOPs with exit status 0 also on errors — judge by `Total time` in the log
+   and `dist_<N>/rpart.out`. It stops on a self-intersecting or non-convex quad and on a `depth.out`
+   layer count outside 2..nl−1 (the model needs ≥ 2 layers per column). It writes INTO `MeshPath`: `edges.out`, `edge_tri.out`, `edgenum.out`
+   (edge2D, edge2D_in), `nlvls.out`, `elvls.out`, `elvls_raw.out` and `dist_<N>/` = `rpart.out`,
+   `my_list%05d.out`, `com_info%05d.out` in the FESOM2 layout plus the appended hybrid sections
+   (double-halo nodes, `com_nod2D_full`, `com_edge2D`) announced by `dist_<N>/format.out` (version 1).
+   It KEEPS existing edge/level files: delete `edges.out edge_tri.out edgenum.out elvls.out
+   elvls_raw.out nlvls.out dist_*` first when the mesh changed (`clean()` in `tools/run_ini_mixed.sh`).
+   One run per N. ORCA025: 128 parts 31 s; 1024 parts 83 s (METIS 42 s, writing 34 s), peak 0.3 GB;
+   at most 16 neighbour ranks per communication list for 128 and 1024 parts (the model's
+   `com_struct` holds `MAX_NEIGHBOR_PARTITIONS = 32`; `fesom_ini` stops above it for every list before
+   filling it, `read_com` before reading it — count with
+   `/work/ab0995/a270029/fesom3_hybrid/t18_workflow/max_neighbours.py <mesh_dir> <N>` for very high
+   N). `dist_1`: `python3 tools/make_dist1.py <mesh_dir>` (only for `check_dist.py`/FESOM2 tools; the
+   model builds its 1-rank partition itself).
+7. **Check the partition** — `python3 tools/mesh/check_dist.py <mesh_dir> <N> [<N> …]` (edges, edge
+   order, levels, ownership, halos, all communication lists incl. the appended sections) → `PASS`;
+   1024 parts of ORCA025: 73 s, 0.9 GB.
+8. **Model** — `FESOM3_MESH_DIR=<mesh_dir>/` and exactly N ranks (the driver reads
+   `dist_<number of ranks>/`). `elem2d.out` with 3 or 4 columns is detected; zbar comes from
+   `aux3d.out`, or from `depth.out` when `aux3d.out` is absent; node levels only from `nlvls.out`.
+   No other mesh setting exists (rotation hard-coded); IC, forcing, runoff, SSS and chlorophyll are
+   regular-grid files interpolated at run time. Only `FESOM3_STEP_PER_DAY` is resolution-dependent.
+   Smoke test: the mixed cut-out made by the commands above, production physics, 4 ranks, 8 steps.
+9. **Mesh diagnostics (optional)** — `FESOM3_MESHDIAG_OUT=<store> fesom_meshdiagdump`, checked by
+   `tools/check_meshdiag.py <mesh_dir> <work_dir> <fesom_meshdiagdump> <np[,np…]> [launcher …]`
+   (ctests `meshdiag_{mixed,quad,pi_w}`).
+
+Regression scripts of the workflow: `tools/mesh/test_nemo_meshq.sh`, `tools/mesh/test_mesh_tools.sh
+[nemo_dir] [out_root]` (steps 2–5; `out_root=/work/ab0995/a270029/meshes` made the persistent test
+meshes), `tools/run_ini_mixed.sh` (step 6–7 on all NEMO meshes + error cases), `tools/run_ini_compare.sh`
+(triangle meshes byte-identical to FESOM2's own mesh_part build). Test meshes in
+`/work/ab0995/a270029/meshes/`: `nemo025q_fesom`, `nemo025mix` (dist_1/2/8/128), `nemo025q_cut`,
+`nemo025mix_cut` (dist_1/2/4/8), `pi_w` (dist_1/2/4/8), `core2_w` (dist_1/2/4/8/128) — the NEMO ones
+were made from the MATLAB output in `nemo025q/`; from the Python port, `elem2d.out`/`depth.out` and all
+cut-out files are identical, `nod2d.out` differs in the one fold point and `nemo025mix` in the two
+triangles of the quad at that point (its diagonal choice flips). `work/README.md` ("FESOM3 has no
+partitioner") predates `fesom_ini` (the user's file, not edited).
+
+### CORE2 throughput of the 4-slot code (login-node timing, 2026-10-09)
+
+- **Setup:** old = `/work/ab0995/a270029/fesom3_hybrid/frozen_task6` (commit `5b2a7f3`, before the
+  4-slot kernels, triangle results bit-identical to the pre-hybrid code), new = scratch build at
+  `ec099ea`; both Release `-O3`. Original CORE2 mesh (`dist_16`, `dist_8`), production driver with the
+  `job_levante` physics (linfs, JRA55, EVP, GM+Redi, TKE, splines, vinv, rvo_upwind 1, SW pene,
+  w split), DEFAULT SSH tolerance, no output, no restart, `FESOM3_TIMING_EVERY=20`; cost per step =
+  the model's loop timers (`LOOP TOTAL`) over steps 21..N from the cumulative reports (setup, the
+  first 20 steps and I/O excluded). Old/new interleaved; np 16: 4 runs each of 200 steps, np 8: 3
+  each of 120 steps. Scripts and logs: `/work/ab0995/a270029/fesom3_hybrid/t18_timing/`
+  (`run_one.sh`, `series.sh`, `parse.py`, `t18_timing_np{16,8}.txt`, `log_*.txt`).
+- **Result:** `LOOP TOTAL` ms/step — np 16: old min 456.5 / median 458.0, new min 492.8 / median
+  499.1 → **new/old 1.079 (min) / 1.090 (median)**; np 8: old 850.9 / 853.9, new 926.9 / 931.9 →
+  **1.089 / 1.091**. Noise: run-to-run spread of the loop time 2.5 % (old) / 3.3 % (new) at np 16,
+  0.8 % / 1.7 % at np 8; 20-step blocks give the same ratio (1.08–1.10). Whole-run wall clock agrees
+  (np 16 old 93.7–95.7 s, new 101.0–104.3 s).
+- **Per component** (np 16 median, ms/step old → new): ice 88.4 → 113.8 (**×1.29**), GM/Redi
+  36.1 → 39.0 (×1.08), dynamics u,v,w 75.5 → 82.2 (×1.09), mix/pres/EOS 52.0 → 55.1 (×1.06), tracer
+  148.5 → 149.8 (×1.01), SSH 32.8 → 33.5, forcing/fluxes unchanged; np 8 the same pattern (ice ×1.29).
+- **Hot spot (only component > 20 %): the sea-ice EVP.** `perf` over all 16 ranks (80 steps,
+  `t18_perf_cmp.txt`): `evpdynamics` (stress_tensor/stress2rhs inlined, 120 subcycles over 4 slots)
+  1.24× summed over ranks and 1.33× on the most ice-loaded rank, which sets the pace — the other ranks
+  wait in MPI (`mca_btl_vader_component_progress` +19 %); ice FCT `ice_fem_fct` 1.28×, `ice_TG_rhs`
+  1.62× (small in absolute terms). Ocean: `smooth_nod` now a separate routine (+0.7 % of the step),
+  `fer_gamma2vel` 1.72×, `momentum_adv_vinv` 1.15×, `impl_vert_visc_ale` 1.19×. All compute outside
+  MPI: ×1.048. Not optimised (Task 18 reports only).
+- **Scaled:** 14 min per model year on 512 ranks (results17, pre-hybrid binary) × 1.08–1.09 ≈
+  **15.1–15.3 min per model year**. Indicative only: login-node ratios at np 8–16 (shared node, MPI
+  over shared memory); at 512 ranks communication weighs more and the ice-rank imbalance may differ.
+
+### NEMO 0.25° example job: `work/job_levante_nemo025`
+
+- New file next to `work/job_levante` (untracked like everything in `work/`; never `git add`ed).
+  Same header style, modules (`env.sh intel`), limits and FESOM3_* physics as `job_levante` (copied);
+  changed: mesh `/work/ab0995/a270029/meshes/nemo025q_fesom` (comment: `nemo025mix` as alternative),
+  8 nodes × 128 = 1024 ranks (`NPART`, must match `dist_1024`), 1 h, output tree
+  `results_nemo025/<mesh>_1958_1m`.
+- **Setup part:** checks `nod2d.out`, `elem2d.out`, the depth file (picks `use_depthfile` 'aux3d' or
+  'nemo'), the model binary, `SLURM_NTASKS == NPART`, and that the edge/level files and a complete
+  `dist_<NPART>/` (rpart, format.out, NPART my_list + com_info) exist; if not, writes the
+  `namelist.config` above into `work/ini_<mesh>_<NPART>/` and runs `srun -l -n 1 -N 1 fesom_ini`
+  there, then re-checks. `DRYRUN=1 bash job_levante_nemo025` runs the checks and prints the would-be
+  `namelist.config`, the fesom_ini and the srun lines and the FESOM3 environment, launches nothing;
+  `DRYRUN=1 DRYRUN_INI=1` also runs fesom_ini on the login node (prepares `dist_N` before
+  submission). Overrides `MESH`, `NPART`, `BIN`, `INIDIR` for tests.
+- **Dry runs (2026-10-09):** as is → stops with `ERROR: missing build_intel_dp/bin/fesom_ini` (the
+  user's binary of 2026-10-08 predates the hybrid branch; **rebuild `build_intel_dp` from this branch
+  before use** — the old model binary cannot read quad meshes) and `dist_1024` missing → prints the
+  fesom_ini call. With `BIN` = scratch build and a scratch mesh that has `dist_1024`: all checks ok,
+  prints `srun -l -n 1024 …/fesom_lifecycle_native_mr`. With `NPART=8 DRYRUN_INI=1` on a scratch
+  `nemo025mix`: fesom_ini ran (21 s), `check_dist.py` PASS afterwards.
+- **USER: choose** (conservative placeholders): `FESOM3_STEP_PER_DAY=96` (900 s; ORCA025 cells
+  shrink to ~10 km at high latitudes; the cut-outs ran 10 days stable at 48), run length 1 month
+  (`FESOM3_RUN_LENGTH=1`, `FESOM3_RUN_UNIT=m`), nodes / wall time (8 nodes, 1 h), `RUNID` / output
+  tree. Restart settings as `job_levante` (yearly; a shorter run writes its end-of-run checkpoint).
+- **Wall-time ESTIMATE (not measured):** work per step relative to CORE2 from the mesh counts —
+  nodes 7.2× (915 866 vs 126 858), wet node-levels 8.4× (31.1 M vs 3.7 M), element-levels 4.3×
+  (quad mesh; mixed 5.3×), edges 4.9× (mixed 5.5×) → factor 4.3–8.4; × 2 steps (900 s) × 1.09 (4-slot
+  cost) × 14 min per CORE2 year on 512 ranks → **2.2–4.3 h per model year on 512 ranks, 1.1–2.1 h on
+  1024 ranks (8 nodes)**, assuming linear scaling (1024 ranks still hold 3.6× more nodes per rank than
+  CORE2 on 512) → one month ≈ 6–11 min + startup (mesh read and IC for 0.9 M nodes, minutes) +
+  fesom_ini 1.5 min on the first run; 1 h leaves ≥ 4× margin; a model year on 8 nodes: ask for ~3 h.
+  Unknowns: more CG iterations of the SSH solve at 0.25° (CG ≈ 4 % of the CORE2 step), a larger ice share
+  (dense ORCA grid in the Arctic; the EVP is the 4-slot hot spot), startup time at 1024 ranks.
+
+### Gate migration for hybrid meshes (decision, 2026-10-08, plan `plans/completed/2026-10-08-hybrid-meshes.md` Task 7)
+
+From Task 7 on the mesh geometry is the unified 4-slot one (area-weighted centroid, kite weights
+`elem_w`, Green–Gauss `gradient_sca(8)` with x in 1:4 / y in 5:8, `edge_tri(2) == edge_tri(1)` and
+`elem_neighbors == self` on the boundary). For triangles it equals FESOM2's P1 geometry only up to
+roundoff, so no FESOM2-oracle byte gate (`max|Δ|=0`) can pass any more.
+- **Retired** (kept in `tools/` as the record of how M0–M10 were proven; not to be run as gates):
+  every FESOM2-oracle byte gate — `run_geom_gate{,_core2,_multirank}.sh` (+ `geom_diff.py` as a gate),
+  `run_advhor_gate{,_multirank}.sh`, `run_pressure_gate{,_core2}.sh`, `run_step_gate{,_multirank}.sh`,
+  `run_stepdyn_gate_multirank.sh`, `run_forcing_gate.sh`, `run_ic_gate_core2.sh`,
+  `run_ice_gate_core2.sh`, `run_evp_gate_core2.sh`, `run_icefct_gate_core2.sh`,
+  `run_iceflux_gate_core2.sh`, `run_icethermo_gate_core2.sh`, `run_tke_replay_gate_core2.sh`,
+  `run_meshdiag_gate.sh`, and all `run_lifecycle_*gate*` scripts (`.sh` and `.sbatch`), plus the
+  oracle-dump helpers they call (`run_*dump*.sh`, `run_oracle_pi.sh`, `run_kppinit_oracle.sh`,
+  `run_tkedump_oracle.sh`).
+- **Remapped:** `src/infra/mod_geom_dump.F90` still writes FESOM2's 6-row `gradient_sca` (x = slots
+  1:3, y = slots 5:7), so `fesom_geomdump` + `tools/geom_diff.py --signal=<tol>` remain usable as a
+  roundoff-level diagnostic. The other dump drivers build and run unchanged; Task 14 retires or
+  remaps each of them.
+- **Dump drivers (Task 14):** none deleted — each stays a buildable diagnostic dump whose FESOM2
+  byte gate is retired (a status note heads every driver). `fesom_geomdump`/`mod_geom_dump`:
+  REMAPPED to the FESOM2 layout (3 vertices, 6-row `gradient_sca`, `edge_tri(2) = 0` on boundary
+  edges as FESOM2 stores it), triangle meshes only — a mesh with quads stops with a message.
+  `fesom_meshdiagdump`: REMAPPED to the hybrid store layout (next bullet), checked by the ctests
+  `meshdiag_{mixed,quad,pi_w}` (`tools/check_meshdiag.py`); `zarr_diff.py --meshdiag` vs FESOM2 is
+  retired. `fesom_pressuredump`: REMAPPED — its own node→element means (KPP `viscAE`, the unstable-
+  element count) run over the 4 slots with `elem_w` like the kernels. `fesom_advhordump{,_mr}`,
+  `fesom_evpdump`, `fesom_icefctdump`: no triangle-specific code of their own (they run the
+  converted kernels; the ice kernels convert in Tasks 15/16), unchanged. `fesom_conserve` is a kept
+  ctest gate (its `helem` invariant was converted in Task 12).
+- **Output format changes (Task 14) — check notebooks/scripts that read FESOM3 stores:**
+  `fesom.mesh.diag.zarr` (`FESOM3_MESHDIAG`) now has 4-column per-face arrays, dim `n4`:
+  `face_nodes` (a triangle's 4th = `_FillValue` −1, i.e. Zarr `fill_value` −1), the new
+  `face_edges` (edge k joins nodes k, k+1; triangle 4th −1) and `face_links` (neighbour across edge
+  k; missing neighbour AND a triangle's 4th = −999, FESOM2's value), `gradient_sca_x/y` (4
+  coefficients, triangle 4th = 0); the topology names `face_edge_connectivity`/
+  `face_face_connectivity`. xarray decodes a declared `_FillValue`, so with the default
+  `mask_and_scale=True` these integer arrays come back as float with NaN (`mask_and_scale=False`
+  keeps the integers). The element coordinates `lon`/`lat` of the field-output and restart stores
+  (and the point where element vectors u/v/bolus are r2g-rotated) are now the area-weighted,
+  cyclic-wrapped centroid (`elem_center`) instead of FESOM2's plain unwrapped 3-vertex mean: equal
+  to < 1e-10 deg everywhere except the elements across the ROTATED dateline (pi 77, CORE2 566),
+  where the old coordinate was on the wrong side of the globe and the old geographic u/v were
+  rotated with the wrong angle. `run_tri_regression.sh` compares element vectors there by speed
+  (see its header). The user's notebooks in `work/` read FESOM2's `fesom.mesh.diag.nc` — unaffected.
+- **Kept** (FESOM3-only, unaffected): `run_restart_gate_core2.sh`, `run_restart_gate_multirank.sh`
+  (split vs straight), `run_output_gate.sh` (writer vs generator), `run_conserve_pi.sh` and the
+  ctest suite.
+- **Replacement:** `tools/run_tri_regression.sh` (Task 7, tightened in the Task-7 follow-up) — run
+  after Tasks 7, 10, 14 and 16. Reference = `/work/ab0995/a270029/fesom3_hybrid/frozen_task6_soltol`:
+  commit `5b2a7f3` (the last bit-identical state) + ONLY the SSH-solver tolerance knob (README there;
+  with the knob unset it is byte-identical to the original `frozen_task6`, which is kept). Cases:
+  `prod:pi:1`, `prod:pi:2`, `prod:core2:8` (production driver, job_levante physics, 4 steps, all
+  substep node dumps in double + float32 output every step, ref vs new), `decomp:pi_w:2`,
+  `decomp:pi_w:8` (new build np 1 vs np N, both restarted from one 0-step np-1 checkpoint — see the
+  next bullet), `conserve:pi:1/2` (`fesom_conserve` zstar+Redi+TKE 20 steps, drift and final totals
+  ≤ 1e-12).
+  - **Solver:** every prod/decomp run sets `FESOM3_SSH_SOLTOL=1e-14` (new env knob in
+    `oce_ssh_solve.F90`, also `FESOM3_SSH_MAXITER`; unset = production soltol 1e-5 / maxiter 2000;
+    ~3× CG iterations). With 1e-5 the iterate differences swamp the roundoff: the same binary at 1e-5
+    vs 1e-14 differs by 3.5e-4 in `d_eta` at step 1 on pi — that is why the first gate could only be 1e-2.
+  - **Metric** per field `d = max|a−b|/max|a|` over nodes/elements, levels, steps/records; tiers and
+    classes (pi / core2 tolerance): PRE = step 1 before the first solve (1e-9 / 1e-9; measured 6e-15 /
+    1.3e-11); EARLY = every double dump except Kv over steps 1..3 on pi, step 1 on core2 (1e-10 / 1e-8,
+    core2 raised to 1e-7 in Task 15 for the EVP-amplified roundoff; measured 9.2e-13 / 2.1e-9); OCEAN =
+    all steps of the double dumps (T, S, eta, d_eta, w, ssh_rhs,
+    density, …) and all float32 output records of temp/salt/ssh/sst/sss/u/v/w/unod/vnod/bolus
+    (1e-6 / 2e-4, float32 +2^-21; measured 3.3e-8 dumps, 1.0e-7 u/v / 4.4e-6 dumps, 2.2e-5 u/v); ICE =
+    a_ice/m_ice/m_snow (1e-5 / 2e-3; measured 3.9e-7 / 1.2e-4); MIX = Kv, Av (1e-6 / 1e-2; measured
+    2.2e-9 / 2.4e-4). decomp measured: PRE 0, EARLY ≤ 4.3e-13, OCEAN ≤ 2.5e-11 (dumps).
+  - **Why not tighter:** the remaining floor is amplification of roundoff by stiff/discontinuous
+    physics, not roundoff: on CORE2 the sea ice (EVP at rest, Δ_min-regularised viscosity) lifts T at
+    ice-covered nodes to 2e-9 already in step 1 and to ~1e-6..1e-5 after 4 steps; on pi the jump
+    comes at step 4 (first JRA55 record refresh moves the ice; the same jump appears in np1 vs npN
+    from a common state and with the summer IC); TKE thresholds drive Kv/Av. Steps 1–3 on pi are
+    pure roundoff (≤ 1e-12), hence the EARLY tier.
+  - **Levels at the end of the plan** (Task 19, clean clone of `98b5164`, all 4-slot kernels in): pi
+    PRE 6.3e-15, EARLY 9.2e-13, OCEAN 1.1e-7, ICE 5.9e-7, MIX 4.4e-9; CORE2 PRE 2.5e-11, EARLY 2.2e-8
+    (T at ice nodes; with mEVP in both runs 1.1e-15), OCEAN 3.1e-5, ICE 9.7e-5, MIX 7.8e-4; decomp
+    OCEAN ≤ 8.8e-10; conservation drift ≤ 2.8e-14. Extra case `decomp:core2_w:8` (np 1 vs np 8 on full
+    CORE2 from one checkpoint): EARLY 2.6e-12, OCEAN 2.7e-5, ICE 7.3e-5, MIX 2.2e-5. Element vectors at
+    the moved dateline centroids are compared by speed (Task 14, header of the script).
+- **Decomposition dependence on the original pi (resolved, by design, not a bug):** a COLD START
+  differs between np 1 and np N (frozen and pre-hybrid 9b0d3a6 binaries alike; density 4.7e-3 at step
+  1, pi_w too: 5.5e-3) because the INITIAL CONDITION does. `oce_initial_state::extrap_nod3D` (FESOM2
+  `gen_support.F90` extrap_nod3D, transcribed for byte-identity) fills land-masked PHC points by a
+  Gauss–Seidel neighbour average over OWNED nodes, reading halo values that are refreshed only after
+  each full sweep — the result depends on the partition and node order. Proven on pi: all 513
+  (node, level) density differences at step 1 (34 nodes) are points that `getcoeffld` leaves as dummy
+  (2175 of 3140 nodes need extrapolation at some level); nothing else differs. From a common state
+  (one checkpoint written by a 0-step np-1 cold start, restarted at np 1/2/8, tight solver) the model
+  is decomposition-independent to roundoff (original pi and pi_w, frozen and current build: step 1
+  ≤ 1.2e-14, steps 2–3 ≤ 2e-13). Not changed: a partition-independent extrapolation (Jacobi sweep,
+  or extrapolate on the global mesh) would change every production IC and break the FESOM2 byte
+  heritage — a design decision for the user. Consequence: compare np 1 vs np N only from a common
+  restart (as `decomp:` does), never from two cold starts.
+
+### Known findings / open questions for the user
+
+Collected from the plan's ⚠️ notes and the `[deviation]` lines of the task log. None is fixed; the ones
+marked **decide** need a design decision.
+
+1. **Decomposition-dependent cold start** (Task 7 follow-up, L60) — **decide**: `extrap_nod3D` (FESOM2's
+   Gauss–Seidel IC extrapolation with per-rank halo snapshots) makes np 1 and np N start from different
+   T/S at the extrapolated points; from one checkpoint the model is decomposition-independent to
+   roundoff. A partition-independent sweep would change every production IC (details in "Gate
+   migration for hybrid meshes").
+2. **Linear tracers are not advected exactly at triangle–quad interface nodes and on general quads**
+   (Task 11) — **decide**: the median-dual edge scheme is linearly exact only where the dual cell is all
+   triangles or all parallelograms; elsewhere the node tendency of a linear tracer in uniform flow has an
+   O(1) LOCAL relative error (0.22 NEMO-mixed interface nodes, 0.24 jittered patch) although the MUSCL
+   face values are exact. Possible remedy: face values at the dual-segment midpoints.
+3. **Vorticity of a linear shear** is exact only on triangles and parallelograms (Task 10): 6e-2 (first
+   order) on the jittered general quads; the NEMO quads are lon/lat rectangles (exact).
+4. **Tracer checkerboard / grid-scale energy grows** (Task 17 ⚠️) — **decide**: 10-day np-1 runs on the
+   cut-outs, E_loc SST ×6, SSS ×11–12, faster at quad and interface nodes than at triangle nodes; not
+   exponential within 10 days but not saturating either. The SSH null mode does not grow. Remedies
+   (hourglass control, the dual-segment face values of item 2) are design decisions. Watch it on the
+   full mesh (`tools/cutout_diag.py checker` works on any mesh with output).
+5. **GM/Redi resolution scaling** `(area(n)·2/refscalresol²)^(1/order)` in `init_Redi_GM`
+   (`src/oce/oce_fer_gm.F90:103`, `:126`) — **decide**: the factor 2 is the triangle element/node area
+   ratio; on all-quad meshes it overstates the resolution by √2 (larger `fer_scal`). FESOM2 tuning, left
+   unchanged.
+   - **Same question for the viscosity length on quads** (code review 2026-10-09) — **decide**:
+     `visc_filt_bidiff` (`src/oce/oce_dyn_visc.F90:132`, `:168`) uses `len =
+     sqrt(sum(elem_area(el)))` of the edge's elements; a quad has about twice a triangle's area at
+     the same node spacing, so `len` is ≈ √2 larger, and the `/elem_area` divisor and the 4-side
+     stencil change the effective coefficient too. On all-quad and mixed meshes the effective
+     viscosity therefore differs by an O(1) factor from what the triangle-tuned `visc_gamma0/1/2`
+     give. Formula left unchanged (physics tuning); an element-type-independent resolution length
+     would be the alternative.
+6. **Output element coordinates changed at the rotated-dateline elements** (Task 14): pi 77, CORE2 566
+   elements now carry the wrapped centroid; their lon/lat and the geographic u/v/bolus_u/bolus_v change
+   by O(1) (the old values were wrong). Notebooks comparing old and new output see this.
+7. **Standard EVP is unstable for uniform ice at rest** (Task 15, pre-existing FESOM2 property): roundoff
+   grows to O(1e-2) m/s within 120 subcycles on the triangle patch; it is the amplifier behind the CORE2
+   ICE regression tier. mEVP (zero stress at rest) is the clean diagnostic.
+8. **TKE thresholds amplify roundoff** (Task 17): 1-vs-N on the quad cut-out reaches 1e-4 (v) after 5
+   days, and a threshold can turn roundoff into a local O(1e-9) jump within hours depending on build,
+   np and dump probes; with PP instead of TKE ≤ 1.1e-7. Compare decompositions with PP, or expect this.
+9. **Open MPI 4.1.2 knem stale payloads on the login node** (Task 10, L61): library bug, workaround
+   `--mca btl_vader_single_copy_mechanism none` in the test launchers; batch runs (UCX, `env.sh`) are not
+   affected (see "Open notes / risks").
+10. **Cost of the 4-slot code**: CORE2 ×1.08–1.09 per step (≈ 15.1–15.3 min per model year on 512
+    ranks), the sea-ice EVP ×1.29 is the hot spot; not optimised.
+11. **At most `MAX_NEIGHBOR_PARTITIONS = 32` neighbour ranks per communication list**
+    (`src/types/mod_partit.F90:12`, `mesh_part/src/MOD_PARTIT.F90`; `rPE`/`sPE` hold 32, `rptr`/`sptr` 33
+    in both): `fesom_ini` stops ("Increase MAX_NEIGHBOR_PARTITIONS") for all five lists when more than 32
+    receive or send PEs are counted, before the fixed arrays are filled (`gen_comm.F90` for com_nod2D,
+    com_elem2D, com_elem2D_full; `set_pe_ptr` in `oce_local.F90` for com_nod2D_full, com_edge2D; no ctest,
+    it needs a > 32-neighbour partition); the model's `read_com` dies with the list name and count before
+    reading (ctest `test_partit_many_neighbours_*`). ORCA025 at 128 and 1024 parts: at most 16. Count before going
+    to very high N (`max_neighbours.py`, setup workflow step 6).
+12. **Full NEMO 0.25° cold start** (Task 19, production physics, 900 s, np 8, 2 days): finite, but
+    max|eta| 2.55 / 2.52 m and max|uv| 2.42 / 2.60 m/s (quad / mixed mesh) within the first day, bounded
+    afterwards (day 2: 1.8 m, 2.1–2.2 m/s) — global cold-start adjustment on a mesh never run before; to
+    be judged with the user's longer runs.
+13. **`configure.sh` now passes `CC`/`CXX`** (`-DCMAKE_C_COMPILER`/`-DCMAKE_CXX_COMPILER`, for METIS and
+    `fort_part.c` of `fesom_ini`); builds that bypass `configure.sh` need a C compiler configured.
+    **Rebuild `build_intel_dp` from this branch** before any NEMO run (the old binary cannot read quad
+    meshes and has no `fesom_ini`); a rebuild moves a running triangle experiment at roundoff level —
+    keep a copy of its binary if it must continue unchanged.
+14. **Old reference partitions not reproducible** (Task 3): pi `dist_2/8` + its `elvls/nlvls.out` and
+    CORE2 `dist_8` + its current levels come from older fesom_ini versions; the ported fesom_ini equals
+    FESOM2's own current build byte for byte, and the old files pass `check_dist.py`.
+15. **Still open from before the plan — dotty `w` near topography** in the user's CORE2 run: not
+    explained by the MUSCL change nor by the knem bug (production uses UCX); candidate one-change tests
+    from the same restart (user's runs): `FESOM3_MOMADV_OPT=2`, `FESOM3_WSPLIT` unset,
+    `FESOM3_RVO_UPWIND=0`.
 
 ## Next task
 
 ### ✅ RESTART / CHECKPOINT — **COMPLETE & tagged `m10` (2026-06-29).** Partition-independent Zarr checkpoints (full prognostic state incl. sea ice + EVP sigma), written periodically + at end-of-run, read at startup on `r_restart`, resuming byte-exactly. Built on the M9 Zarr stack (`mod_io_zarr` + `mod_io_decomp` + new `decomp_gather` inverse); new `src/io/mod_io_restart.F90` (writer+reader, atomic tmp→rename finalize + `restart.latest` + keep-N prune), `mod_io_posix.F90` (bind(C) rename/unlink/fsync/rmtree — no `execute_command_line`), `mod_io_coords.F90` (shared coord helper). Lifecycle wiring in `fesom_lifecycle_native_mr` (detect/read/AB-guard/write/cadence + `clock_finish`).
-- **Gate (6.1) split-vs-straight self-consistency:** np=1 mid+boundary **exactly `max|Δ|=0`** over the WHOLE state (ice+sigma+velocity+AB+tracers); np=2 mid exact; np=2 boundary **≤1 ULP** (temp 2.2e-16) — a **FESOM2-inherent** limit (any-node element ownership → 562 redundantly-owned boundary elements not halo-synced; FESOM2's own nc restart dedups identically; a live sync would break M0–M9 byte-identity → user-accepted caveat; `tools/run_restart_gate_core2.sh`, `--rel-floor` 0 at np=1 / 1e-12 at np>1). Found+fixed 2 missing carried fields the gate caught: `ice%thermo%t_skin` + `dyn%d_eta`.
+- **Gate (6.1) split-vs-straight self-consistency:** np=1 mid+boundary **exactly `max|Δ|=0`** over the WHOLE state (ice+sigma+velocity+AB+tracers); np=2 mid exact; np=2 boundary **≤1 ULP** (temp 2.2e-16) — a **FESOM2-inherent** limit (any-node element ownership → 562 redundantly-owned boundary elements not halo-synced; FESOM2's own nc restart dedups identically; a live sync would break M0–M9 byte-identity → user-accepted caveat; `tools/run_restart_gate_core2.sh`, `--rel-floor` 0 at np=1 / 1e-12 at np>1). **Resolved 2026-10-12:** the same unsynced copies leaked volume in CORE2 runs; the shared-element sync (section "Shared elements: one owner for `uv`") keeps them equal, np>1 restarts are now exact and the gate's floor is 0 (1e-12 only with `FESOM3_SHARED_SYNC=0`). Found+fixed 2 missing carried fields the gate caught: `ice%thermo%t_skin` + `dyn%d_eta`.
 - **Gate (6.2) cross-partition storage+restore:** `C2(np2) ≡ C8(np8)` **strict `max|Δ|=0`** all 27 stores (`tools/run_restart_gate_multirank.sh`, np8 reads C2, zero steps, re-writes C8).
 - **No-regression (6.3):** ctest **Intel 21/21 + GNU 21/21** (sweep caught & fixed a GNU-only cpp `/*`-in-comment build break); M9 zarrsmoke/meshdiag/output gates GREEN; production MR lifecycle byte-gate np2 **195 records `max|Δ|=0`**.
 - **Plan:** `docs/plans/completed/2026-06-28-restart-checkpoint.md` (all boxes ticked; Claim-scope refinement documents the np>1 ULP). Memory: `restart-tskin-carried-ice-state`, `restart-np-element-1ulp-inherent`.
@@ -1096,7 +1729,8 @@ multi-rank ✅ DONE + byte-gated 2026-06-23/24 (`max|Δ|=0`, CORE2 1-rank AND di
   oracle base namelist IS work_core (GM params already correct) so `run_lifecycle_core2.sh` gained `FER_GM=1` to KEEP
   `Fer_GM=.true.` (Redi sed off); FESOM3 `fesom_lifecycle` gained `FESOM3_FER_GM` (sets `Fer_GM` + work_core GM config
   + allocates/inits the GM arrays). NO oracle source change. `compute_neutral_slope` SKIPPED (Redi/Ktaper-only,
-  unconsumed at M4c → M4d). `fer_w` into BOTH `w` and `w_e` (faithful; `w_e` unused at `use_wsplit=.false.`). No
+  unconsumed at M4c → M4d). `fer_w` into BOTH `w` and `w_e` (faithful: the non-FCT HO vertical advection reads `w_e`; it
+  equals `w` when the split is off). No
   regression: GM-OFF lifecycle 195 `|Δ|=0` (the `Fer_GM`-guarded edits are byte-neutral), step-65 1-rank `|Δ|=0`,
   ctest 13/13.
 - **M4d** — Redi isopycnal diffusion, gated `Fer_GM=T + Redi=T` (production GM+Redi) UNFORCED lifecycle: **`max|Δ|=0`,
@@ -1279,9 +1913,10 @@ passes — all input paths verified: CORE2 mesh `/pool/data/AWICM/FESOM2/MESHES_
   hang (L8) is bypassed. The shim FORCES the reduced-M2 dispatch (`mix_scheme_nmb=2`/`Fer_GM=.false.`/`Redi=.false.`/
   `opt_visc=7`/`use_wsplit=.false.`) over the shipped pi namelist (which keeps all GM/Redi/KPP arrays allocated).
   M2.10 forcing is where reading real files + running PAST the shim's stop first becomes necessary.
-- **`use_wsplit=.true.` / `adv_tra_vert_impl` is an unported kernel** (do_oce_adv_tra's FCT implicit-vertical-advection
-  correction; guarded with `error stop`). M2.9b forced `use_wsplit=.false.` (M1.4 precedent). Port it + integrate
-  the M2.7 explicit/implicit w-split into a real multi-step run in a later dynamics pass.
+- **`use_wsplit=.true.` / `adv_tra_vert_impl` was an unported kernel** (do_oce_adv_tra's FCT implicit-vertical-advection
+  correction; guarded with `error stop`); M2.9b forced `use_wsplit=.false.` (M1.4 precedent). **Ported 2026-10-02**
+  together with the smooth Shchepetkin split and run end to end in the `wsplit` conserve configs — see
+  "Implicit vertical advection: the smooth `use_wsplit` split" under "Momentum advection options".
 
 **M1 multi-rank gate (folded into M2.12b):** the local-mesh remap (global→local
 numbering/connectivity/geometry, com-structs) is ✅ DONE (M2.12a — geometry byte-gated `max|Δ|=0` on dist_2+dist_8;
@@ -1362,6 +1997,22 @@ ice step + `oce_fluxes` into a forced lifecycle, drop the prescribed fluxes, the
 
 ## Open notes / risks
 
+- **Stale MPI payloads on the login node = an Open MPI 4.1.2 bug, NOT a halo-code bug (2026-10-08,
+  hybrid plan Task 10 follow-up, LESSONS L61; supersedes the "corrupts >131 KB" reading of L35).**
+  `pml ob1` + `btl vader` + knem single-copy caches knem registrations by virtual address and misses
+  glibc heap trims (`brk`); a buffer re-allocated at the same address is then read from the OLD pinned
+  pages (right count, correct first 32 KB, payload of an earlier message). Standalone proof:
+  `tools/run_mpi_knem_stale_repro.sh` (stale only under knem + heap trim; clean with single-copy
+  `none`/`emulated`, `mpi_leave_pinned 0`, or `pml ucx`). `mod_halo` was audited: contiguous buffers
+  alive until `MPI_Waitall`, exact request counts, no overlapping exchanges, and an
+  `-check arg_temp_created` build creates no argument temporary in `test_vinv` or the production
+  driver (pi np 2, CORE2 np 8). **Production is not affected**: `work/job_levante` sources `env.sh`
+  → `shell.intel` sets `OMPI_MCA_pml=ucx` (vader unused; UCX tested clean with its knem/cma
+  transports), and `env.sh` has also exported `OMPI_MCA_btl_vader_single_copy_mechanism=none` since
+  M2.12. Hence this bug **cannot explain the dotty `w` near topography** in the CORE2 batch runs.
+  Exposed are only login-node `mpiexec --mca btl self,vader` runs WITHOUT `env.sh` and without the
+  flag (ctest gets it from `FESOM3_MPI_LAUNCH_FLAGS`; `run_tri_regression.sh`, `run_conserve_pi.sh`,
+  `run_bottom_audit.sh` pass it; the other `tools/run_*.sh` source `env.sh`).
 - The FESOM2 oracle is built + PROVEN (M0.7 geometry + M1.1–M1.4 advection + M2.1–M2.9a
   pressure/EOS/N²/PGF/vel_rhs/momadv/viscosity/ivertvisc/SSH/ALE-update/PP-mixing/convective-adjustment/tracer-solve gates
   all `max|Δ|=0`, **57 fields**, `tools/run_pressure_gate.sh`) + M2.9b the WHOLE assembled `oce_timestep_ale`
@@ -1398,3 +2049,180 @@ ice step + `oce_fluxes` into a forced lifecycle, drop the prescribed fluxes, the
   fesom.x`, then re-run `cmake .` first if a NEW shim file was added so the GLOB picks it up) after editing a
   shim. The `next_io_rank` np=1 fix is behavior-preserving (sequential I/O, value-identical) and arguably a real
   bug fix (the code's own TODO admits the recursion never ends at 1 rank).
+
+## MUSCL horizontal tracer advection: on-the-fly up/downwind reconstruction (reference RK3 rule)
+
+FESOM2 stores the per-edge up/downwind tracer gradient `edge_up_dn_grad(4, nl-1, nEdge)`,
+rebuilt every step by `fill_up_dn_grad` (triangle gradient on the levels shared by both edge
+nodes, a Miura node-averaged gradient on the others and at edges without both triangles).
+FESOM3 follows the reference RK3 code (`qq/oce_stepRK3.F90`, `t_hor_adv_muscl_RK3`) instead:
+
+- `init_tracers_AB` builds `twork%tr_xy` (elemental gradient of `values`, full element halo),
+  persistent scratch; `solve_tracers_ale` reuses it for the horizontal diffusion / Redi.
+- `adv_tra_hor_muscl(…, tr_xy, edge_up_dn_tri, …)`: side 1 takes `tr_xy` of
+  the upwind triangle, side 2 that of the downwind triangle, on the levels where that triangle
+  is wet; a missing or dry triangle gives a **zero** increment. No stored array, no node
+  average. Kept from FESOM3 (not from the reference): `edge_dxdy` with the folded metric, edge
+  flux output for FCT, cavities (`ulevels`), the gradient of `values` (not of the advected `valuesAB`, as FESOM2).
+- **Not bit-identical to FESOM2 any more**: identical on every (edge, level) where both edge
+  triangles exist and the level is shared by both edge nodes; different at coasts and
+  bathymetry / cavity steps (core2: 0.8 M of 10.9 M edge-levels, max |Δflux| 0.4 % of max
+  |flux|; pi 1.3-1.5 %).
+- `fill_up_dn_grad` is removed (2026-10-08) together with the FESOM2-comparison parts S/T of
+  `test_muscl_onthefly` and the `edge_up_dn_grad` dump record; the numbers below are from
+  before the removal.
+
+Net: `test_muscl_onthefly` (np 1/2; pi as read and with synthesised cavities): part R = the
+production kernels equal the stored-array kernels fed with the reference rule, bitwise, both
+velocity signs; part S = equal to FESOM2 bitwise on the shared levels, different elsewhere
+(teeth); part T = timing. core2 (login node, one MFCT call incl. the gradient preparation):
+np 4 42 vs 74 ms, np 1 180 vs 316 ms (~43 % faster than FESOM2's fill + kernel); memory
+-535 MiB in total (~1 MiB/rank at 512). Run the test on core2 with `ulimit -s unlimited`.
+
+**Single MUSCL kernel (2026-10-08)**: as in the reference RK3 code there is ONE MUSCL kernel,
+`adv_tra_hor_muscl` = FESOM2's `adv_tra_hor_mfct` (no boundary clamp; where the up/downwind
+triangle is missing or dry the face value is ⅔·T_up + ⅓·T_dn). FESOM2's clamped MUSCL and
+everything of `nboundary_lay` (init, `t_tracer_work` field, dump record) are removed;
+`tra_adv_hor` is `UPW1` or `MUSCL` (`'MFCT'` is no longer accepted). The production FCT
+path is unchanged bitwise (only the name). Without FCT the scheme runs but is not monotone.
+
+## Momentum advection options (`momadv_opt`)
+
+| value | scheme | where |
+|---|---|---|
+| 1 | vector invariant, `(curl u + f) x u + grad(u^2/2) + w du/dz` | `src/oce/oce_dyn_vinv.F90` |
+| 2 | flux/scalar form (default, all drivers pin it) | `momentum_adv_scalar`, `src/oce/oce_dyn_velrhs.F90` |
+
+Both only ADD into `UV_rhsAB`, dispatched as siblings in `compute_vel_rhs`; `momadv_opt==2`
+is unreachable from the `==1` branch, so enabling the new scheme cannot perturb the old one.
+
+`FESOM3_MOMADV_OPT` (**value**-based, not presence-based — `momadv_opt` is 1 or 2; default
+2) is read by `fesom_conserve` and `fesom_lifecycle_native_mr`; `tools/run_conserve_pi.sh`
+gates it at np=1 and np=8. The other production drivers pin `momadv_opt = 2`.
+
+`rvo_upwind` (`FESOM3_RVO_UPWIND`, value in [0,1], default 0) blends the face
+relative-vorticity reconstruction toward the 1-2 upwind edge-neighbours, weighted by the
+inflow `d+|d|` through each face (inward normals rebuilt from the element's OWN vertices --
+per-edge geometry is owned-edges-only). 0 = plain vertex average, structurally bit-identical;
+1 = fully upwind. Convex (max principle), energy-neutral (`u.[(f+zeta) x u] == 0` for any
+zeta), linear in the coefficient. Net: `test_vinv` V8-V12 + the `momadv-vinv-upw` gate
+configs at np=1/8. `mesh%elem_neighbors` is built once in `build_elem_adjacency`
+(`compute_geometry`); `elem_edges` remains unbuilt.
+
+Revalidated after the fact (critical re-review of `6e38cf6`): the one open question was
+the halo ring — `exchange_elem` fills only eDim while `elem_neighbors` may hold halo ids.
+Settled, not patched: edge-neighbours of an owned element are in eDim by construction
+(FESOM2 `gen_comm.F90`: `com_elem2D` = edge-sharing, `com_elem2D_full` = node-sharing),
+verified at np=2/8 and guarded by `test_vinv` A5 (production fill/exchange/read pattern
+with a sentinel). `exchange_elem_full` is NOT needed here. See L56.
+
+**There is no FESOM2 oracle for `momadv_opt==1`** (the v2.7.3 branch aborts: "not adapted
+mom_adv advection typ for ALE"). Its net is `test/test_vinv.F90` — analytic cases that are
+exact to round-off — plus the conservation gate. See L54 and
+`docs/plans/completed/2026-10-01-momadv-vector-invariant.md`.
+
+### Implicit vertical advection: the smooth `use_wsplit` split
+
+`w = w_e + w_i` face by face in `compute_Wvel_split` (end of `vert_vel_ale`, owned+halo,
+`src/oce/oce_ale.F90`): `w_i = f·w`, `w_e = w − w_i`, with the implicit share `f` from
+`oce_wsplit::wsplit_implicit_fraction(CFL_z, wsplit_mincfl, wsplit_maxcfl)`, the C¹
+limiting function of Shchepetkin (2015, Ocean Modelling 91, Sec. 3.1 / Fig. 9; NEMO
+`wAimp`). With `D = Cu_max − Cu_min`, `F = 4·Cu_max·D`, `Cu_cut = 2·Cu_max − Cu_min`:
+`f = 0` for `Cu ≤ Cu_min`; `f = x²/(F + x²)`, `x = Cu − Cu_min`, on the bend;
+`f = (Cu − Cu_max)/Cu` for `Cu ≥ Cu_cut`, so the explicit Courant number `Cu·(1−f)`
+saturates EXACTLY at `wsplit_maxcfl` (FESOM2's cap, reached without the kink — the
+parameter keeps its FESOM2 meaning). `f` and `f'` are continuous at both joints, `Cu_e` is
+non-decreasing, `f → 1`. FESOM2's hard switch (`w_e = w·C/CFL_z` above `C`) is the
+degenerate `Cu_min = Cu_max` limit (`F = 0`): admissible to `wsplit_check_params`, used
+only as the positive control of the smoothness test, NOT a mode (decision 2026-10-02).
+The argument is FESOM2's `CFL_z` (`compute_CFLz`, unchanged):
+`|w(nz)|·dt·(1/h(nz−1) + 1/h(nz))`, the interface flux counted against BOTH adjacent
+cells (one term at the surface), so `wsplit_maxcfl = 1` means `|w|·dt/h ≈ 0.5` per cell
+on uniform layers.
+
+Parameters: `t_dyn%wsplit_mincfl` (type default 0.5 — an ABSOLUTE number, `0.5·maxcfl`
+only at the default cap) and `%wsplit_maxcfl` (1.0), both serialized (`test_types` round
+trip); admissible iff `maxcfl > 0` and `0 ≤ mincfl ≤ maxcfl` (`wsplit_check_params`).
+Validation is SETUP-time and the kernels are stateless (house convention): every driver
+that enables `use_wsplit` calls `wsplit_assert_params(mincfl, maxcfl)` once — the
+obligation is documented in `t_dyn` next to the parameters; `fesom_conserve`,
+`fesom_lifecycle_native_mr` and `fesom_pressuredump` do — so a driver that lowers the cap
+without the onset cannot run the discontinuous pair in silence; the ≥ 2-layer column
+precondition of the implicit solves is a mesh invariant asserted once, collectively, in
+`read_mesh` (`assert_min_layers`; ctest `test_minlayers_np1` trips it). Env hooks in
+`fesom_conserve` and `fesom_lifecycle_native_mr`:
+`FESOM3_WSPLIT` (presence → `use_wsplit`), `FESOM3_WSPLIT_MAXCFL` (value, default 1.0),
+`FESOM3_WSPLIT_MINCFL` (value, default `0.5·maxcfl`, so a config that sets only the cap
+keeps the type's onset/cap ratio; an unparsable value is an `error stop`, not the
+default), `FESOM3_WSPLIT_EXPECT_SPLIT=N` (value; `fesom_conserve` only: `error stop`
+unless ≥ N owned faces split at the last step and ≥ 1 has `f ≥ 0.5`). Off by default
+everywhere: `fesom_lifecycle`, `_mr`, `_native`, `fesom_stepdump*`, `fesom_stepfull_mr`,
+`fesom_advhordump_mr` pin `use_wsplit=.false.`; `fesom_conserve` and
+`fesom_lifecycle_native_mr` default to `.false.` unless `FESOM3_WSPLIT` is set. With it
+off: `w_e == w`, `w_i == +0` bitwise, the previous off path verbatim, every pre-existing
+gate drift row unchanged. Switching it on in `job_levante` and choosing `wsplit_mincfl`
+is the user's call.
+
+Where `w_i` acts: (1) momentum — the TDMA `impl_vert_visc_ale` in upwind flux form, with
+the advective-form diagonal correction for `momadv_opt==1` (L57; `test_ivertvisc` I1-I5);
+momentum advection (`momentum_adv_scalar`, `momentum_adv_vinv`) reads `w_e`. (2) non-FCT
+tracers — `do_wimpl` in the vertical-diffusion TDMA `diff_ver_part_impl_ale`. (3) FCT
+tracers — FESOM2's sequence in `do_oce_adv_tra` (`oce_adv_tra_driver.F90`): low-order
+upwind step with `w_e`, then `adv_tra_vert_impl(dt, w_i, fct_LO)` (per-column upwind
+backward-Euler TDMA on `fct_LO`, column sums `= hnode_new`, f3 1-D area rule; ≥ 2 layers
+is a stated precondition, asserted at setup, not in the kernel; `oce_adv_tra_ver.F90`),
+then the LO upwind flux RECOMPUTED with the full
+`w` so the antidiffusive flux is `HO(w) − LO(w)`. (`HO(w) − LO(w_e)` would double-count
+the `w_i` transport and still telescope — a conservation gate cannot see it.)
+
+Nets: `test/test_wsplit.F90` W (function: cap error ≤ 4.4e-17, joints exact, C¹ to
+1.6e-6, `Cu_e` monotone to 1.23 eps·Cu), S (split identities on pi: `w_e + w_i = w` to
+1 ulp, `w_i = f·w` bitwise, every `CFL_z` class populated), S5 (the HALO contract: inputs
+from the global node index, then `cfl_z/w_e/w_i` at every halo node == the owner's
+bitwise against an `exchange_nod`'d copy — 1429 faces at np 2, 0 mismatches; positive
+control with local-index inputs 1429/1429 mismatch. No consumer exchanges `w_e/w_i` and
+the conserve gate is blind to a wrong halo value, so this is the only net on it), X
+(transition smoothness of the non-FCT chain QR4C + `do_wimpl`, `Kv = 0`, quadratic `T`,
+601-point `Cu` scan over `[0, 3·maxcfl]` on one representative column per
+`(ulevels, nlevels)` class: second-difference ratio `max|D2|/(ΔCu·max|D1|)` = 0.96 / 1.17
+for `w ≷ 0` against the bound 5 (a C⁰ linear ramp would pass 10 for `w < 0`); positive
+control = the degenerate `(1,1)` function: 100.3 / 64.1, its kink `D2 = 1.0025·J·ΔCu` at
+the closed-form jump `J = cq·h²·(1+Cu_c)/2`). Both tests synthesise cavity columns
+(`ulevels = 3` on every 10th global node) so the `nzmin`-based layouts are not tested at
+`nzmin = 1` only. `test/test_wimpl_tra.F90` C1-C6 (identity bitwise; constancy of uniform
+`T` through explicit(`w_e`) + implicit(`w_i`) with `hnode_new` advanced by the full `w`
+≤ 5.3e-16 for three parameter sets, both signs, open surface, incl. a 2-layer column;
+conservation ≤ 1e-15; boundedness at `CFL_z` 10.8 / 14.0 against an uncapped positive
+control overshooting by 0.95 / 5.6 of the range; the fully implicit closed form; C6 the
+driver `do_oce_adv_tra` BITWISE equal to the test's own assembly at np 1/2 for BOTH signs
+of `w` — the assembly carries `oce_tra_adv_fct`, inactive for `w > 0` (every factor 1
+on 95469 nonzero faces, closed form of the whole step to 1.4e-14 K) and active for
+`w < 0` — the wrong `HO(w) − LO(w_e)` differing by 29.9 / 58.8 K·m = the predicted
+double-counted `w_i` transport to 5e-14 for `w > 0`, by 3.9 / 1.4 K·m with the limiter
+for `w < 0`); ctest `test_minlayers_np1` trips the setup-time < 2-layer refusal.
+End to end: `fesom_conserve` prints for every config one last-step owned-face statistics
+line (max `CFL_z`; faces with `w_i ≠ 0` = `CFL_z > mincfl`; capped faces
+`CFL_z ≥ Cu_cut = 2·maxcfl − mincfl`; `f ≥ 0.5` = `CFL_z ≥ 2·maxcfl`; max `f`). The
+20-step pi cold start has max `CFL_z` = 2.76e-2, so the default cap 1.0 splits NOTHING;
+the gate configs `wsplit` / `momadv-vinv-wsplit` / `GM+wsplit` use
+`FESOM3_WSPLIT_MAXCFL=0.005` (onset 0.0025, chosen over 0.01 which left 26 faces at
+`f ≥ 0.5`): 8632 faces split, 1130 capped, 500 at `f ≥ 0.5`, max `f` 0.818 (np 8: 8628 /
+496; vinv: 8647 / 497), drift heat/salt/vol ~1e-14 (`tools/run_conserve_pi.sh` np 1/8 +
+vinv np 1 + GM np 1; ctest `fesom_conserve_zstar_{wsplit,vinv_wsplit}_np{1,2}` with
+`EXPECT_SPLIT=1000`). The guards are ctests too: `fesom_conserve_zstar_wsplit_vacuous_np1`
+(cap 0.5 → "vacuous config", no drift report; also pins the driver default
+`mincfl = 0.5·maxcfl`), `fesom_conserve_wsplit_badparams_np1` ((0.9, 0.5) rejected),
+`fesom_conserve_wsplit_badvalue_np1` (`MAXCFL=0.5x` rejected). The conserve tracers are
+FCT, so the gate runs path (3) and the momentum TDMA; path (2) is pinned at unit level by
+X3 (the chain in the fully implicit limit == the closed-form upwind row recursion).
+
+Retired byte-gate fields: `fesom_pressuredump` still forces `use_wsplit=.true.` (cap 1.0)
+so `compute_Wvel_split` runs there (its diagnostic counts faces with `w_i ≠ 0`), but it
+no longer dumps `w_split_e/w_split_i` (nothing read them); `tools/pressure_diff.py` keeps
+the FESOM2-side names in `SKIP_FIELDS` (printed as SKIP, never compared against FESOM2's
+hard split; the FESOM2 byte-gates are retired since bottom-at-vertices anyway). That
+driver calls `diff_tracers_ale` only, never `do_oce_adv_tra`, so it does not reach
+`adv_tra_vert_impl`. Plan: `docs/plans/completed/2026-10-02-wsplit-smooth.md`; see L57,
+L58.
+
+

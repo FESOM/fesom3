@@ -21,7 +21,7 @@ module oce_dyn_velrhs
     ! ALGORITHM (per element, mid-depth levels nz = ulevels..nlevels-1):
     !   ab1 = -(0.5 + eps),  ab2 = (1.5 + eps)          [eps = ab_epsilon = 0.1]
     !   (1) AB-init :  UV_rhs(:,nz)  = ab1 * UV_rhsAB_prev(:,nz)
-    !   (2) SSH grad:  pre = -g*eta_n(elnodes) ; Fx/Fy = gradient_sca(1:3/4:6) . pre
+    !   (2) SSH grad:  pre = -g*eta_n(elnodes) ; Fx/Fy = gradient_sca(1:4/5:8) . pre
     !                  ff  = coriolis(elem) * elem_area(elem)
     !   (3) PGF+Cor :  UV_rhs(1,nz) += (Fx - pgf_x(nz)) * elem_area
     !                  UV_rhs(2,nz) += (Fy - pgf_y(nz)) * elem_area
@@ -44,13 +44,14 @@ module oce_dyn_velrhs
     !  - 1-rank only: the ported part of compute_vel_rhs has NO halo exchange (those
     !    live in the skipped momentum_adv_scalar); UV_rhs is element-local.
     use mod_precision, only: WP
-    use mod_mesh,      only: t_mesh
+    use mod_mesh,      only: t_mesh, MAX_NV
     use mod_dyn,       only: t_dyn
     use mod_constants, only: g
     use mod_config,    only: ab_epsilon
     use mod_partit,    only: t_partit
     use mod_part_bounds, only: owned_bounds, is_multirank
     use mod_halo,      only: exchange_nod
+    use oce_dyn_vinv,  only: momentum_adv_vinv
     implicit none
     private
     public :: compute_vel_rhs
@@ -68,9 +69,9 @@ contains
         logical,       intent(in) :: lfirst
         type(t_partit), intent(in), optional :: partit
         !_______________________________________________________________________
-        integer       :: elem, elnodes(3), nz, nzmax, nzmin
+        integer       :: elem, elnodes(MAX_NV), nz, nzmax, nzmin
         integer       :: nNodO, nNodL, nEdgeO, nElemO
-        real(kind=WP) :: ff, Fx, Fy, pre(3), p_eta(3)
+        real(kind=WP) :: ff, Fx, Fy, pre(MAX_NV), p_eta(MAX_NV)
         real(kind=WP) :: ab1, ab2
         real(kind=WP), dimension(:,:,:),   pointer :: UV, UV_rhs
         real(kind=WP), dimension(:,:,:,:), pointer :: UV_rhsAB
@@ -103,12 +104,12 @@ contains
 
             ! (2) SSH gradient contribution -g*grad(eta) + Coriolis factor.
             !     p_air (l_mslp) and p_ice (use_pice, linfs) are 0 on pi -> dropped.
-            elnodes = mesh%elem2D_nodes(1:3,elem)   ! triangles (elem2D_nodes is MAX_NV=4)
+            elnodes = mesh%elem2D_nodes(:,elem)     ! 4 slots (a triangle's slot 4 has gradient 0)
             p_eta   = g*eta_n(elnodes)
             ff      = mesh%coriolis(elem)*mesh%elem_area(elem)
             pre = -(p_eta)
-            Fx  = sum(mesh%gradient_sca(1:3, elem)*pre)
-            Fy  = sum(mesh%gradient_sca(4:6, elem)*pre)
+            Fx  = sum(mesh%gradient_sca(1:4, elem)*pre)
+            Fy  = sum(mesh%gradient_sca(5:8, elem)*pre)
 
             ! (3) add PGF + SSH-gradient to UV_rhs; init this step's AB array with
             !     the Coriolis term
@@ -124,9 +125,13 @@ contains
         ! Momentum advection -> ADD into this-step UV_rhsAB(1,1:2,:) (FESOM2 :271-273),
         ! AFTER the Coriolis/PGF elem loop and BEFORE the AB blend. v1 has no
         ! split-explicit subcycling (use_ssh_se_subcycl=.false.), so momadv_opt==2
-        ! routes to momentum_adv_scalar (the _transpv variant is M2.x). momadv_opt==1
-        ! is an unsupported FESOM2 scheme (error there); v1 simply skips when /=2.
-        if (dynamics%momadv_opt == 2) then
+        ! routes to momentum_adv_scalar (the _transpv variant is M2.x). momadv_opt==1 is
+        ! the VECTOR-INVARIANT form (oce_dyn_vinv): FESOM2 aborts on it (never adapted to
+        ! ALE, oce_ale_vel_rhs.F90:268), so ours has no oracle -- see that module's header.
+        ! Both branches only ADD into UV_rhsAB, so (4) below is common to them.
+        if (dynamics%momadv_opt == 1) then
+            call momentum_adv_vinv(dynamics, mesh, partit)
+        else if (dynamics%momadv_opt == 2) then
             call momentum_adv_scalar(dynamics, mesh, partit)
         end if
 
@@ -150,13 +155,14 @@ contains
         ! Transcribed VERBATIM from FESOM2 v2.7.3 oce_ale_vel_rhs.F90:335-589. Three
         ! passes:
         !   1. vertical w*du/dz : per node, average elemental UV to full-depth prism
-        !      faces (weighted by elem_area), multiply by w_e, then the layer flux
-        !      divergence -(wu(nz)-wu(nz+1))/(3*hnode(nz,n)) -> UVnode_rhs.
+        !      faces (weighted by the node's kite share elem_area*nod_in_elem2D_w), multiply
+        !      by w_e, then the layer flux divergence -(wu(nz)-wu(nz+1))/hnode(nz,n)
+        !      -> UVnode_rhs.
         !   2. horizontal u*du/dx + v*du/dy : per edge, the edge-normal velocity
         !      un1/un2 from edge_cross_dxdy, scatter +-un*UV into UVnode_rhs at the two
-        !      edge nodes (the boundary el2<0 branch keeps only the el1 contribution).
+        !      edge nodes (the boundary el2==el1 branch keeps only the el1 contribution).
         !   3. UVnode_rhs *= areasvol_inv ; exchange_nod (1-rank no-op) ; vertice->element
-        !      /3 ADD into UV_rhsAB(1,1:2,ul:nl-1,el).
+        !      kite-weighted mean (elem_w) ADD into UV_rhsAB(1,1:2,ul:nl-1,el).
         !
         ! BIT-IDENTITY NOTES (the L9 transitive-gate pattern — every operand is already
         ! byte-pinned, so faithful transcription byte-matches like M1.1-M2.3):
@@ -165,12 +171,11 @@ contains
         !    order matches FESOM2's exactly (same L8/L9 argument as the area gate / FCT
         !    scatter: the `area` gate already pinned nod_in_elem2D order, the geometry
         !    gate pinned edges/edge_tri order).
-        !  - `/(3._WP*hnode(nz,n))` and `*areasvol_inv` are RUNTIME divisors/factors but
-        !    byte-identical on both sides (hnode/areasvol_inv geom/M1-proven operands),
-        !    so the -no-prec-div reciprocal matches (L7/L10/L14). The vertice->element
-        !    `/3.0_WP` is a LITERAL divisor (exact 1/3 fold, byte-safe; triangles only).
-        !  - elem2D_nodes(1:3,el) accessed PER-COMPONENT (scalar 1/2/3), not as a
-        !    `(:,el)` slice, so no MAX_NV=4 vs 3 shape mismatch (cf. L15).
+        !  - Hybrid meshes: the FESOM2 `/(3._WP*hnode)` and vertice->element `/3.0_WP`
+        !    are the triangle kite weights 1/3; they are now nod_in_elem2D_w / elem_w (unified
+        !    4-slot formulas, triangles equal to roundoff, not bitwise). elem2D_nodes(k,el)
+        !    is accessed PER-COMPONENT (k = 1..4; a triangle's slot 4 repeats slot 1 with
+        !    weight 0).
         !  - 1-rank only: exchange_nod(UVnode_rhs) is a no-op (lifted at M2.12). The
         !    `nod(1:2) <= nod2D` guards are always true at 1-rank (kept for multi-rank
         !    fidelity). OpenMP locks/ordered are dropped (FESOM3 v1 is serial).
@@ -181,7 +186,7 @@ contains
         integer :: n, nz, el1, el2, nl1, nl2, ul1, ul2, nod(2), el, ed, k, nle, ule
         integer :: nNodO, nNodL, nEdgeO, nElemO
         real(kind=WP) :: un1(1:mesh%nl-1), un2(1:mesh%nl-1)
-        real(kind=WP) :: wu(1:mesh%nl),    wv(1:mesh%nl)
+        real(kind=WP) :: wu(1:mesh%nl),    wv(1:mesh%nl), wa
         real(kind=WP), dimension(:,:,:),   pointer :: UV, UVnode_rhs
         real(kind=WP), dimension(:,:,:,:), pointer :: UV_rhsAB
         real(kind=WP), dimension(:,:),     pointer :: Wvel_e
@@ -200,31 +205,32 @@ contains
             wu(1:nl1+1) = 0._WP
             wv(1:nl1+1) = 0._WP
 
-            ! loop over adjacent elements of vertice n
+            ! loop over adjacent elements of vertice n; wa = the node's kite share of el
             do k = 1, mesh%nod_in_elem2D_num(n)
                 el  = mesh%nod_in_elem2D(k, n)
                 nle = mesh%nlevels(el) - 1
                 ule = mesh%ulevels(el)
+                wa  = mesh%elem_area(el)*mesh%nod_in_elem2D_w(k, n)
 
                 ! accumulate horizontal velocities at full-depth faces (top/bottom of
                 ! prism). The surface face (ule==1) takes the surface-layer velocity;
                 ! interior faces average the two adjacent mid-depth-layer velocities.
                 if (ule == 1) then
-                    wu(ule) = wu(ule) + UV(1,ule,el)*mesh%elem_area(el)
-                    wv(ule) = wv(ule) + UV(2,ule,el)*mesh%elem_area(el)
+                    wu(ule) = wu(ule) + UV(1,ule,el)*wa
+                    wv(ule) = wv(ule) + UV(2,ule,el)*wa
                 end if
-                wu(ule+1:nle) = wu(ule+1:nle) + 0.5_WP*(UV(1,ule+1:nle,el)+UV(1,ule:nle-1,el))*mesh%elem_area(el)
-                wv(ule+1:nle) = wv(ule+1:nle) + 0.5_WP*(UV(2,ule+1:nle,el)+UV(2,ule:nle-1,el))*mesh%elem_area(el)
+                wu(ule+1:nle) = wu(ule+1:nle) + 0.5_WP*(UV(1,ule+1:nle,el)+UV(1,ule:nle-1,el))*wa
+                wv(ule+1:nle) = wv(ule+1:nle) + 0.5_WP*(UV(2,ule+1:nle,el)+UV(2,ule:nle-1,el))*wa
             end do
 
             ! multiply face momentum by the (explicit) vertical velocity
             wu(ul1:nl1) = wu(ul1:nl1)*Wvel_e(ul1:nl1,n)
             wv(ul1:nl1) = wv(ul1:nl1)*Wvel_e(ul1:nl1,n)
 
-            ! w*du/dz, w*dv/dz (the 1/3 splits the element area across its 3 nodes)
+            ! w*du/dz, w*dv/dz (the kite weights already split each element area)
             do nz = ul1, nl1
-                UVnode_rhs(1,nz,n) = - (wu(nz) - wu(nz+1)) / (3._WP*mesh%hnode(nz,n))
-                UVnode_rhs(2,nz,n) = - (wv(nz) - wv(nz+1)) / (3._WP*mesh%hnode(nz,n))
+                UVnode_rhs(1,nz,n) = - (wu(nz) - wu(nz+1)) / mesh%hnode(nz,n)
+                UVnode_rhs(2,nz,n) = - (wv(nz) - wv(nz+1)) / mesh%hnode(nz,n)
             end do
 
             ! clean checksum: zero the remaining (below-bottom / above-surface) entries
@@ -245,7 +251,7 @@ contains
             un1(ul1:nl1) =   UV(2,ul1:nl1,el1)*mesh%edge_cross_dxdy(1,ed) &
                            - UV(1,ul1:nl1,el1)*mesh%edge_cross_dxdy(2,ed)
 
-            if (el2 > 0) then  ! interior edge: el2 is a valid element
+            if (el2 /= el1) then  ! interior edge: el2 is the other element
                 nl2 = mesh%nlevels(el2) - 1
                 ul2 = mesh%ulevels(el2)
 
@@ -292,26 +298,35 @@ contains
         end do
 
         !______________________________________________________________________
-        ! 3rd. divide the total nodal advection by the scalar control-volume area
+        ! 3rd. divide the total nodal advection by the scalar control-volume area.
+        !
+        ! FESOM3 bottom at vertices: this is a FLUX DIVERGENCE over the control volume
+        ! (wu/wv above accumulate UV*elem_area, i.e. a transport), not an average, so the
+        ! full prism area is the correct divisor and it is deliberately NOT renormalised
+        ! by the wet element area the way tr_xynodes is (oce_ale_tracer.F90). Under the
+        ! vertex bottom the CV is the full prism at every wet layer and the lateral walls
+        ! run through the velocity points, so a dry adjacent element contributes no flux
+        ! and needs no share of the area.
         do n = 1, nNodO
             nl1 = mesh%nlevels_nod2D(n) - 1
             ul1 = mesh%ulevels_nod2D(n)
-            UVnode_rhs(1,ul1:nl1,n) = UVnode_rhs(1,ul1:nl1,n)*mesh%areasvol_inv(ul1:nl1,n)
-            UVnode_rhs(2,ul1:nl1,n) = UVnode_rhs(2,ul1:nl1,n)*mesh%areasvol_inv(ul1:nl1,n)
+            UVnode_rhs(1,ul1:nl1,n) = UVnode_rhs(1,ul1:nl1,n)*mesh%areasvol_inv(n)
+            UVnode_rhs(2,ul1:nl1,n) = UVnode_rhs(2,ul1:nl1,n)*mesh%areasvol_inv(n)
         end do
 
         ! M2.12c: share the nodal advection to the halo (FESOM2 :559) — the vertice->
-        ! element conversion below reads UVnode_rhs at an owned element's 3 nodes (halo).
+        ! element conversion below reads UVnode_rhs at an owned element's vertices (halo).
         if (is_multirank(partit)) call exchange_nod(UVnode_rhs, partit)
 
-        ! convert nodal advection vertice -> element and ADD into UV_rhsAB
+        ! convert nodal advection vertice -> element (kite-weighted mean) and ADD into UV_rhsAB
         do el = 1, nElemO
             nl1 = mesh%nlevels(el) - 1
             ul1 = mesh%ulevels(el)
             UV_rhsAB(1,1:2,ul1:nl1,el) = UV_rhsAB(1,1:2,ul1:nl1,el) &
-                    + mesh%elem_area(el)*(UVnode_rhs(1:2,ul1:nl1,mesh%elem2D_nodes(1,el)) &
-                    + UVnode_rhs(1:2,ul1:nl1,mesh%elem2D_nodes(2,el)) &
-                    + UVnode_rhs(1:2,ul1:nl1,mesh%elem2D_nodes(3,el))) / 3.0_WP
+                    + mesh%elem_area(el)*(mesh%elem_w(1,el)*UVnode_rhs(1:2,ul1:nl1,mesh%elem2D_nodes(1,el)) &
+                    + mesh%elem_w(2,el)*UVnode_rhs(1:2,ul1:nl1,mesh%elem2D_nodes(2,el)) &
+                    + mesh%elem_w(3,el)*UVnode_rhs(1:2,ul1:nl1,mesh%elem2D_nodes(3,el)) &
+                    + mesh%elem_w(4,el)*UVnode_rhs(1:2,ul1:nl1,mesh%elem2D_nodes(4,el)))
         end do
     end subroutine momentum_adv_scalar
 

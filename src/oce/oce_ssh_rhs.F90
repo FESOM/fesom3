@@ -14,11 +14,21 @@ module oce_ssh_rhs
     ! (init_stiff_mat_ale) and the right-hand side (compute_ssh_rhs_ale).
     !
     ! STIFFNESS MATRIX (init_stiff_mat_ale):
-    !  - CSR sparsity from the node neighbourhood (self + edge-connected nodes); the
-    !    diagonal (self) is the FIRST entry of every row (n_pos(1,n)=n).
+    !  - CSR sparsity from the node neighbourhood: self, the edge-connected nodes (in
+    !    edge order, as before), then the remaining vertices of the elements around the
+    !    node (the quad diagonals; none on a triangle mesh, whose CSR is unchanged). Row
+    !    lengths are dynamic. The diagonal (self) is the FIRST entry of every row
+    !    (n_pos(1,n)=n) -- the Jacobi preconditioner in oce_ssh_solve relies on it.
     !  - Stiffness part (loop over edges, both adjacent elements): the H*div operator
     !    factor*(zbar_e_bot-zbar_e_srf)*(gradient_sca_x*edge_cross_dy - gradient_sca_y*
-    !    edge_cross_dx), scattered +/- into the two edge-node rows, factor=g*dt*alpha*theta.
+    !    edge_cross_dx) over the 4 vertex slots (x 1:4, y 5:8; a triangle's slot 4 is 0
+    !    and repeats vertex 1, so it adds an exact zero), scattered +/- into the two
+    !    edge-node rows, factor=g*dt*alpha*theta. With the Green-Gauss coefficients the
+    !    matrix stays symmetric on quads (dual-face normals ~ gradient coefficients).
+    !  - Checkerboard: the Green-Gauss quad gradient vanishes for (+1,-1,+1,-1) on the
+    !    vertices of ANY quad (coefficient j ~ x_{j+1}-x_{j-1}, so c_1=-c_3, c_2=-c_4),
+    !    so on an all-quad mesh with a consistent 2-colouring the stiffness part has that
+    !    null mode (asserted in test/test_ssh_stiff.F90); only the mass part sees it.
     !  - Mass part: + areasvol(surf)/dt added to each row diagonal.
     !  - For which_ale=='linfs' the matrix is built ONCE here with the unperturbed depth
     !    and never updated (FESOM2 oce_ale.F90:3921 calls update_stiff_mat_ale only for
@@ -47,7 +57,8 @@ module oce_ssh_rhs
     !  - zbar_e_srf = zbar(ulevels(elem)) = zbar(1) = 0 on pi (no cavity; FESOM2 default
     !    oce_ale.F90:525). Computed inline (no new mesh field): faithful to the non-cavity
     !    formula, and 0 on pi.
-    !  - elem2D_nodes(1:3,el) sliced per the L15 MAX_NV=4-vs-3 trap.
+    !  - elem2D_nodes(1:4,el) and gradient_sca(1:4|5:8): unified 4-slot form (hybrid
+    !    meshes); the scatter is a scalar loop because a triangle's npos(4)=npos(1).
     !
     ! 1-RANK SCOPE (multi-rank lifted at M2.12):
     !  - The CSR is built in LOCAL numbering (rowptr_loc/colind_loc, used by the CG); at
@@ -61,7 +72,7 @@ module oce_ssh_rhs
     use mod_constants,  only: g
     use mod_param_phys, only: alpha, theta
     use mod_config,     only: which_ALE          ! M6a-3: 'linfs'/'zlevel'/'zstar'
-    use mod_mesh,       only: t_mesh
+    use mod_mesh,       only: t_mesh, MAX_NV
     use mod_dyn,        only: t_dyn
     use mod_partit,     only: t_partit
     use mod_part_bounds, only: owned_bounds, is_multirank
@@ -82,7 +93,7 @@ contains
         ! — NO halo exchange, NO mesh-infra extension. Verified partition invariants
         ! (pi dist_2/8): (i) every edge incident to an owned node is owned, so looping
         ! the owned edges (1..nEdgeO) visits every contribution to an owned row; (ii)
-        ! both triangles of an owned edge are OWNED (edge_tri(:,ed) <= nElemO), so the
+        ! both elements of an owned edge are OWNED (edge_tri(:,ed) <= nElemO), so the
         ! elem2D_nodes/gradient_sca/zbar_e_bot reads stay within the owned-only arrays
         ! (M2.12a) — the FESOM2 oracle relies on the SAME invariant (its elem2D_nodes/
         ! gradient_sca are owned-only too, oce_mesh.F90:497,2466); (iii) an owned
@@ -95,12 +106,13 @@ contains
         real(kind=WP), intent(in)            :: dt
         type(t_partit), intent(in), optional :: partit
         !______________________________________________________________________
-        integer              :: n, n1, n2, i, row, ed
-        integer              :: elnodes(3), el(2), npos(3)
-        integer              :: offset, nini, nend
+        integer              :: n, n1, n2, i, k, j, row, ed, el1
+        integer              :: elnodes(MAX_NV), el(2), npos(MAX_NV)
+        integer              :: offset, nini, nend, maxrow
         integer              :: nNodO, nNodL, nEdgeO, nElemO
-        real(kind=WP)        :: factor, fy(3), zsrf
-        integer, allocatable :: n_num(:), n_pos(:,:)
+        real(kind=WP)        :: zsrf
+        integer, allocatable :: n_num(:), n_pos(:,:), mark(:)
+        real(kind=WP), allocatable :: depth_e(:)
 
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
 
@@ -108,9 +120,24 @@ contains
         !__________________________________________________________________
         ! a) neighbourhood: n_num(n) = #neighbours of OWNED node n (incl. self),
         !    n_pos(:,n) = their local indices (a neighbour may be a HALO node),
-        !    n_pos(1,n)=n (self -> diagonal first). n_num is sized owned+halo because
-        !    it is reused below as the reverse-map indexed by a (possibly halo) colind.
-        allocate(n_num(nNodL), n_pos(12, nNodO))
+        !    n_pos(1,n)=n (self -> diagonal first), then the edge neighbours in edge
+        !    order, then the other vertices of the elements around n (quad diagonals).
+        !    Row length <= 1 + #edges + #elements (a quad adds at most its diagonal
+        !    vertex), counted first. n_num is sized owned+halo because it is reused
+        !    below as the reverse-map indexed by a (possibly halo) colind.
+        allocate(n_num(nNodL), mark(nNodL))
+        n_num = 0
+        do n = 1, nEdgeO
+            n1 = mesh%edges(1,n)
+            n2 = mesh%edges(2,n)
+            if (n1 <= nNodO) n_num(n1) = n_num(n1)+1
+            if (n2 <= nNodO) n_num(n2) = n_num(n2)+1
+        end do
+        maxrow = 0
+        do n = 1, nNodO
+            maxrow = max(maxrow, 1 + n_num(n) + mesh%nod_in_elem2D_num(n))
+        end do
+        allocate(n_pos(maxrow, nNodO))
         n_pos = 0
         do n = 1, nNodO
             n_num(n)   = 1
@@ -127,6 +154,20 @@ contains
                 n_pos(n_num(n2)+1, n2) = n1
                 n_num(n2) = n_num(n2)+1
             end if
+        end do
+        mark = 0
+        do n = 1, nNodO
+            mark(n_pos(1:n_num(n), n)) = n
+            do k = 1, mesh%nod_in_elem2D_num(n)
+                el1 = mesh%nod_in_elem2D(k, n)
+                do j = 1, mesh%elem2D_nnodes(el1)
+                    n1 = mesh%elem2D_nodes(j, el1)
+                    if (mark(n1) == n) cycle
+                    mark(n1) = n
+                    n_num(n) = n_num(n)+1
+                    n_pos(n_num(n), n) = n1
+                end do
+            end do
         end do
 
         !__________________________________________________________________
@@ -155,40 +196,15 @@ contains
         ssh_stiff%colind = ssh_stiff%colind_loc
 
         !__________________________________________________________________
-        ! d) stiffness part: factor * H * div, scattered over OWNED edges. n_num is
-        !    reused as the reverse-map (local node index -> its CSR position in the row).
-        n_num  = 0
-        factor = g*dt*alpha*theta
-        do ed = 1, nEdgeO
-            el = mesh%edge_tri(:, ed)
-            do i = 1, 2   ! the two triangles sharing edge ed (both OWNED, invariant ii)
-                if (el(i) < 1) cycle   ! boundary edge has only one triangle
-                elnodes = mesh%elem2D_nodes(1:3, el(i))
-                zsrf    = mesh%zbar(mesh%ulevels(el(i)))   ! zbar_e_srf (=0, no cavity)
-                fy(1:3) = (mesh%zbar_e_bot(el(i)) - zsrf) * &
-                          ( mesh%gradient_sca(1:3,el(i)) * mesh%edge_cross_dxdy(2*i  ,ed)  &
-                           -mesh%gradient_sca(4:6,el(i)) * mesh%edge_cross_dxdy(2*i-1,ed) )
-                if (i==2) fy = -fy
-
-                row = mesh%edges(1, ed)
-                if (row <= nNodO) then
-                    do n = ssh_stiff%rowptr_loc(row), ssh_stiff%rowptr_loc(row+1)-1
-                        n_num(ssh_stiff%colind_loc(n)) = n
-                    end do
-                    npos = n_num(elnodes)
-                    ssh_stiff%values(npos) = ssh_stiff%values(npos) + fy*factor
-                end if
-
-                row = mesh%edges(2, ed)
-                if (row <= nNodO) then
-                    do n = ssh_stiff%rowptr_loc(row), ssh_stiff%rowptr_loc(row+1)-1
-                        n_num(ssh_stiff%colind_loc(n)) = n
-                    end do
-                    npos = n_num(elnodes)
-                    ssh_stiff%values(npos) = ssh_stiff%values(npos) - fy*factor
-                end if
-            end do
+        ! d) stiffness part: factor * H * div over OWNED edges, H = zbar_e_bot - zbar_e_srf
+        !    (zbar_e_srf = zbar(ulevels) = 0, no cavity). n_num is reused as the reverse map.
+        allocate(depth_e(nElemO))
+        do el1 = 1, nElemO
+            zsrf = mesh%zbar(mesh%ulevels(el1))
+            depth_e(el1) = mesh%zbar_e_bot(el1) - zsrf
         end do
+        call add_edge_stiffness(mesh, nNodO, nEdgeO, depth_e, g*dt*alpha*theta, n_num)
+        deallocate(depth_e)
 
         !__________________________________________________________________
         ! e) mass part: + areasvol(surf)/dt on the row diagonal (the first CSR entry).
@@ -197,10 +213,10 @@ contains
             if (mesh%ulevels_nod2D(row) > 1) cycle
             offset = ssh_stiff%rowptr_loc(row)
             ssh_stiff%values(offset) = ssh_stiff%values(offset) &
-                                     + mesh%areasvol(mesh%ulevels_nod2D(row),row)/dt
+                                     + mesh%areasvol(row)/dt
         end do
 
-        deallocate(n_pos, n_num)
+        deallocate(n_pos, n_num, mark)
         end associate
     end subroutine init_stiff_mat_ale
 
@@ -216,55 +232,70 @@ contains
         ! compute_hbar_ale (LAGGED; step-1 dhe=0 -> stiffness unchanged step 1). The
         ! additions ACCUMULATE across steps so the matrix tracks the moving free surface.
         !
-        ! BYTE-EXACT: structurally identical to init_stiff_mat_ale's stiffness loop (d)
-        ! above — same owned-edge order, same CSR (rowptr_loc/colind_loc, M2.6-proven),
-        ! same gradient_sca/edge_cross_dxdy — only (zbar_e_bot-zsrf) -> -dhe(el(i)). The
+        ! The same edge assembly as init_stiff_mat_ale's stiffness part (d), shared in
+        ! add_edge_stiffness — same owned-edge order, same CSR (rowptr_loc/colind_loc),
+        ! same gradient_sca/edge_cross_dxdy — only (zbar_e_bot-zsrf) -> -dhe(el). The
         ! edges(1)=+fy / edges(2)=-fy split == the oracle's j-loop with the j==2 flip.
         ! M6a-2: optional partit -> owned-edge loop; mutates mesh%ssh_stiff%values.
         type(t_mesh),   intent(inout), target :: mesh
         real(kind=WP),  intent(in)            :: dt
         type(t_partit), intent(in), optional  :: partit
-        integer       :: ed, el(2), elnodes(3), i, n, row, npos(3)
         integer       :: nNodO, nNodL, nEdgeO, nElemO
-        real(kind=WP) :: factor, fy(3)
         integer, allocatable :: rev(:)   ! reverse-map local-node -> CSR position (init's n_num reuse)
 
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
+        allocate(rev(nNodL))
+        call add_edge_stiffness(mesh, nNodO, nEdgeO, -mesh%dhe(1:nElemO), g*dt*alpha*theta, rev)
+        deallocate(rev)
+    end subroutine update_stiff_mat_ale
+
+    !===========================================================================
+    subroutine add_edge_stiffness(mesh, nNodO, nEdgeO, depth_e, factor, rev)
+        ! The edge assembly of init_stiff_mat_ale (d) and update_stiff_mat_ale: for every
+        ! OWNED edge and each of its elements (both OWNED, invariant ii; a boundary edge
+        ! has one), fy(k) = depth_e(el)*(gradient_sca_x(k)*edge_cross_dy -
+        ! gradient_sca_y(k)*edge_cross_dx) over the 4 slots, sign-flipped for the 2nd
+        ! element, added as +fy*factor to the row of edges(1) and -fy*factor to the row of
+        ! edges(2) when that row is owned. rev (size >= owned+halo) is the work reverse map
+        ! local node -> CSR position in the current row.
+        type(t_mesh),  intent(inout), target :: mesh
+        integer,       intent(in)            :: nNodO, nEdgeO
+        real(kind=WP), intent(in)            :: depth_e(:), factor
+        integer,       intent(inout)         :: rev(:)
+        integer       :: ed, el(2), elnodes(MAX_NV), i, j, k, n, row, npos(MAX_NV)
+        real(kind=WP) :: fy(MAX_NV)
         associate(ssh_stiff => mesh%ssh_stiff)
-        allocate(rev(nNodL)); rev = 0
-        factor = g*dt*alpha*theta
+        rev = 0
         do ed = 1, nEdgeO
             el = mesh%edge_tri(:, ed)
-            do i = 1, 2   ! the two triangles sharing edge ed (both OWNED, invariant ii)
-                if (el(i) < 1) cycle   ! boundary edge has only one triangle
-                elnodes = mesh%elem2D_nodes(1:3, el(i))
-                fy(1:3) = -mesh%dhe(el(i)) * &
-                          ( mesh%gradient_sca(1:3,el(i)) * mesh%edge_cross_dxdy(2*i  ,ed)  &
-                           -mesh%gradient_sca(4:6,el(i)) * mesh%edge_cross_dxdy(2*i-1,ed) )
+            do i = 1, 2   ! the two elements sharing edge ed (both OWNED, invariant ii)
+                if (i == 2 .and. el(2) == el(1)) cycle   ! boundary edge has only one element
+                elnodes = mesh%elem2D_nodes(1:MAX_NV, el(i))
+                fy = depth_e(el(i)) * &
+                     ( mesh%gradient_sca(1:4,el(i)) * mesh%edge_cross_dxdy(2*i  ,ed)  &
+                      -mesh%gradient_sca(5:8,el(i)) * mesh%edge_cross_dxdy(2*i-1,ed) )
                 if (i==2) fy = -fy
-
-                row = mesh%edges(1, ed)
-                if (row <= nNodO) then
+                do j = 1, 2   ! the rows of the edge's two nodes: +fy, -fy
+                    row = mesh%edges(j, ed)
+                    if (row > nNodO) cycle
                     do n = ssh_stiff%rowptr_loc(row), ssh_stiff%rowptr_loc(row+1)-1
                         rev(ssh_stiff%colind_loc(n)) = n
                     end do
                     npos = rev(elnodes)
-                    ssh_stiff%values(npos) = ssh_stiff%values(npos) + fy*factor
-                end if
-
-                row = mesh%edges(2, ed)
-                if (row <= nNodO) then
-                    do n = ssh_stiff%rowptr_loc(row), ssh_stiff%rowptr_loc(row+1)-1
-                        rev(ssh_stiff%colind_loc(n)) = n
-                    end do
-                    npos = rev(elnodes)
-                    ssh_stiff%values(npos) = ssh_stiff%values(npos) - fy*factor
-                end if
+                    if (j == 1) then
+                        do k = 1, MAX_NV
+                            ssh_stiff%values(npos(k)) = ssh_stiff%values(npos(k)) + fy(k)*factor
+                        end do
+                    else
+                        do k = 1, MAX_NV
+                            ssh_stiff%values(npos(k)) = ssh_stiff%values(npos(k)) - fy(k)*factor
+                        end do
+                    end if
+                end do
             end do
         end do
-        deallocate(rev)
         end associate
-    end subroutine update_stiff_mat_ale
+    end subroutine add_edge_stiffness
 
     !===========================================================================
     subroutine compute_ssh_rhs_ale(dynamics, mesh, partit, water_flux)
@@ -318,7 +349,7 @@ contains
             !__________________________________________________________________
             ! ... and from el(2), unless ed is a boundary edge
             c2 = 0.0_WP
-            if (el(2) > 0) then
+            if (el(2) /= el(1)) then
                 deltaX2 = mesh%edge_cross_dxdy(3, ed)
                 deltaY2 = mesh%edge_cross_dxdy(4, ed)
                 nzmin   = mesh%ulevels(el(2))
@@ -342,7 +373,7 @@ contains
         if (trim(which_ALE)/='linfs' .and. present(water_flux)) then
             do n = 1, nNodO
                 if (mesh%ulevels_nod2D(n) > 1) cycle   ! cavity (dead)
-                ssh_rhs(n) = ssh_rhs(n) - alpha*water_flux(n)*mesh%areasvol(mesh%ulevels_nod2D(n),n) &
+                ssh_rhs(n) = ssh_rhs(n) - alpha*water_flux(n)*mesh%areasvol(n) &
                                         + (1.0_WP-alpha)*ssh_rhs_old(n)
             end do
         else

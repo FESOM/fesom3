@@ -38,6 +38,19 @@ module mod_dyn
         real(kind=WP), allocatable, dimension(:,:)   :: density_ref     ! (nl-1,nod2D) reference density
         real(kind=WP), allocatable, dimension(:,:)   :: hpressure       ! (nl,  nod2D) hydrostatic pressure
         real(kind=WP), allocatable, dimension(:,:)   :: bvfreq          ! (nl,  nod2D) N^2 (squared Brunt-Vaisala)
+        ! N^2 as pressure_bv computed it, BEFORE the horizontal smooth_nod pass. Consumers
+        ! that must see the true local stratification (mo_convect's static-instability ramp)
+        ! read this; GM/Redi + PP/KPP/TKE keep reading the smoothed bvfreq above.
+        real(kind=WP), allocatable, dimension(:,:)   :: bvfreq_raw      ! (nl,  nod2D) N^2 pre-smoothing
+        ! Squared vertical velocity shear |d(uvnode)/dz|^2 at LEVELS, produced once per
+        ! step by oce_vert_spline::compute_shear2 and shared by PP, KPP's ri_iwmix and
+        ! TKE (which each formed it separately before, with slightly different rounding).
+        real(kind=WP), allocatable, dimension(:,:)   :: shear2          ! (nl,  nod2D) |du/dz|^2
+        ! Relative vorticity curl(u) at nodes, for the vector-invariant momentum
+        ! advection (momadv_opt==1, oce_dyn_vinv). Recomputed from UV at the start of
+        ! every momentum_adv_vinv call, so it is NOT serialized -- adding it to
+        ! write/read_t_dyn_work would change the restart layout for no benefit.
+        real(kind=WP), allocatable, dimension(:,:)   :: vorticity       ! (nl-1,nod2D) curl(u)
         real(kind=WP), allocatable, dimension(:,:)   :: pgf_x, pgf_y    ! (nl-1,elem2D) PGF (M2.2 oce_pgf), from hpressure
         ! M2.8 PP vertical mixing coefficients (oce_ale_mixing_pp). FESOM2 o_ARRAYS
         ! names Kv/Av; recomputed each step from N^2 + uvnode shear, NOT serialized.
@@ -110,7 +123,16 @@ module mod_dyn
         logical       :: use_ivertvisc  = .true.
         integer       :: momadv_opt     = 2
         logical       :: use_freeslip   = .false.
+        ! Smooth Courant-dependent w = w_e + w_i split (oce_wsplit documents the function;
+        ! compute_Wvel_split applies it). Admissible iff wsplit_check_params (maxcfl > 0,
+        ! 0 <= mincfl <= maxcfl). OBLIGATION: every driver that sets use_wsplit=.true.
+        ! calls wsplit_assert_params(wsplit_mincfl, wsplit_maxcfl) once at setup (the
+        ! kernels validate nothing). The default mincfl is the ABSOLUTE 0.5 (= 0.5*maxcfl
+        ! only at the default maxcfl): a driver that lowers maxcfl must set mincfl too
+        ! (the env-hook drivers default it to 0.5*maxcfl).
+        ! Plan: docs/plans/completed/2026-10-02-wsplit-smooth.md.
         logical       :: use_wsplit     = .false.
+        real(kind=WP) :: wsplit_mincfl  = 0.5_WP
         real(kind=WP) :: wsplit_maxcfl  = 1.0_WP
 
         ! ---- sub-objects ----
@@ -183,7 +205,8 @@ contains
         write(unit, iostat=iostat, iomsg=iomsg) dyn%check_opt_visc, &
             dyn%use_ivertvisc, dyn%use_freeslip, dyn%use_wsplit
         write(unit, iostat=iostat, iomsg=iomsg) dyn%visc_gamma0, dyn%visc_gamma1, &
-            dyn%visc_gamma2, dyn%visc_gamma0_h, dyn%visc_gamma1_h, dyn%wsplit_maxcfl
+            dyn%visc_gamma2, dyn%visc_gamma0_h, dyn%visc_gamma1_h, dyn%wsplit_maxcfl, &
+            dyn%wsplit_mincfl
         call dyn%solverinfo%write_si(unit)
         call dyn%work%write_dw(unit)
         call write_bin_array(dyn%uv,          unit, iostat, iomsg)
@@ -211,7 +234,8 @@ contains
         read(unit, iostat=iostat, iomsg=iomsg) dyn%check_opt_visc, &
             dyn%use_ivertvisc, dyn%use_freeslip, dyn%use_wsplit
         read(unit, iostat=iostat, iomsg=iomsg) dyn%visc_gamma0, dyn%visc_gamma1, &
-            dyn%visc_gamma2, dyn%visc_gamma0_h, dyn%visc_gamma1_h, dyn%wsplit_maxcfl
+            dyn%visc_gamma2, dyn%visc_gamma0_h, dyn%visc_gamma1_h, dyn%wsplit_maxcfl, &
+            dyn%wsplit_mincfl
         call dyn%solverinfo%read_si(unit)
         call dyn%work%read_dw(unit)
         call read_bin_array(dyn%uv,          unit, iostat, iomsg)

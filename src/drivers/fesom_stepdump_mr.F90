@@ -40,6 +40,7 @@ program fesom_stepdump_mr
     use oce_pgf,          only: pressure_force_4_linfs_fullcell
     use oce_ale_mixing_pp,only: oce_mixing_pp
     use oce_mo_conv,      only: mo_convect
+    use oce_vert_spline,  only: compute_shear2
     use oce_dyn_velrhs,   only: compute_vel_rhs
     use oce_dyn_visc,     only: viscosity_filter
     use oce_dyn_ivertvisc,only: impl_vert_visc_ale
@@ -135,15 +136,17 @@ program fesom_stepdump_mr
     allocate(dyn%w(nl, nNodL), dyn%w_e(nl, nNodL), dyn%w_i(nl, nNodL))
     allocate(dyn%cfl_z(nl, nNodL))
     allocate(dyn%work%density_ref(nl-1, nNodL), dyn%work%density_m_rho0(nl-1, nNodL))
-    allocate(dyn%work%hpressure(nl, nNodL), dyn%work%bvfreq(nl, nNodL))
+    allocate(dyn%work%hpressure(nl, nNodL), dyn%work%bvfreq(nl, nNodL), dyn%work%bvfreq_raw(nl, nNodL), dyn%work%shear2(nl, nNodL))
     allocate(dyn%work%pgf_x(nl-1, nElemF), dyn%work%pgf_y(nl-1, nElemF))
     allocate(dyn%work%u_c(nl-1, nElemF), dyn%work%v_c(nl-1, nElemF))
     allocate(dyn%work%uvnode_rhs(2, nl-1, nNodL))
+    allocate(dyn%work%vorticity(nl-1, nNodL))   ! momadv_opt==1 (vector-invariant) scratch
+    dyn%work%vorticity = 0.0_WP
     allocate(dyn%work%Kv(nl, nNodL), dyn%work%Av(nl, nElemF))
     dyn%uv = 0.0_WP; dyn%uv_rhs = 0.0_WP; dyn%uv_rhsAB = 0.0_WP; dyn%uvnode = 0.0_WP
     dyn%eta_n = 0.0_WP; dyn%d_eta = 0.0_WP; dyn%ssh_rhs = 0.0_WP; dyn%ssh_rhs_old = 0.0_WP
     dyn%w = 0.0_WP; dyn%w_e = 0.0_WP; dyn%w_i = 0.0_WP; dyn%cfl_z = 0.0_WP
-    dyn%work%density_m_rho0 = 0.0_WP; dyn%work%hpressure = 0.0_WP; dyn%work%bvfreq = 0.0_WP
+    dyn%work%density_m_rho0 = 0.0_WP; dyn%work%hpressure = 0.0_WP; dyn%work%bvfreq = 0.0_WP; dyn%work%bvfreq_raw = 0.0_WP; dyn%work%shear2 = 0.0_WP
     dyn%work%pgf_x = 0.0_WP; dyn%work%pgf_y = 0.0_WP
     dyn%work%u_c = 0.0_WP; dyn%work%v_c = 0.0_WP; dyn%work%uvnode_rhs = 0.0_WP
     dyn%work%Kv = 0.0_WP; dyn%work%Av = 0.0_WP
@@ -216,8 +219,10 @@ program fesom_stepdump_mr
     ! drive the lifted dynamics chain UP TO compute_ssh_rhs_ale (pass partit).
     call compute_vel_nodes(dyn, mesh, partit)
     call pressure_bv(tracers%data(1)%values, tracers%data(2)%values, dyn%work%density_ref, &
-                     mesh, dyn%work%density_m_rho0, dyn%work%hpressure, dyn%work%bvfreq, partit)
+                     mesh, dyn%work%density_m_rho0, dyn%work%hpressure, dyn%work%bvfreq, partit, &
+                     bvfreq_raw=dyn%work%bvfreq_raw)
     call pressure_force_4_linfs_fullcell(dyn%work%hpressure, mesh, dyn%work%pgf_x, dyn%work%pgf_y, partit)
+    call compute_shear2(dyn, mesh, partit)
     call oce_mixing_pp(dyn, mesh, partit)
     call mo_convect(dyn, mesh, partit)
     call compute_vel_rhs(dyn, mesh, dt, .true., partit)

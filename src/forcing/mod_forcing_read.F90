@@ -477,7 +477,7 @@ contains
         type(t_partit), intent(in),    target :: partit
         integer  :: fld
         real(WP) :: rdate
-        logical  :: do_rotation_wind, force_newcoeff
+        logical  :: do_rotation_wind, force_newcoeff, needs_refresh
         ! M8c year-file rollover (sbc_do:1510-1519): on a year change re-read EVERY field's grid +
         ! time axis from the next year's file (forcing_read_grid re-anchors nc_time to yearnew, see its
         ! re-entrancy guards) and force an immediate coeff refresh. The per-node bilinear source
@@ -490,6 +490,15 @@ contains
                 ! invalidate the double-buffer (new year => read both brackets fresh; mirror FESOM2's
                 ! yearold==yearnew cache guard). getcoeffld reopens the persistent handle on ncid_year/=year.
                 frc%f(fld)%ia_indx = -1; frc%f(fld)%ib_indx = -1
+                ! ... and reset the time bracket. forcing_read_grid REALLOCATES nc_time to the new
+                ! year's length, so a stale index from the previous year can point PAST THE END:
+                ! leaving a leap year (2928 three-hourly records) for a normal one (2920) leaves
+                ! t_indx_p1 up to 2928 against a 2920-long array. The crossing test below then reads
+                ! out of bounds, and the ORDERED compare it compiles to (comisd) raises `floating
+                ! invalid` the moment that garbage happens to be a NaN. getcoeffld does re-search and
+                ! fix the index, but only AFTER the test that crashes. Symptom: the run dies with
+                ! forrtl (65) at 1968->1969, 1972->1973, ... and never at any other rollover.
+                frc%f(fld)%t_indx = 1; frc%f(fld)%t_indx_p1 = 1
             end do
             force_newcoeff = .true.
             if (partit%mype == 0) write(*,'(a,i0,a,i0)') &
@@ -503,9 +512,17 @@ contains
             ! crossing test (sbc_do:1561): rdate past the bracket end AND not at the last record, OR a
             ! year rollover just forced a refresh (force_newcoeff). getcoeffld re-binarysearches rdate
             ! so the stale (prev-year) t_indx is reset to the new year's early-January bracket.
-            if ( ( (rdate > frc%f(fld)%nc_time(frc%f(fld)%t_indx_p1)) .and. &
-                   (frc%f(fld)%nc_time(frc%f(fld)%t_indx) < frc%f(fld)%nc_time(frc%f(fld)%ntime)) ) &
-                 .or. force_newcoeff ) then
+            ! NB: Fortran does NOT guarantee short-circuit evaluation, so `.or. force_newcoeff`
+            ! is no protection for the array reads in the first operand -- they are evaluated
+            ! regardless. Test the rollover flag FIRST, in its own branch, so the nc_time reads
+            ! only happen when the bracket is known to belong to the current year's array.
+            needs_refresh = force_newcoeff
+            if (.not. needs_refresh) then
+                needs_refresh = (rdate > frc%f(fld)%nc_time(frc%f(fld)%t_indx_p1)) .and. &
+                                (frc%f(fld)%nc_time(frc%f(fld)%t_indx) <             &
+                                 frc%f(fld)%nc_time(frc%f(fld)%ntime))
+            end if
+            if (needs_refresh) then
                 call forcing_getcoeffld(frc, fld, yearnew, rdate, mesh, partit)
                 ! M8b diagnostic (stdout only — never touches the dump): confirm the rollover fired.
                 if (partit%mype == 0) write(*,'(a,i0,a,i0,a,i0,a,es18.10)') &

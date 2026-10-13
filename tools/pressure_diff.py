@@ -35,13 +35,23 @@ wrong 2nd pass in uv_rhs_visc-but-not-visc_u_c, a wrong Thomas solve in uv_rhs_i
 
 Usage:  pressure_diff.py <fesom2.bin> <fesom3.bin> [--signal 0.0]
 Exit 0 iff every common field matches within the signal threshold (default 0 ==
-byte-identical) and shapes/dims agree.
+byte-identical) and shapes/dims agree -- except the fields in SKIP_FIELDS, which both
+dumps carry but which are by design not comparable.
 """
 import sys
 import struct
 import numpy as np
 
 MAGIC = b"FADVHDMP"
+
+# Dumped by FESOM2 but NOT compared and no longer dumped by FESOM3: FESOM3 splits w into
+# w_e/w_i with the smooth Shchepetkin limiting function (src/oce/oce_wsplit.F90,
+# docs/plans/completed/2026-10-02-wsplit-smooth.md), FESOM2 with its hard switch at
+# wsplit_maxcfl, so the split fields differ wherever CFL_z > wsplit_mincfl by
+# construction. Listing them here keeps the FESOM2-side records out of the "MISSING in
+# F3" test (checked before it); w, cfl_z and hnode_new -- the split's inputs -- are
+# still gated.
+SKIP_FIELDS = {"w_split_e", "w_split_i"}
 
 
 def read_dump(path):
@@ -100,6 +110,9 @@ def main():
     print(f"\n{'field':24s} {'shape':>14s} {'dtype':>6s} {'max|delta|':>16s}  status")
     print("-" * 74)
     for name in names:
+        if name in SKIP_FIELDS:
+            print(f"{name:24s} {'-':>14s} {'-':>6s} {'not comparable':>16s}  SKIP")
+            continue
         if name not in f3:
             print(f"{name:24s} {'-':>14s} {'-':>6s} {'MISSING in F3':>16s}  FAIL")
             ok = False

@@ -10,11 +10,19 @@ module mod_partitioning
     ! init_mpi_types (precompiled MPI_TYPE_INDEXED datatypes) is intentionally NOT
     ! built: the M0.5 halo packs manually via com_struct (broadcast-only), so the
     ! s/r_mpitype_* fields stay unallocated for v1.
+    !
+    ! Hybrid meshes: dist_N/format.out (version DIST_FORMAT_VERSION, written by fesom_ini)
+    ! announces sections appended to the FESOM2 files -- my_list: eXDim_nod2D + the
+    ! global ids of the double-halo nodes (appended to myList_nod2D); com_info:
+    ! com_nod2D_full and com_edge2D in the com_struct layout. Without format.out the
+    ! FESOM2 layout is read as before and dist_format stays 0.
     use mpi
     use mod_partit, only: t_partit, com_struct, MAX_NEIGHBOR_PARTITIONS
     implicit none
     private
-    public :: par_init, par_ex, set_partition, read_mesh_dims
+    public :: par_init, par_ex, set_partition, read_mesh_dims, set_empty_comms, die
+
+    integer, parameter :: DIST_FORMAT_VERSION = 1
 
 contains
 
@@ -82,7 +90,7 @@ contains
         integer :: nod2D, elem2D, edge2D, edge2D_in, i
         call read_mesh_dims(mesh_dir, nod2D, elem2D, edge2D, edge2D_in)
 
-        partit%myDim_nod2D = nod2D; partit%eDim_nod2D = 0
+        partit%myDim_nod2D = nod2D; partit%eDim_nod2D = 0; partit%eXDim_nod2D = 0
         allocate(partit%myList_nod2D(nod2D))
         partit%myList_nod2D = [(i, i=1, nod2D)]
 
@@ -96,12 +104,29 @@ contains
 
         allocate(partit%part(2)); partit%part = [1, nod2D+1]   ! cumulative, npes+1
 
-        ! No neighbours: empty com_structs (rPEnum=sPEnum=0; halo is a no-op).
+        call set_empty_comms(partit)
+        partit%pe_status = 0
+    end subroutine synthesize_1rank
+
+    subroutine set_empty_comms(partit)
+        ! No neighbours: empty com_structs (rPEnum=sPEnum=0; halo is a no-op), the
+        ! appended lists (com_nod2D_full, com_edge2D) present and empty. Also used by the
+        ! analytic patches' 1-rank partition (mod_mesh_analytic synth_partit).
+        type(t_partit), intent(inout) :: partit
         call clear_com(partit%com_nod2D)
         call clear_com(partit%com_elem2D)
         call clear_com(partit%com_elem2D_full)
-        partit%pe_status = 0
-    end subroutine synthesize_1rank
+        call clear_com(partit%com_nod2D_full)
+        call clear_com(partit%com_edge2D)
+        call clear_com(partit%com_elem2D_shared)
+        if (allocated(partit%com_nod2D_full%rlist)) deallocate(partit%com_nod2D_full%rlist)
+        if (allocated(partit%com_nod2D_full%slist)) deallocate(partit%com_nod2D_full%slist)
+        if (allocated(partit%com_edge2D%rlist))     deallocate(partit%com_edge2D%rlist)
+        if (allocated(partit%com_edge2D%slist))     deallocate(partit%com_edge2D%slist)
+        allocate(partit%com_nod2D_full%rlist(0), partit%com_nod2D_full%slist(0))
+        allocate(partit%com_edge2D%rlist(0), partit%com_edge2D%slist(0))
+        partit%dist_format = DIST_FORMAT_VERSION          ! the new lists exist (empty)
+    end subroutine set_empty_comms
 
     subroutine clear_com(com)
         type(com_struct), intent(inout) :: com
@@ -118,6 +143,8 @@ contains
         character(len=16) :: npes_string, mype_string
         character(len=512) :: fname
         integer :: u, ios, n, npes, mype
+        integer, allocatable :: xlist(:)
+        logical :: has_format
 
         npes = partit%npes; mype = partit%mype
         write(npes_string, '(I10)') npes
@@ -138,6 +165,19 @@ contains
         end do
         close(u)
 
+        ! ---- format.out: appended sections present (hybrid meshes) ----
+        fname = dist_dir//'format.out'
+        inquire(file=trim(fname), exist=has_format)
+        partit%dist_format = 0
+        if (has_format) then
+            open(newunit=u, file=trim(fname), status='old', action='read', iostat=ios)
+            if (ios /= 0) call die('cannot open '//trim(fname), partit)
+            read(u,*, iostat=ios) partit%dist_format
+            close(u)
+            if (ios /= 0 .or. partit%dist_format /= DIST_FORMAT_VERSION) &
+                call die('unsupported version in '//trim(fname), partit)
+        end if
+
         ! ---- my_list<mype>.out: local dims + global-id lists ----
         fname = dist_dir//'my_list'//trim(mype_string)//'.out'
         open(newunit=u, file=trim(fname), status='old', action='read', iostat=ios)
@@ -156,6 +196,17 @@ contains
         read(u,*) partit%eDim_edge2D
         allocate(partit%myList_edge2D(partit%myDim_edge2D + partit%eDim_edge2D))
         read(u,*) partit%myList_edge2D
+        partit%eXDim_nod2D = 0
+        if (partit%dist_format >= 1) then
+            ! double-halo nodes: local numbers myDim+eDim+1 .. myDim+eDim+eXDim_nod2D
+            read(u,*, iostat=ios) partit%eXDim_nod2D
+            if (ios /= 0) call die('no eXDim_nod2D in '//trim(fname), partit)
+            allocate(xlist(partit%eXDim_nod2D))
+            read(u,*, iostat=ios) xlist
+            if (ios /= 0) call die('short eXDim_nod2D list in '//trim(fname), partit)
+            partit%myList_nod2D = [partit%myList_nod2D, xlist]
+            deallocate(xlist)
+        end if
         close(u)
 
         ! ---- com_info<mype>.out: the three com_structs ----
@@ -163,33 +214,66 @@ contains
         open(newunit=u, file=trim(fname), status='old', action='read', iostat=ios)
         if (ios /= 0) call die('cannot open '//trim(fname), partit)
         read(u,*) n   ! header
-        call read_com(u, partit%com_nod2D,       partit%eDim_nod2D)
-        call read_com(u, partit%com_elem2D,      partit%eDim_elem2D)
-        call read_com(u, partit%com_elem2D_full, partit%eDim_elem2D + partit%eXDim_elem2D)
+        call read_com(u, partit%com_nod2D,       partit%eDim_nod2D, 'com_nod2D', fname, partit)
+        call read_com(u, partit%com_elem2D,      partit%eDim_elem2D, 'com_elem2D', fname, partit)
+        call read_com(u, partit%com_elem2D_full, partit%eDim_elem2D + partit%eXDim_elem2D, &
+                      'com_elem2D_full', fname, partit)
+        if (partit%dist_format >= 1) then
+            call read_com(u, partit%com_nod2D_full, partit%eDim_nod2D + partit%eXDim_nod2D, &
+                          'com_nod2D_full', fname, partit)
+            call read_com(u, partit%com_edge2D, -1, 'com_edge2D', fname, partit)
+            if (partit%com_nod2D_full%rptr(partit%com_nod2D_full%rPEnum+1) - 1 /= &
+                partit%eDim_nod2D + partit%eXDim_nod2D) &
+                call die('com_nod2D_full does not cover the eDim+eXDim halo nodes in '// &
+                         trim(fname), partit)
+        end if
         close(u)
         partit%pe_status = 0
     end subroutine read_dist_partition
 
-    subroutine read_com(u, com, rlist_size)
+    subroutine read_com(u, com, rlist_size, name, fname, partit)
         ! One com_struct from an open com_info unit (oce_mesh.F90:804-828 pattern).
+        ! rlist_size < 0: the receive-list length is taken from rptr (com_edge2D).
+        ! rPE/rptr/sPE/sptr are fixed-size: stop on more than MAX_NEIGHBOR_PARTITIONS PEs.
         integer,          intent(in)    :: u
         type(com_struct), intent(inout) :: com
         integer,          intent(in)    :: rlist_size
+        character(len=*), intent(in)    :: name, fname
+        type(t_partit),   intent(in)    :: partit
         integer :: n
         read(u,*) com%rPEnum
+        call check_pe_count(com%rPEnum, 'receive')
         read(u,*) com%rPE(1:com%rPEnum)
         read(u,*) com%rptr(1:com%rPEnum+1)
-        allocate(com%rlist(rlist_size))
+        n = rlist_size
+        if (n < 0) n = com%rptr(com%rPEnum+1) - 1
+        allocate(com%rlist(n))
         read(u,*) com%rlist
         read(u,*) com%sPEnum
+        call check_pe_count(com%sPEnum, 'send')
         read(u,*) com%sPE(1:com%sPEnum)
         read(u,*) com%sptr(1:com%sPEnum+1)
         n = com%sptr(com%sPEnum+1) - 1
         allocate(com%slist(n))
         read(u,*) com%slist
+    contains
+        subroutine check_pe_count(npe, side)
+            integer,          intent(in) :: npe
+            character(len=*), intent(in) :: side
+            character(len=16) :: cnum, cmax
+            if (npe >= 0 .and. npe <= MAX_NEIGHBOR_PARTITIONS) return
+            write(cnum,'(i0)') npe
+            write(cmax,'(i0)') MAX_NEIGHBOR_PARTITIONS
+            call die(name//': '//trim(cnum)//' '//side//' PEs, outside 0..MAX_NEIGHBOR_PARTITIONS='// &
+                     trim(cmax)//' in '//trim(fname)//' (increase MAX_NEIGHBOR_PARTITIONS in '// &
+                     'src/types/mod_partit.F90 and in fesom_ini, then recompile)', partit)
+        end subroutine check_pe_count
     end subroutine read_com
 
     subroutine die(msg, partit)
+        ! Print msg and abort every rank (MPI_Abort): a failing rank must not leave the
+        ! others waiting in a collective. Public for the setup-time list builders
+        ! (mod_shared_elem).
         character(len=*), intent(in) :: msg
         type(t_partit),   intent(in) :: partit
         write(*,'(a)') 'set_partition: '//msg

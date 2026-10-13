@@ -130,6 +130,12 @@ foreach(_drv ${fesom3_drivers})
 endforeach()
 
 # ----------------------------------------------------------------------
+# fesom_ini: FESOM2's mesh partitioner (mesh_part/, METIS in lib/metis-5.1.0).
+# Writes edges/levels and dist_N/ into the mesh directory; see mesh_part/CMakeLists.txt.
+# ----------------------------------------------------------------------
+add_subdirectory(mesh_part)
+
+# ----------------------------------------------------------------------
 # Tests: one executable per test/test_*.F90, registered with ctest.
 # add_fesom_test(<name> <nranks>) builds + runs under mpirun.
 # ----------------------------------------------------------------------
@@ -143,8 +149,21 @@ endif()
 # The DKRZ UCX runtime settings (env/levante shells) target compute-node
 # InfiniBand and fail on login nodes. Self-tests are tiny single-node runs, so
 # default to the ob1/vader (shared-memory) path. Override for batch if needed.
-set(FESOM3_MPI_LAUNCH_FLAGS "--mca;pml;ob1;--mca;btl;self,vader;--oversubscribe"
+# vader's single-copy mechanism (knem, the Levante default) is switched off: Open MPI
+# 4.1.2 caches knem registrations by virtual address and misses glibc heap trims (brk),
+# so a send buffer re-allocated at the same address after a trim is read from the OLD
+# pinned pages -- right count, payload of an earlier message (LESSONS L61; standalone
+# evidence: tools/run_mpi_knem_stale_repro.sh). env.sh sets the same for all runs.
+set(FESOM3_MPI_LAUNCH_FLAGS "--mca;pml;ob1;--mca;btl;self,vader;--mca;btl_vader_single_copy_mechanism;none;--oversubscribe"
     CACHE STRING "Extra mpirun flags for ctest self-tests")
+# a build tree configured before the single-copy switch keeps its cached vader flags:
+# add the switch there (a cache without vader, e.g. a UCX override, is left alone)
+if(FESOM3_MPI_LAUNCH_FLAGS MATCHES "vader" AND NOT FESOM3_MPI_LAUNCH_FLAGS MATCHES "single_copy_mechanism")
+    list(INSERT FESOM3_MPI_LAUNCH_FLAGS 0 --mca btl_vader_single_copy_mechanism none)
+    set(FESOM3_MPI_LAUNCH_FLAGS "${FESOM3_MPI_LAUNCH_FLAGS}" CACHE STRING
+        "Extra mpirun flags for ctest self-tests" FORCE)
+    message(STATUS "FESOM3_MPI_LAUNCH_FLAGS: added btl_vader_single_copy_mechanism none")
+endif()
 
 function(add_fesom_test test_name nranks)
     # Build the executable once; allow registering the same test at several rank
@@ -153,6 +172,9 @@ function(add_fesom_test test_name nranks)
         add_executable(${test_name} ${CMAKE_SOURCE_DIR}/test/${test_name}.F90)
         apply_fesom_compile_flags(${test_name})
         target_link_libraries(${test_name} PUBLIC fesom3)
+        if(TARGET fesom3_test_util)
+            target_link_libraries(${test_name} PUBLIC fesom3_test_util)
+        endif()
         set_target_properties(${test_name} PROPERTIES
             LINKER_LANGUAGE Fortran
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

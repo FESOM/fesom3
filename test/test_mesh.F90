@@ -51,7 +51,25 @@ program test_mesh
     call check(max_grad_const(mesh) < 1.0e-6_WP, 'pi: gradient_sca annihilates constant')
     call check(all(mesh%nlevels >= 1 .and. mesh%nlevels <= mesh%nl), 'pi: nlevels in range')
     call check(adjacency_consistent(mesh), 'pi: nod_in_elem2D consistent')
-    call check(all(mesh%area(1, 1:mesh%nod2D) > 0.0_MP), 'pi: surface control areas > 0')
+    ! 3-column elem2d.out: every element a triangle, its 4th slot repeating the 1st vertex
+    call check(all(mesh%elem2D_nnodes == 3) .and. &
+               all(mesh%elem2D_nodes(4,:) == mesh%elem2D_nodes(1,:)), &
+               'pi: triangles with elem2D_nodes(4,:) == elem2D_nodes(1,:)')
+    ! FESOM3 bottom at vertices: area/areasvol(+inv) are 1-D -- a scalar column's
+    ! horizontal area does not vary with depth, so depth-independence is now structural
+    ! rather than something to assert. What is left to check is that every column has a
+    ! usable area and reciprocal, since areasvol divides every tracer tendency.
+    call check(all(mesh%area(1:mesh%nod2D) > 0.0_MP), 'pi: control areas > 0')
+    call check(all(mesh%areasvol(1:mesh%nod2D) == mesh%area(1:mesh%nod2D)), &
+               'pi: areasvol == area (no cavity)')
+    call check(areasvol_inv_usable(mesh), 'pi: areasvol_inv finite and > 0')
+    ! The node-average denominator used by tr_xynodes (oce_ale_tracer.F90) is the area of
+    ! the elements that ACTUALLY contribute at level nz, not areasvol. At the surface every
+    ! adjacent element is wet, so the two agree; deeper they must not, or the change from
+    ! /3/areasvol to /tvol would be a no-op and the average would be silently scaled by
+    ! wet_area/full_area.
+    call check(wet_area_matches_at_surface(mesh), 'pi: wet element area == areasvol at surface')
+    call check(wet_area_differs_at_depth(mesh),   'pi: wet element area < areasvol somewhere deep')
 
     ! ================= analytic (Cartesian) =================
     call generate_analytic_mesh(amesh, partit, nx=9, ny=7, nl=5, &
@@ -99,6 +117,66 @@ contains
         end do
     end function
 
+    logical function areasvol_inv_usable(m)
+        ! areasvol_inv divides every tracer tendency, so every node needs a finite,
+        ! positive reciprocal area.
+        type(t_mesh), intent(in) :: m
+        integer :: n
+        areasvol_inv_usable = .true.
+        do n = 1, m%nod2D
+            if (.not. (m%areasvol_inv(n) > 0.0_MP) .or. &
+                .not. (abs(m%areasvol_inv(n)) <= huge(1.0_MP))) then
+                areasvol_inv_usable = .false.; return
+            end if
+        end do
+    end function
+
+    real(kind=MP) function wet_elem_area(m, n, nz)
+        ! sum of elem_area over the adjacent elements wet at level nz -- the denominator
+        ! the POINTWISE node averages use (UVnode, edge_up_dn_grad, sigma_xy, smooth_nod),
+        ! as opposed to the full areasvol the FLUX-forming ones use (tr_xynodes,
+        ! momentum_adv_scalar). The two genuinely differ under a vertex bottom and each
+        ! is right for its own job; see the checks below.
+        type(t_mesh), intent(in) :: m
+        integer,      intent(in) :: n, nz
+        integer :: k, elem
+        wet_elem_area = 0.0_MP
+        do k = 1, m%nod_in_elem2D_num(n)
+            elem = m%nod_in_elem2D(k, n)
+            if (nz <= m%nlevels(elem)-1 .and. nz >= m%ulevels(elem)) &
+                wet_elem_area = wet_elem_area + m%elem_area(elem)
+        end do
+    end function
+
+    logical function wet_area_matches_at_surface(m)
+        ! at the surface every adjacent element is wet, so the two denominators agree
+        type(t_mesh), intent(in) :: m
+        integer :: n
+        real(kind=MP) :: tvol, ref
+        wet_area_matches_at_surface = .true.
+        do n = 1, m%nod2D
+            tvol = wet_elem_area(m, n, m%ulevels_nod2D(n)) / 3.0_MP
+            ref  = m%areasvol(n)
+            if (abs(tvol - ref) > 1.0e-9_MP*max(abs(ref), 1.0_MP)) then
+                wet_area_matches_at_surface = .false.; return
+            end if
+        end do
+    end function
+
+    logical function wet_area_differs_at_depth(m)
+        ! ... and deeper they must NOT, or the pointwise/flux distinction would be vacuous
+        type(t_mesh), intent(in) :: m
+        integer :: n, nz
+        wet_area_differs_at_depth = .false.
+        do n = 1, m%nod2D
+            do nz = m%ulevels_nod2D(n), m%nlevels_nod2D(n)-1
+                if (wet_elem_area(m, n, nz)/3.0_MP < m%areasvol(n) * 0.999_MP) then
+                    wet_area_differs_at_depth = .true.; return
+                end if
+            end do
+        end do
+    end function
+
     logical function ocean_fraction_ok(m)
         type(t_mesh), intent(in) :: m
         real(kind=MP) :: frac
@@ -116,7 +194,7 @@ contains
             gx = 0.0_WP; gy = 0.0_WP
             do j = 1, 3
                 gx = gx + 1.0_WP * real(m%gradient_sca(j,   e), WP)
-                gy = gy + 1.0_WP * real(m%gradient_sca(3+j, e), WP)
+                gy = gy + 1.0_WP * real(m%gradient_sca(4+j, e), WP)
             end do
             max_grad_const = max(max_grad_const, abs(gx), abs(gy))
         end do
@@ -137,7 +215,7 @@ contains
                 fnode = a*real(m%coord_nod2D(1, nd), WP)*r_earth &
                       + b*real(m%coord_nod2D(2, nd), WP)*r_earth
                 gx = gx + fnode * real(m%gradient_sca(j,   e), WP)
-                gy = gy + fnode * real(m%gradient_sca(3+j, e), WP)
+                gy = gy + fnode * real(m%gradient_sca(4+j, e), WP)
             end do
             linear_gradient_exact = max(linear_gradient_exact, abs(gx-a), abs(gy-b))
         end do

@@ -22,6 +22,21 @@ module oce_dyn_ivertvisc
     ! plus the vertical-advection upwind update from the implicit vertical velocity
     ! w_i averaged to the prism faces (wu at top face nz, wd at bottom face nz+1):
     !   a += min(0,wu)*zinv ; b += max(0,wu)*zinv ; b -= min(0,wd)*zinv ; c -= max(0,wd)*zinv
+    ! That is the upwind FLUX form d(w_i u)/dz: its row sums are (wu-wd)*zinv, so a
+    ! uniform u gets the tendency -u*dw_i/dz. For the scalar scheme (momadv_opt==2) that
+    ! is consistent -- its explicit part is flux form too, and the u*dw/dz piece is
+    ! balanced by the horizontal u*div(u) through continuity. The vector-invariant
+    ! scheme (momadv_opt==1, oce_dyn_vinv) is ADVECTIVE form in both directions
+    ! (zeta x u + grad KE; Block C does w_e du/dz as d(w_e u)/dz - u dw_e/dz), so the
+    ! flux-form operator would leave a spurious u*dw_i/dz wherever the split is active
+    ! (CFL_z > wsplit_mincfl, oce_wsplit). For momadv_opt==1 the diagonal is therefore
+    ! corrected by
+    !   b -= (wu-wd)*zinv            (bottom row: b -= wu*zinv, its wd is dropped)
+    ! which turns the operator into the upwind ADVECTIVE form w_i du/dz (inflow-face
+    ! velocity), zero row sums, constants preserved implicitly, diagonal dominance kept.
+    ! Structurally gated: the ==2 path is untouched, and with use_wsplit=.false. w_i==0.
+    ! Net: test/test_ivertvisc.F90 (closed forms for both options); end to end in the
+    ! fesom_conserve wsplit / momadv-vinv-wsplit gate configs (FESOM3_WSPLIT).
     ! Boundary rows: the surface row carries the wind-stress flux
     !   ur(top) += zinv*stress_surf(1,elem)/density_0 ;  vr(top) += zinv*stress_surf(2,elem)/density_0
     ! and the bottom row the quadratic bottom drag
@@ -57,9 +72,9 @@ module oce_dyn_ivertvisc
     !  - The many runtime divisors (zinv, the Z/zbar differences, m, b(nz), the Thomas
     !    1/b and 1/m) are byte-identical on both sides (same operands), so the Intel
     !    -no-prec-div reciprocal matches (L7/L10/L14).
-    !  - elnodes = elem2D_nodes(1:3,elem): the (1:3) slice avoids the MAX_NV=4 shape trap
-    !    (L15). wu/wd = sum over the 3 nodes / 3 — a fixed 3-term sum in index order, so
-    !    deterministic and order-stable.
+    !  - Hybrid meshes: wu/wd = the kite-weighted element mean sum(elem_w*w_i) over the 4
+    !    vertex slots (FESOM2: sum over the 3 nodes / 3; triangles equal to roundoff) — a
+    !    fixed 4-term sum in index order, so deterministic and order-stable.
     !  - SINGLE-LAYER COLUMN CAVEAT (deferred to M2.11 CORE2): for nlevels(elem)==2 the
     !    "last row" block reads Z_n(nzmax-2)=Z_n(0) and UV(:,nzmax-2)=UV(:,0) — benign
     !    out-of-bounds reads (the values are overwritten by the "first row" block / are
@@ -75,7 +90,7 @@ module oce_dyn_ivertvisc
     use mod_precision,  only: WP
     use mod_constants,  only: density_0
     use mod_param_phys, only: C_d
-    use mod_mesh,       only: t_mesh
+    use mod_mesh,       only: t_mesh, MAX_NV
     use mod_dyn,        only: t_dyn
     use mod_partit,     only: t_partit
     use mod_part_bounds, only: owned_bounds
@@ -99,7 +114,7 @@ contains
         !______________________________________________________________________
         real(kind=WP) :: a(mesh%nl-1), b(mesh%nl-1), c(mesh%nl-1), ur(mesh%nl-1), vr(mesh%nl-1)
         real(kind=WP) :: cp(mesh%nl-1), up(mesh%nl-1), vp(mesh%nl-1)
-        integer       :: nz, elem, nzmin, nzmax, elnodes(3)
+        integer       :: nz, elem, nzmin, nzmax, elnodes(MAX_NV)
         integer       :: nNodO, nNodL, nEdgeO, nElemO
         real(kind=WP) :: zinv, m, friction, wu, wd
         real(kind=WP) :: zbar_n(mesh%nl), Z_n(mesh%nl-1)
@@ -113,7 +128,7 @@ contains
 
         !______________________________________________________________________
         do elem = 1, nElemO
-            elnodes = mesh%elem2D_nodes(1:3, elem)
+            elnodes = mesh%elem2D_nodes(:, elem)
             nzmin   = mesh%ulevels(elem)
             nzmax   = mesh%nlevels(elem)
 
@@ -138,31 +153,35 @@ contains
                 c(nz) = -Av(nz+1,elem)/(Z_n(nz)  -Z_n(nz+1))*zinv
                 b(nz) = -a(nz)-c(nz)+1.0_WP
                 ! update from the vertical advection
-                wu = sum(Wvel_i(nz,   elnodes))/3._WP
-                wd = sum(Wvel_i(nz+1, elnodes))/3._WP
+                wu = sum(mesh%elem_w(:,elem)*Wvel_i(nz,   elnodes))
+                wd = sum(mesh%elem_w(:,elem)*Wvel_i(nz+1, elnodes))
                 a(nz) = a(nz)+min(0._WP, wu)*zinv
                 b(nz) = b(nz)+max(0._WP, wu)*zinv
                 b(nz) = b(nz)-min(0._WP, wd)*zinv
                 c(nz) = c(nz)-max(0._WP, wd)*zinv
+                ! advective form for the vector-invariant scheme (see header)
+                if (dynamics%momadv_opt == 1) b(nz) = b(nz)-(wu-wd)*zinv
             end do
             ! The last row
             zinv       = 1.0_WP*dt/(zbar_n(nzmax-1)-zbar_n(nzmax))
             a(nzmax-1) = -Av(nzmax-1,elem)/(Z_n(nzmax-2)-Z_n(nzmax-1))*zinv
             b(nzmax-1) = -a(nzmax-1)+1.0_WP
             c(nzmax-1) = 0.0_WP
-            wu         = sum(Wvel_i(nzmax-1, elnodes))/3._WP
+            wu         = sum(mesh%elem_w(:,elem)*Wvel_i(nzmax-1, elnodes))
             a(nzmax-1) = a(nzmax-1)+min(0._WP, wu)*zinv
             b(nzmax-1) = b(nzmax-1)+max(0._WP, wu)*zinv
+            if (dynamics%momadv_opt == 1) b(nzmax-1) = b(nzmax-1)-wu*zinv
             ! The first row
             zinv       = 1.0_WP*dt/(zbar_n(nzmin)-zbar_n(nzmin+1))
             c(nzmin)   = -Av(nzmin+1,elem)/(Z_n(nzmin)-Z_n(nzmin+1))*zinv
             a(nzmin)   = 0.0_WP
             b(nzmin)   = -c(nzmin)+1.0_WP
-            wu         = sum(Wvel_i(nzmin,   elnodes))/3._WP
-            wd         = sum(Wvel_i(nzmin+1, elnodes))/3._WP
+            wu         = sum(mesh%elem_w(:,elem)*Wvel_i(nzmin,   elnodes))
+            wd         = sum(mesh%elem_w(:,elem)*Wvel_i(nzmin+1, elnodes))
             b(nzmin)   = b(nzmin)+wu*zinv
             b(nzmin)   = b(nzmin)-min(0._WP, wd)*zinv
             c(nzmin)   = c(nzmin)-max(0._WP, wd)*zinv
+            if (dynamics%momadv_opt == 1) b(nzmin)   = b(nzmin)-(wu-wd)*zinv
 
             !__________________________________________________________________
             ! The rhs

@@ -11,6 +11,10 @@ program fesom_advhordump_mr
     ! the oracle on the same partition) — node fields directly, the element velocity at
     ! owned elements then exchange_elem_full'd (halo elements have no local elem2D_nodes).
     !
+    ! Hybrid meshes (plan docs/plans/completed/2026-10-08-hybrid-meshes.md, Task 14): the FESOM2-oracle
+    ! byte gate is retired (docs/HANDOFF.md "Gate migration"). The driver has no triangle-
+    ! specific code of its own (it runs the converted kernels) and stays a diagnostic dump.
+    !
     !   FESOM3_MESH_DIR    mesh dir (must contain dist_<NP>/)
     !   FESOM3_ADVHOR_OUT  out path prefix (per rank: <prefix>.<mype5>)
     use mpi
@@ -30,7 +34,7 @@ program fesom_advhordump_mr
     implicit none
 
     real(kind=WP), parameter :: dt   = 1800.0_WP
-    real(kind=WP), parameter :: opth = 0.0_WP    ! MFCT 4th-order fraction (FCT config)
+    real(kind=WP), parameter :: opth = 0.0_WP    ! MUSCL 4th-order fraction (FCT config)
     real(kind=WP), parameter :: optv = 1.0_WP    ! QR4C 4th-order fraction (FCT config)
 
     character(len=512) :: mesh_dir, out_prefix, out_path
@@ -45,7 +49,7 @@ program fesom_advhordump_mr
     real(kind=MP) :: zbar_srf, zbar_bot
     real(kind=WP), allocatable :: ttf(:,:), ttfAB(:,:), wvel(:,:)
     ! captured FCT-config fields (overwritten by the non-FCT advect call)
-    real(kind=MP), allocatable :: valuesAB_s(:,:), eudg_s(:,:,:), fctLO_s(:,:)
+    real(kind=MP), allocatable :: valuesAB_s(:,:), fctLO_s(:,:)
     real(kind=MP), allocatable :: fmax_s(:,:), fmin_s(:,:), fplus_s(:,:), fminus_s(:,:)
     real(kind=MP), allocatable :: dh_s(:,:), dv_s(:,:), dt_s(:,:)
     real(kind=MP), allocatable :: dh_n(:,:), dv_n(:,:), dt_n(:,:)
@@ -157,23 +161,20 @@ program fesom_advhordump_mr
 
     call muscl_adv_init(tr%work, mesh, partit)
 
-    ! --- FCT config (MFCT/QR4C/FCT, AB2) -------------------------------------------
+    ! --- FCT config (MUSCL/QR4C/FCT, AB2) -------------------------------------------
     tr%data(1)%values(:,:)      = ttf
     tr%data(1)%valuesold(1,:,:) = ttfAB
     tr%data(1)%AB_order    = 2
-    tr%data(1)%tra_adv_hor = 'MFCT'
+    tr%data(1)%tra_adv_hor = 'MUSCL'
     tr%data(1)%tra_adv_ver = 'QR4C'
     tr%data(1)%tra_adv_lim = 'FCT'
     tr%data(1)%tra_adv_ph  = opth
     tr%data(1)%tra_adv_pv  = optv
     call init_tracers_AB(1, tr, mesh, partit)
-    ! capture edge_up_dn_grad NOW — do_oce_adv_tra's FCT limiter reuses it as AUX
-    ! scratch in FESOM2 (bignumber fill), so it is only meaningful pre-advection.
-    allocate(valuesAB_s(nl-1, nNodO), eudg_s(4, nl-1, nEdgeO), fctLO_s(nl-1, nNodO))
+    allocate(valuesAB_s(nl-1, nNodO), fctLO_s(nl-1, nNodO))
     allocate(fmax_s(nl-1, nNodO), fmin_s(nl-1, nNodO), fplus_s(nl-1, nNodO), fminus_s(nl-1, nNodO))
     allocate(dh_s(nl-1, nNodO), dv_s(nl-1, nNodO), dt_s(nl-1, nNodO))
     valuesAB_s = real(tr%data(1)%valuesAB(1:nl-1, 1:nNodO),   MP)
-    eudg_s     = real(tr%work%edge_up_dn_grad(1:4,1:nl-1,1:nEdgeO), MP)
     call do_oce_adv_tra(dt, dyn%uv, dyn%w, dyn%w_i, dyn%w_e, 1, dyn, tr, mesh, partit)
     do n = 1, nNodO
         tr%work%del_ttf(:,n) = tr%work%del_ttf(:,n) &
@@ -215,7 +216,6 @@ program fesom_advhordump_mr
     end if
     call advhor_dump_open(u, trim(out_path), nNodO, nElemO, nEdgeO, nl)
     call wr_r2(u, 'valuesAB',             valuesAB_s)
-    call wr_r3(u, 'edge_up_dn_grad',      eudg_s)
     call wr_r2(u, 'fct_LO',               fctLO_s)
     call wr_r2(u, 'fct_ttf_max',          fmax_s)
     call wr_r2(u, 'fct_ttf_min',          fmin_s)

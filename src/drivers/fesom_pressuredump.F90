@@ -9,6 +9,11 @@ program fesom_pressuredump
     ! dumps density_m_rho0 / hpressure / bvfreq / pgf_x/pgf_y / coriolis / uv_rhs* in
     ! the oracle's FADVHDMP format. tools/pressure_diff.py compares for max|delta|=0.
     !
+    ! Hybrid meshes (plan docs/plans/completed/2026-10-08-hybrid-meshes.md, Task 14): the FESOM2-oracle
+    ! byte gate is retired (docs/HANDOFF.md "Gate migration"). REMAPPED: the driver's own
+    ! node->element means (KPP viscAE, unstable-element count) run over the 4 slots with the
+    ! kite weights elem_w like the kernels; it stays a diagnostic dump (roundoff vs FESOM2).
+    !
     !   FESOM3_MESH_DIR      mesh dir   (default: pi)
     !   FESOM3_PRESSURE_OUT  out path   (default: pressure_f3.bin)
     use mpi
@@ -16,12 +21,13 @@ program fesom_pressuredump
     use mod_constants,    only: density_0
     use mod_param_phys,   only: N2smth_h
     use mod_param_phys,   only: Fer_GM, Redi, Redi_Ktaper, scaling_ODM95, ODM95_Scr, ODM95_Sd, scaling_LDD97
-    use mod_mesh,         only: t_mesh
+    use mod_mesh,         only: t_mesh, MAX_NV
     use mod_partit,       only: t_partit
     use mod_partitioning, only: par_init, par_ex
     use mod_mesh_read,    only: read_mesh
     use mod_mesh_areas,   only: compute_geometry
     use mod_dyn,          only: t_dyn
+    use oce_wsplit,       only: wsplit_assert_params
     use oce_pressure_bv,  only: pressure_bv, sw_alpha_beta, compute_sigma_xy, compute_neutral_slope
     use oce_fer_gm,       only: init_Redi_GM, fer_solve_Gamma, fer_gamma2vel
     use mod_param_phys,   only: K_GM_max, K_GM_min, K_GM_bvref, K_GM_rampmax, K_GM_rampmin, &
@@ -36,6 +42,7 @@ program fesom_pressuredump
     use oce_ssh_solve,    only: solve_ssh_ale
     use oce_ale,          only: update_vel, compute_hbar_ale, update_eta_n, vert_vel_ale
     use oce_ale_mixing_pp, only: oce_mixing_pp
+    use oce_vert_spline,   only: compute_shear2
     use oce_mixing_kpp,   only: ri_iwmix, bldepth, oce_mixing_kpp_init, blmix_kpp, enhance
     use mod_constants,    only: density_0_r, vcpw, g
     use mod_param_phys,   only: Ricr, concv
@@ -100,7 +107,7 @@ program fesom_pressuredump
     ! INPUT dump records still echo the prescription, not the M2.7 output.
     real(kind=WP), allocatable :: hbar_in(:), eta_n_in(:), w_e_in(:,:), w_i_in(:,:)
     real(kind=WP), allocatable :: uv_upd(:,:,:)
-    integer       :: n_cflsplit
+    integer       :: n_split_faces
     ! --- M2.8 PP vertical mixing (oce_mixing_pp -> Kv nodes / Av elements) ---
     real(kind=WP) :: shear, dz_inv, factor, fmin, fmax
     integer       :: nf, nf_big
@@ -130,7 +137,7 @@ program fesom_pressuredump
     real(kind=WP), allocatable :: blmc_kpp(:,:,:), ghats_kpp(:,:), dkm1_kpp(:,:)
     real(kind=WP), allocatable :: viscA_fin(:,:), diffK_fin(:,:,:), viscAE_kpp(:,:)
     real(kind=WP)              :: minmix
-    integer                    :: elem, elnodes(3)
+    integer                    :: elem, elnodes(MAX_NV)
     real(kind=WP)              :: usurf, vsurf, u_loc, v_loc, sw0
     real(kind=WP), allocatable :: heat_flux(:), water_flux(:), virtual_salt(:), relax_salt(:)
     real(kind=WP), allocatable :: real_salt_flux(:)
@@ -303,6 +310,8 @@ program fesom_pressuredump
     allocate(dyn%w_e(nl, mesh%nod2D))                   ! explicit vertical velocity (nodes)
     allocate(dyn%w_i(nl, mesh%nod2D))                   ! M2.5 implicit vertical velocity (nodes)
     allocate(dyn%work%uvnode_rhs(2, nl-1, mesh%nod2D))  ! momadv nodal scratch
+    allocate(dyn%work%vorticity(nl-1, mesh%nod2D))   ! momadv_opt==1 (vector-invariant) scratch
+    dyn%work%vorticity = 0.0_WP
     allocate(dyn%work%pgf_x(nl-1, mesh%elem2D), dyn%work%pgf_y(nl-1, mesh%elem2D))
     allocate(dyn%work%u_c(nl-1, mesh%elem2D), dyn%work%v_c(nl-1, mesh%elem2D))  ! visc scratch
     allocate(Av(nl, mesh%elem2D), stress_surf(2, mesh%elem2D))  ! M2.5 prescribed inputs
@@ -310,6 +319,7 @@ program fesom_pressuredump
     ! M2.1 local bvfreq), and the Kv/Av output fields.
     allocate(dyn%uvnode(2, nl-1, mesh%nod2D))                   ! nodal velocity (PP shear input)
     allocate(dyn%work%bvfreq(nl, mesh%nod2D))                   ! smoothed N^2 (PP reads it)
+    allocate(dyn%work%shear2(nl, mesh%nod2D))                   ! shared |du/dz|^2 (PP reads it)
     allocate(dyn%work%Kv(nl, mesh%nod2D), dyn%work%Av(nl, mesh%elem2D))
     dyn%AB_order          = 2
     dyn%momadv_opt        = 2     ! M2.4: enable momentum_adv_scalar (pi production value)
@@ -494,7 +504,13 @@ program fesom_pressuredump
     ! solve. Build the ALE thickness state the update reads/writes: mesh%hbar (prescribed,
     ! the previous-step elevation), hbar_old/dhe (outputs), hnode_new=hnode (linfs never
     ! evolves it), and dyn%w/cfl_z. Force the pi wsplit config (use_wsplit=.true.,
-    ! wsplit_maxcfl=1.0). alpha=theta=1.0 already set above. The chain is, in order:
+    ! wsplit_maxcfl=1.0; wsplit_mincfl at its type default 0.5) so compute_Wvel_split runs
+    ! here (the w_i /= 0 count below is its evidence). The split is FESOM3's smooth
+    ! Shchepetkin function (oce_wsplit), NOT FESOM2's hard switch, so w_e/w_i are not
+    ! byte-comparable and are NOT dumped; FESOM2's w_split_e/w_split_i records are listed
+    ! in pressure_diff.py's SKIP_FIELDS (the FESOM2 byte-gates are retired since
+    ! bottom-at-vertices anyway).
+    ! alpha=theta=1.0 already set above. The chain is, in order:
     !   update_vel (UV += UV_rhs + SSH-grad) -> compute_hbar_ale (hbar/dhe/ssh_rhs_old)
     !   -> update_eta_n (eta_n=hbar) -> vert_vel_ale (w + cfl_z + Wvel split). dyn%uv_rhs
     ! is the post-TDMA uv_rhs_ivv; dyn%uv is the prescribed UV (update_vel overwrites it).
@@ -507,7 +523,8 @@ program fesom_pressuredump
     dyn%w          = 0.0_WP
     dyn%cfl_z      = 0.0_WP
     dyn%use_wsplit    = .true.             ! pi production value (namelist.dyn)
-    dyn%wsplit_maxcfl = 1.0_WP
+    dyn%wsplit_maxcfl = 1.0_WP             ! the explicit CFL_z cap; wsplit_mincfl = 0.5 (type default)
+    call wsplit_assert_params(dyn%wsplit_mincfl, dyn%wsplit_maxcfl)   ! the t_dyn obligation
 
     ! analytic previous-step elevation hbar (sign-varying, ~0.6 m). MUST match the oracle.
     do n = 1, mesh%nod2D
@@ -556,19 +573,19 @@ program fesom_pressuredump
     call vert_vel_ale(dyn, mesh, dt_velrhs)         ! w + cfl_z + w_e/w_i split + (Fer_GM) fer_w
     Fer_GM = .false.; Redi = .false.   ! restore reduced-M2 for the downstream M2.8/M2.9 step
 
-    ! gate-strength diagnostic (NOT dumped): the Wvel split fires only where CFL_z >
-    ! wsplit_maxcfl. A non-zero share confirms the split formula (dd, Wvel_e/Wvel_i) is
-    ! genuinely exercised (not just the trivial Wvel_e=Wvel branch), the L11/L17 guard.
-    n_cflsplit = 0
+    ! gate-strength diagnostic (NOT dumped): the smooth Wvel split fires (w_i /= 0) only
+    ! where CFL_z > wsplit_mincfl. A non-zero count confirms the split function is genuinely
+    ! exercised (not just the trivial w_e=w, w_i=0 range), the L11/L17 guard.
+    n_split_faces = 0
     do n = 1, mesh%nod2D
         do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n)
-            if (dyn%cfl_z(nz,n) > dyn%wsplit_maxcfl) n_cflsplit = n_cflsplit + 1
+            if (dyn%w_i(nz,n) /= 0.0_WP) n_split_faces = n_split_faces + 1
         end do
     end do
     write(*,'(a,es10.3,a,es10.3,a,es10.3,a,i0)') &
         'fesom_pressuredump: ale: max|uv_upd|=', maxval(abs(uv_upd)), &
         ' ; max|hbar|=', maxval(abs(mesh%hbar)), ' ; max|w|=', maxval(abs(dyn%w)), &
-        ' ; CFL_z>maxcfl on ', n_cflsplit
+        ' ; w_i/=0 (split faces) on ', n_split_faces
 
     ! ============== M2.8 PP (Pacanowski-Philander) vertical mixing ====================
     ! The Richardson-number mixing coefficients (FESOM2 oce_ale.F90:3728 -> oce_mixing_PP),
@@ -601,6 +618,8 @@ program fesom_pressuredump
     dyn%work%bvfreq = bvfreq                 ! the M2.1 SMOOTHED N^2 (PP reads dyn%work%bvfreq)
     dyn%work%Kv = 0.0_WP                      ! caller pre-zeros (PP writes only nzmin+1..nzmax-1)
     dyn%work%Av = 0.0_WP
+    dyn%work%shear2 = 0.0_WP
+    call compute_shear2(dyn, mesh)
     call oce_mixing_pp(dyn, mesh)
 
     ! gate-strength diagnostic (NOT dumped): re-derive the Ri factor (the pass-1 Kv) to
@@ -742,11 +761,11 @@ program fesom_pressuredump
     ! node->elem viscAE average (minmix=3e-3 surface floor). 1-rank: no pre-average exchange.
     minmix = 3.0e-3_WP
     do elem = 1, mesh%elem2D
-        elnodes = mesh%elem2D_nodes(1:3,elem)
+        elnodes = mesh%elem2D_nodes(:,elem)
         nzmin   = mesh%ulevels(elem)
         nzmax   = mesh%nlevels(elem)
         do nz = nzmin, nzmax-1
-            viscAE_kpp(nz,elem) = sum(viscA_fin(nz,elnodes))/3.0_WP
+            viscAE_kpp(nz,elem) = sum(mesh%elem_w(:,elem)*viscA_fin(nz,elnodes))
         end do
         viscAE_kpp(nzmax,elem) = viscAE_kpp(nzmax-1,elem)
         if (viscAE_kpp(nzmin,elem) < minmix) viscAE_kpp(nzmin,elem) = minmix
@@ -781,7 +800,7 @@ program fesom_pressuredump
     end do
     do e = 1, mesh%elem2D
         do nz = mesh%ulevels(e)+1, mesh%nlevels(e)-1
-            if (any(bvfreq(nz, mesh%elem2D_nodes(1:3,e)) < 0.0_WP)) n_unstab_e = n_unstab_e + 1
+            if (any(bvfreq(nz, mesh%elem2D_nodes(:,e)) < 0.0_WP)) n_unstab_e = n_unstab_e + 1
         end do
     end do
     write(*,'(a,i0,a,i0,a,es10.3,a,es10.3)') &
@@ -921,7 +940,9 @@ program fesom_pressuredump
     ! M2.7 ALE velocity/SSH/thickness-W update: the prescribed hbar input + the updated
     ! UV (update_vel) + the divergence ssh_rhs_old + new hbar/dhe (compute_hbar_ale) + the
     ! blended eta_n + the vertical velocity w (vert_vel_ale) + hnode_new (=hnode, linfs) +
-    ! cfl_z (compute_CFLz) + the explicit/implicit Wvel split (compute_Wvel_split).
+    ! cfl_z (compute_CFLz). The explicit/implicit split w_e/w_i (compute_Wvel_split) is
+    ! the smooth FESOM3 function and is NOT dumped: nothing reads it, and FESOM2's
+    ! w_split_e/w_split_i records are skipped by pressure_diff.py (never byte-compared).
     call wr_r1(u, 'hbar_in',        real(hbar_in,          MP))
     call wr_r3(u, 'uv_upd',         real(uv_upd,           MP))
     call wr_r1(u, 'ssh_rhs_old',    real(dyn%ssh_rhs_old,  MP))
@@ -931,8 +952,6 @@ program fesom_pressuredump
     call wr_r2(u, 'w',              real(dyn%w(1:nl, :),   MP))
     call wr_r2(u, 'hnode_new',      real(mesh%hnode_new(1:nl-1, :), MP))
     call wr_r2(u, 'cfl_z',          real(dyn%cfl_z(1:nl, :), MP))
-    call wr_r2(u, 'w_split_e',      real(dyn%w_e(1:nl, :), MP))
-    call wr_r2(u, 'w_split_i',      real(dyn%w_i(1:nl, :), MP))
     ! M4b GM: the diffusivity fer_K (nl) + gravity-wave fer_c (cm^2) + scaling fer_scal +
     ! the streamfunction fer_gamma (fer_solve_Gamma TDMA) + bolus velocity fer_uv
     ! (fer_gamma2vel) + bolus vertical velocity fer_w (vert_vel_ale, Fer_GM branch).

@@ -37,13 +37,16 @@ program fesom_lifecycle_native_mr
     !   FESOM_DUMP_FILE     per-rank node dump prefix (mod_dump; <prefix>.<mype5>)
     !   FESOM_DUMP_MAXSTEPS dump step cap
     !   FESOM3_NSTEPS       number of steps                     (default: 3)
+    !   FESOM3_SHARED_SYNC  1 = one owner per shared element: update_vel syncs uv (default);
+    !                       0 = off (unsynced copies, A/B only). Read in src/infra/mod_shared_elem.F90.
     use mpi
     use mod_timer           ! permanent per-component wall-clock timing (TMR_* ids, timer_start/stop/report)
     use, intrinsic :: ieee_arithmetic   ! M8c Step-3 fix: control flush-to-zero (denormal) underflow mode
     use, intrinsic :: iso_fortran_env, only: int32, real64
     use mod_precision,      only: WP, MP, MPI_WP
     use mod_constants,      only: density_0
-    use mod_param_phys,     only: N2smth_h, alpha, theta
+    use mod_halo,           only: shared_copy_max_elem   ! FESOM3_STEP_DIAG shared-element spreads
+    use mod_param_phys,     only: N2smth_h, alpha, theta, scale_area, shear_splines, N2_splines, rvo_upwind
     use mod_param_phys,     only: mix_coeff_PP, A_ver, K_ver, Kv0_const, mix_scheme_nmb
     use mod_param_phys,     only: use_instabmix, instabmix_kv, use_momix, use_windmix
     ! M4f: GM bolus (FESOM3_FER_GM) + Redi isopycnal diffusion (FESOM3_REDI) at MULTI-RANK —
@@ -70,6 +73,7 @@ program fesom_lifecycle_native_mr
                                   yearstart, ndpyr, day_in_month, fleapyear, num_day_in_month
     use oce_mixing_kpp,     only: oce_mixing_kpp_init
     use oce_mixing_tke,     only: tke_init
+    use oce_wsplit,         only: wsplit_assert_params
     use oce_shortwave_pene, only: cal_shortwave_rad
     use mod_mesh,           only: t_mesh
     use mod_partit,         only: t_partit
@@ -103,7 +107,12 @@ program fesom_lifecycle_native_mr
                                   restart_read, restart_finalize, restart_resolve_latest
     implicit none
 
-    real(kind=WP), parameter :: dt = 86400.0_WP / real(48, WP)   ! CORE2 dt = 1800 s
+    ! Model timestep, from step_per_day (env FESOM3_STEP_PER_DAY; default 48 => dt = 1800 s = 30 min,
+    ! the CORE2 namelist timestep). Set once in the env block below, BEFORE init_stiff_mat_ale and
+    ! ice_setup bake it in. Leaving the env unset reproduces the old parameter exactly, so every
+    ! byte-gate is unchanged.
+    integer                  :: spd, spd_env
+    real(kind=WP)            :: dt
 
     character(len=512) :: mesh_dir, ic_file, env, whichevp_str
     type(t_partit)        :: partit
@@ -126,7 +135,8 @@ program fesom_lifecycle_native_mr
     character(len=4096) :: out_env, out_dir_o, nml_io_path
     ! M8a: model clock (cold start from FESOM3_START_CLOCK) + run-length driver
     integer            :: clk_d0, clk_y0, clk_unit, idx, ierr
-    real(kind=WP)      :: clk_t0, dstat(6)   ! dstat: M8c Step-3 global per-step physical diagnostics
+    real(kind=WP)      :: clk_t0, dstat(9)   ! dstat: M8c Step-3 global per-step physical diagnostics
+    real(kind=WP)      :: dsum(2)            ! [sum ssh_rhs_old, sum|ssh_rhs_old|] over owned nodes
     logical            :: ftz_supported   ! M8c Step-3: flush-to-zero (denormal) underflow control (match FESOM2)
     logical            :: step_diag        ! perf: per-step global MPI_MAX stability diagnostic (env FESOM3_STEP_DIAG; default OFF — FESOM2 has no per-step collective)
     integer            :: mon_every        ! perf monitoring: emit a per-component timing report every mon_every steps (env FESOM3_TIMING_EVERY; 0 = only the final report)
@@ -149,6 +159,9 @@ program fesom_lifecycle_native_mr
     logical :: use_fer_gm, use_redi   ! M4f: GM bolus / Redi isopycnal diffusion toggles
     logical :: use_kpp, do_swpene, do_nonlcl   ! M5d: KPP / shortwave pene / ghats nonlocal flux
     logical :: use_tke      ! M7d: FESOM3_MIX_TKE -> cvmix_TKE producer at multi-rank (LOCAL nNodL)
+    integer :: momadv_env   ! FESOM3_MOMADV_OPT: 1 = vector invariant, 2 = scalar (default)
+    logical       :: use_wsplit                            ! FESOM3_WSPLIT (presence)
+    real(kind=WP) :: wsplit_mincfl_env, wsplit_maxcfl_env  ! FESOM3_WSPLIT_MINCFL/_MAXCFL (values)
     real(kind=WP), allocatable :: chl(:)       ! M5d const 0.1 / M8c Sweeney monthly climatology
     logical :: use_chl_sweeney                 ! M8c: FESOM3_CHL_SWEENEY -> read Sweeney chl monthly
     ! native atmospheric forcing read (the whole atmosphere, over owned+halo).
@@ -188,6 +201,56 @@ program fesom_lifecycle_native_mr
     use_tke = (ios == 0 .and. env_len > 0)
     call get_environment_variable('FESOM3_SW_PENE', env, length=env_len, status=ios)
     do_swpene = (ios == 0 .and. env_len > 0)
+    ! Vertical cubic-spline reconstruction of the shear (oce_vert_spline) and of N^2
+    ! (oce_pressure_bv), FESOM's RI_SPLINES analogue. Presence-based like the rest.
+    ! Set BOTH for like-by-like Ri and neutral-slope ratios; one alone re-creates the
+    ! numerator/denominator asymmetry the pair exists to remove.
+    call get_environment_variable('FESOM3_SHEAR_SPLINES', env, length=env_len, status=ios)
+    shear_splines = (ios == 0 .and. env_len > 0)
+    call get_environment_variable('FESOM3_N2_SPLINES', env, length=env_len, status=ios)
+    N2_splines = (ios == 0 .and. env_len > 0)
+    ! Momentum advection operator. VALUE-based, NOT presence-based like the switches
+    ! above: momadv_opt is 1 (vector invariant, oce_dyn_vinv) or 2 (scalar/flux form),
+    ! so a bare presence test could not distinguish them. Unset => 2, the default.
+    call get_environment_variable('FESOM3_MOMADV_OPT', env, length=env_len, status=ios)
+    momadv_env = 2
+    if (ios == 0 .and. env_len > 0) read(env, *, iostat=ios) momadv_env
+    if (momadv_env /= 1 .and. momadv_env /= 2) &
+        error stop 'FESOM3_MOMADV_OPT must be 1 or 2'
+    ! Upwind blending of the face relative vorticity (oce_dyn_vinv; only active with
+    ! momadv_opt==1). VALUE-based: a fraction in [0,1], not a presence switch.
+    call get_environment_variable('FESOM3_RVO_UPWIND', env, length=env_len, status=ios)
+    if (ios == 0 .and. env_len > 0) read(env, *, iostat=ios) rvo_upwind
+    if (rvo_upwind < 0.0_WP .or. rvo_upwind > 1.0_WP) &
+        error stop 'FESOM3_RVO_UPWIND must be in [0,1]'
+    ! Smooth Courant-dependent w = w_e + w_i split (oce_wsplit, compute_Wvel_split): the
+    ! part of w above the explicit CFL_z cap is advected by the implicit upstream solves
+    ! (momentum TDMA, tracer vertical-diffusion TDMA, FCT adv_tra_vert_impl). Presence-
+    ! based switch like FESOM3_FER_GM; the two parameters are VALUE-based like
+    ! FESOM3_MOMADV_OPT. Defaults: the t_dyn cap 1.0 and an onset of 0.5*maxcfl, so setting
+    ! only FESOM3_WSPLIT_MAXCFL keeps the type's onset/cap ratio. Validated once here
+    ! (wsplit_assert_params: maxcfl > 0, 0 <= mincfl <= maxcfl). Off unless set
+    ! (production precedent).
+    ! An unparsable value is an error, not a silent fall-back to the default: a production
+    ! run must never carry a cap other than the one the job file asked for.
+    call get_environment_variable('FESOM3_WSPLIT', env, length=env_len, status=ios)
+    use_wsplit = (ios == 0 .and. env_len > 0)
+    wsplit_maxcfl_env = 1.0_WP
+    call get_environment_variable('FESOM3_WSPLIT_MAXCFL', env, length=env_len, status=ios)
+    if (ios == 0 .and. env_len > 0) then
+        read(env, *, iostat=ios) wsplit_maxcfl_env
+        if (ios /= 0) error stop 'FESOM3_WSPLIT_MAXCFL: not a real'
+    end if
+    wsplit_mincfl_env = 0.5_WP*wsplit_maxcfl_env
+    call get_environment_variable('FESOM3_WSPLIT_MINCFL', env, length=env_len, status=ios)
+    if (ios == 0 .and. env_len > 0) then
+        read(env, *, iostat=ios) wsplit_mincfl_env
+        if (ios /= 0) error stop 'FESOM3_WSPLIT_MINCFL: not a real'
+    end if
+    call wsplit_assert_params(wsplit_mincfl_env, wsplit_maxcfl_env)   ! the t_dyn obligation
+    if (partit%mype == 0 .and. (shear_splines .or. N2_splines)) write(*,'(a,l1,a,l1,a)') &
+        'fesom_lifecycle_native_mr: vertical splines ENABLED (shear=', shear_splines, &
+        ', N2=', N2_splines, ')'
     ! M8c: FESOM3_CHL_SWEENEY -> read the Sweeney monthly chlorophyll climatology (production) instead
     ! of the const-0.1 fallback. Only meaningful with shortwave penetration (use_sw_pene) on.
     call get_environment_variable('FESOM3_CHL_SWEENEY', env, length=env_len, status=ios)
@@ -206,6 +269,16 @@ program fesom_lifecycle_native_mr
     ! freshwater flux (use_virt_salt=.false., is_nonlinfs=1; mirror of the 1-rank M6a-3 wiring).
     call get_environment_variable('FESOM3_WHICH_ALE', env, length=env_len, status=ios)
     if (ios == 0 .and. env_len > 0) which_ALE = trim(env)
+    ! Timestep: FESOM3_STEP_PER_DAY steps per day (default 48 = 1800 s = 30 min, the CORE2
+    ! namelist timestep). A finer mesh needs a larger value (e.g. 96 => 900 s). dt must be
+    ! resolved HERE: init_stiff_mat_ale and ice_setup below capture it at setup time.
+    spd = 48
+    call get_environment_variable('FESOM3_STEP_PER_DAY', env, length=env_len, status=ios)
+    if (ios == 0 .and. env_len > 0) then
+        read(env, *, iostat=ios) spd_env
+        if (ios == 0 .and. spd_env > 0) spd = spd_env
+    end if
+    dt = 86400.0_WP / real(spd, WP)
 
     !===========================================================================
     ! model_init: MR mesh remap + geometry (set_partition -> read_mesh dispatches to
@@ -243,6 +316,9 @@ program fesom_lifecycle_native_mr
     if (partit%mype == 0) &
         write(*,'(a,i0,a,i0,a,i0,a,i0)') 'fesom_lifecycle_native_mr: nod2D=', mesh%nod2D, &
             ' elem2D=', mesh%elem2D, ' nl=', nl, ' CW swaps=', nsw
+    if (partit%mype == 0) &
+        write(*,'(a,i0,a,f0.1,a)') 'fesom_lifecycle_native_mr: step_per_day=', spd, &
+            ' dt=', dt, ' s'
 
     !===========================================================================
     ! ALE depth/thickness state (linfs full cells; local sizes) — as fesom_lifecycle_mr.
@@ -292,29 +368,39 @@ program fesom_lifecycle_native_mr
     allocate(dyn%w(nl, nNodL), dyn%w_e(nl, nNodL), dyn%w_i(nl, nNodL))
     allocate(dyn%cfl_z(nl, nNodL))
     allocate(dyn%work%density_ref(nl-1, nNodL), dyn%work%density_m_rho0(nl-1, nNodL))
-    allocate(dyn%work%hpressure(nl, nNodL), dyn%work%bvfreq(nl, nNodL))
+    allocate(dyn%work%hpressure(nl, nNodL), dyn%work%bvfreq(nl, nNodL), dyn%work%bvfreq_raw(nl, nNodL), dyn%work%shear2(nl, nNodL))
     allocate(dyn%work%pgf_x(nl-1, nElemF), dyn%work%pgf_y(nl-1, nElemF))
     allocate(dyn%work%u_c(nl-1, nElemF), dyn%work%v_c(nl-1, nElemF))
     allocate(dyn%work%uvnode_rhs(2, nl-1, nNodL))
+    allocate(dyn%work%vorticity(nl-1, nNodL))   ! momadv_opt==1 (vector-invariant) scratch
+    dyn%work%vorticity = 0.0_WP
     allocate(dyn%work%Kv(nl, nNodL), dyn%work%Av(nl, nElemF))
     dyn%uv = 0.0_WP; dyn%uv_rhs = 0.0_WP; dyn%uv_rhsAB = 0.0_WP; dyn%uvnode = 0.0_WP
     dyn%eta_n = 0.0_WP; dyn%d_eta = 0.0_WP; dyn%ssh_rhs = 0.0_WP; dyn%ssh_rhs_old = 0.0_WP
     dyn%w = 0.0_WP; dyn%w_e = 0.0_WP; dyn%w_i = 0.0_WP; dyn%cfl_z = 0.0_WP
-    dyn%work%density_m_rho0 = 0.0_WP; dyn%work%hpressure = 0.0_WP; dyn%work%bvfreq = 0.0_WP
+    dyn%work%density_m_rho0 = 0.0_WP; dyn%work%hpressure = 0.0_WP; dyn%work%bvfreq = 0.0_WP; dyn%work%bvfreq_raw = 0.0_WP; dyn%work%shear2 = 0.0_WP
     dyn%work%pgf_x = 0.0_WP; dyn%work%pgf_y = 0.0_WP
     dyn%work%u_c = 0.0_WP; dyn%work%v_c = 0.0_WP; dyn%work%uvnode_rhs = 0.0_WP
     dyn%work%Kv = 0.0_WP; dyn%work%Av = 0.0_WP
     dyn%work%density_ref = density_0
     dyn%AB_order      = 2
-    dyn%momadv_opt    = 2
+    dyn%momadv_opt    = momadv_env
+    if (partit%mype == 0 .and. dyn%momadv_opt == 1) write(*,'(a)') &
+        'fesom_lifecycle_native_mr: momentum advection = VECTOR INVARIANT (momadv_opt=1)'
+    if (partit%mype == 0 .and. rvo_upwind > 0.0_WP) write(*,'(a,f6.3)') &
+        'fesom_lifecycle_native_mr: face-vorticity upwind blend rvo_upwind = ', rvo_upwind
     dyn%opt_visc      = 7
     dyn%visc_gamma0   = 0.003_WP
     dyn%visc_gamma1   = 0.1_WP
     dyn%visc_gamma2   = 0.285_WP
     dyn%visc_gamma0_h = 0.0_WP
     dyn%visc_gamma1_h = 0.0_WP
-    dyn%use_wsplit    = .false.
-    dyn%wsplit_maxcfl = 1.0_WP
+    dyn%use_wsplit    = use_wsplit            ! .false. unless FESOM3_WSPLIT (production precedent)
+    dyn%wsplit_mincfl = wsplit_mincfl_env
+    dyn%wsplit_maxcfl = wsplit_maxcfl_env
+    if (partit%mype == 0 .and. dyn%use_wsplit) write(*,'(a,f8.4,a,f8.4,a)') &
+        'fesom_lifecycle_native_mr: implicit vertical advection split w = w_e + w_i ENABLED ' // &
+        '(use_wsplit; wsplit_mincfl=', dyn%wsplit_mincfl, ', wsplit_maxcfl=', dyn%wsplit_maxcfl, ')'
 
     !===========================================================================
     ! 2-tracer ocean state (data(1)=T, data(2)=S; local sizes) + do_ic3d phc3.0 IC.
@@ -344,7 +430,7 @@ program fesom_lifecycle_native_mr
         allocate(tracers%data(tr_num)%valuesAB(nl-1, nNodL))
         allocate(tracers%data(tr_num)%valuesold(2, nl-1, nNodL))
         tracers%data(tr_num)%AB_order   = 2
-        tracers%data(tr_num)%tra_adv_hor = 'MFCT'
+        tracers%data(tr_num)%tra_adv_hor = 'MUSCL'
         tracers%data(tr_num)%tra_adv_ver = 'QR4C'
         tracers%data(tr_num)%tra_adv_lim = 'FCT'
         tracers%data(tr_num)%tra_adv_ph  = 0.0_WP
@@ -370,6 +456,14 @@ program fesom_lifecycle_native_mr
     ! reduced-M2 module config (= the FESOM2 oracle / CORE2 namelist).
     alpha = 1.0_WP; theta = 1.0_WP
     N2smth_h     = .true.
+    ! &oce_dyn scale_area: the CORE2 namelist.oce value, NOT the o_PARAM default
+    ! 2.0e8. read_param_phys() is never called here, so the default used to stand.
+    ! The ice FCT is its only consumer (diff = ice_diff*sqrt(elem_area/scale_area),
+    ! mod_ice_fct.F90); inert while ice_diff=0, but at ice_diff/=0 the default gives
+    ! sqrt(5.8e9/2e8) = 5.4x the reference ice diffusion -- the cause of the C port's
+    ! systematic bi-hemispheric ice loss and Southern Ocean warming drift over 63-yr
+    ! hindcasts (port2 21da79e).
+    scale_area   = 5.8e9_WP
     mix_scheme_nmb = 2           ! reduced-M2 mixing = PP (KPP is M5c/M5d)
     mix_coeff_PP = 0.01_WP
     A_ver        = 1.0e-4_WP
@@ -563,8 +657,8 @@ program fesom_lifecycle_native_mr
     else
         forc_calendar = 'noleap';    include_fleapyear = .false.
     end if
-    step_per_day    = 48
-    cfg_dt          = dt              ! 86400/48 = 1800 s; clock + forcing_sbc_do read mod_config%dt
+    step_per_day    = spd
+    cfg_dt          = dt              ! 86400/spd (default 48 = 1800 s); clock + forcing_sbc_do read mod_config%dt
     run_length      = 2
     run_length_unit = 'y'
     call get_environment_variable('FESOM3_RUN_LENGTH', env, length=env_len, status=ios)
@@ -923,8 +1017,13 @@ program fesom_lifecycle_native_mr
         end if
         ! perf monitoring: periodic (cumulative) per-component timing report every mon_every steps.
         ! Collective (all ranks call it — placed before the step_diag cycle); 0 => only the final report.
-        if (mon_every > 0 .and. mod(n, mon_every) == 0) &
-            call timer_report(partit%MPI_COMM_FESOM, partit%mype, partit%npes, n, 'monitor')
+        ! NOT a single `.and.`: Fortran does not guarantee short-circuit evaluation, and
+        ! mon_every defaults to 0, so `mod(n, mon_every)` would be an integer divide by zero
+        ! on every step of a default run. Same hazard class as the leap-year forcing bug.
+        if (mon_every > 0) then
+            if (mod(n, mon_every) == 0) &
+                call timer_report(partit%MPI_COMM_FESOM, partit%mype, partit%npes, n, 'monitor')
+        end if
         ! M8c Step 3: GLOBAL per-step diagnostics. ALL ranks compute local extrema and reduce with ONE
         ! MPI_MAX; only rank 0 prints. Stability (max|eta|,max|uv|), cryosphere (max a_ice in [0,1], max
         ! m_ice), and warm/salty drift ceilings (global Tmax, Smax). Diagnostic-only: reads the prognostic
@@ -937,12 +1036,29 @@ program fesom_lifecycle_native_mr
         dstat(4) = maxval(ice%data(2)%values(1:nNodO))            ! m_ice  (effective thickness, >=0)
         dstat(5) = maxval(tracers%data(1)%values(:,1:nNodO))      ! T max  (tropical SST ceiling)
         dstat(6) = maxval(tracers%data(2)%values(:,1:nNodO))      ! S max  (evaporative-basin salinity)
-        call MPI_Allreduce(MPI_IN_PLACE, dstat, 6, MPI_WP, MPI_MAX, partit%MPI_COMM_FESOM, ierr)
+        ! Shared elements (docs/plans/completed/20261012-shared-element-sync.md): the copy spreads
+        ! max|copy - designated owner's copy| of uv (0 with FESOM3_SHARED_SYNC=1; the drift
+        ! without it), uv_rhsAB and sigma (0 by construction, guarded by test_vinv V13 and
+        ! test_ice_dyn_mixed D6), and the divergence-sum ratio |sum ssh_rhs_old| /
+        ! sum|ssh_rhs_old| over owned nodes: a linfs leak shows as a ratio above ~1e-12
+        ! (zstar adds the freshwater term to ssh_rhs_old, so there it is only reported).
+        ! Appended AFTER Smax: tools/run_cutout_short.sh reads fields 5, 7 and 9.
+        dstat(7) = shared_copy_max_elem(dyn%uv, partit)
+        dstat(8) = shared_copy_max_elem(dyn%uv_rhsAB(1,:,:,:), partit)
+        dstat(9) = 0.0_WP
+        if (allocated(ice%work%sigma11)) dstat(9) = max(shared_copy_max_elem(ice%work%sigma11, partit), &
+                                                        shared_copy_max_elem(ice%work%sigma12, partit), &
+                                                        shared_copy_max_elem(ice%work%sigma22, partit))
+        call MPI_Allreduce(MPI_IN_PLACE, dstat, 9, MPI_WP, MPI_MAX, partit%MPI_COMM_FESOM, ierr)
+        dsum = [sum(dyn%ssh_rhs_old(1:nNodO)), sum(abs(dyn%ssh_rhs_old(1:nNodO)))]
+        call MPI_Allreduce(MPI_IN_PLACE, dsum, 2, MPI_WP, MPI_SUM, partit%MPI_COMM_FESOM, ierr)
         if (partit%mype == 0) &
-            write(*,'(a,i0,6(a,es12.4))') 'fesom_lifecycle_native_mr: step ', n, &
+            write(*,'(a,i0,10(a,es12.4))') 'fesom_lifecycle_native_mr: step ', n, &
                 '  max|eta|=', dstat(1), '  max|uv|=', dstat(2), &
                 '  a_ice=', dstat(3), '  m_ice=', dstat(4), &
-                '  Tmax=', dstat(5), '  Smax=', dstat(6)
+                '  Tmax=', dstat(5), '  Smax=', dstat(6), &
+                '  divsum=', abs(dsum(1))/max(dsum(2), tiny(1.0_WP)), &
+                '  dUV=', dstat(7), '  dAB=', dstat(8), '  dsig=', dstat(9)
     end do
     ! Restart Stage 5 (Task 5.3): end-of-run final checkpoint — a safety net for the case the last
     ! in-loop step was NOT cadence-due. restart_due already treats the last step as due, so this is

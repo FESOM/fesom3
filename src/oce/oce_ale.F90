@@ -32,12 +32,14 @@ module oce_ale
     use mod_precision,  only: WP, MP
     use mod_constants,  only: g
     use mod_param_phys, only: alpha, theta, Fer_GM
-    use mod_mesh,       only: t_mesh
+    use mod_mesh,       only: t_mesh, MAX_NV
     use mod_dyn,        only: t_dyn
     use mod_partit,     only: t_partit
     use mod_part_bounds, only: owned_bounds, is_multirank
-    use mod_halo,       only: exchange_nod, exchange_elem, exchange_elem_full
+    use mod_halo,       only: exchange_nod, exchange_elem, exchange_elem_full, exchange_elem_shared
+    use mod_timer,      only: timer_start, timer_stop, TMR_OCE_SHSYNC
     use mod_config,     only: which_ALE          ! M6 ALE: 'linfs'/'zlevel'/'zstar'
+    use oce_wsplit,     only: wsplit_implicit_fraction   ! the C^1 w_e/w_i split function
     implicit none
     private
     public :: update_vel, compute_hbar_ale, update_eta_n, vert_vel_ale
@@ -45,6 +47,10 @@ module oce_ale
     ! at M2.8); update_thickness_ale is the linfs thickness commit (a no-op for which_ale=
     ! 'linfs'). Both join the faithful oce_timestep sequence assembled in mod_step_oce.
     public :: compute_vel_nodes, update_thickness_ale
+    ! The vertical-CFL / w-split pair at the end of vert_vel_ale, exported for
+    ! test/test_wsplit.F90 (parts S and X drive them on prescribed w) and
+    ! test/test_wimpl_tra.F90 (C2-C6 build their split with them).
+    public :: compute_CFLz, compute_Wvel_split
 
 contains
 
@@ -71,19 +77,32 @@ contains
         UVnode => dynamics%uvnode
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
 
+        ! FESOM3 BOTTOM AT VERTICES. An adjacent element that is dry at level nz is NOT
+        ! dropped from the average: its velocity there is genuinely ZERO -- that is what
+        ! "velocities touching topography are zero" means -- so it contributes zero while
+        ! still carrying its FULL area weight. The denominator is therefore the full
+        ! median-dual area area(n) = sum_k nod_in_elem2D_w(k,n)*elem_area (the kite share of
+        ! every adjacent element), not the area of the elements that happen to be wet.
+        ! This is the same statement that makes the scalar column's area depth-independent,
+        ! and it is why area/areasvol are 1-D.
+        !
+        ! Consequence, and it is intended rather than a side effect: a uniform velocity
+        ! field does NOT node-average to the same value at every level -- it decreases where
+        ! the wet fraction does. That is the real damping of the cell-mean velocity by
+        ! topography, not an artefact; UVnode feeds the vertical shear used by PP/KPP/TKE.
         do n = 1, nNodO
             uln = mesh%ulevels_nod2D(n)
             nln = mesh%nlevels_nod2D(n)
+            tvol = real(mesh%area(n), WP)             ! full median-dual area at this vertex
             do nz = uln, nln-1
-                tvol = 0.0_WP; tx = 0.0_WP; ty = 0.0_WP
+                tx = 0.0_WP; ty = 0.0_WP
                 do k = 1, mesh%nod_in_elem2D_num(n)
                     elem = mesh%nod_in_elem2D(k, n)
                     ule  = mesh%ulevels(elem)
                     nle  = mesh%nlevels(elem)
-                    if (nle-1 < nz .or. nz < ule) cycle
-                    tvol = tvol + mesh%elem_area(elem)
-                    tx   = tx   + UV(1,nz,elem)*mesh%elem_area(elem)
-                    ty   = ty   + UV(2,nz,elem)*mesh%elem_area(elem)
+                    if (nle-1 < nz .or. nz < ule) cycle   ! dry: contributes 0, weight kept
+                    tx   = tx   + UV(1,nz,elem)*mesh%elem_area(elem)*mesh%nod_in_elem2D_w(k,n)
+                    ty   = ty   + UV(2,nz,elem)*mesh%elem_area(elem)*mesh%nod_in_elem2D_w(k,n)
                 end do
                 UVnode(1,nz,n) = tx/tvol
                 UVnode(2,nz,n) = ty/tvol
@@ -97,12 +116,12 @@ contains
         ! FESOM2 oce_dyn.F90:88-173. New horizontal velocity after the SSH solve:
         !   u^(n+1) = u* + UV_rhs + [-g*theta*dt*grad(d_eta)]
         ! The SSH-gradient correction is a gradient_sca contraction of -g*theta*dt*d_eta
-        ! over the element's three nodes (same shape as the M2.3 vel_rhs SSH-gradient and
-        ! the M2.2 PGF). UV_rhs here is the post-TDMA value (M2.5; the CG solve does not
-        ! touch it).
+        ! over the element's 4 vertex slots (same shape as the M2.3 vel_rhs SSH-gradient
+        ! and the M2.2 PGF; a triangle's slot 4 has coefficient 0). UV_rhs here is the
+        ! post-TDMA value (M2.5; the CG solve does not touch it).
         ! M2.12c-3: optional partit -> OWNED element loop (FESOM2 :105 do elem=1,
         ! myDim_elem2D), then exchange_elem(UV) (:172). d_eta is read at the owned element's
-        ! 3 nodes (within owned+halo, invariant iii) — valid from the CG's exchange_nod(x).
+        ! vertices (within owned+halo, invariant iii) — valid from the CG's exchange_nod(x).
         ! The UV halo is refreshed owner->halo for the NEXT step (compute_vel_nodes/advection);
         ! the owned UV the post-update kernels read is computed directly here. The rank-3
         ! (2,nl-1,elem) UV exchanges over the eDim com_elem2D (exchange_elem_blk_r) — EXACTLY
@@ -114,9 +133,9 @@ contains
         real(kind=WP), intent(in) :: dt
         type(t_partit), intent(in), optional :: partit
         !______________________________________________________________________
-        integer       :: elem, nz, nzmin, nzmax, elnodes(3)
+        integer       :: elem, nz, nzmin, nzmax, elnodes(MAX_NV)
         integer       :: nNodO, nNodL, nEdgeO, nElemO
-        real(kind=WP) :: eta(3), Fx, Fy
+        real(kind=WP) :: eta(MAX_NV), Fx, Fy
         real(kind=WP), dimension(:,:,:), pointer :: UV, UV_rhs
         real(kind=WP), dimension(:),     pointer :: d_eta
 
@@ -126,10 +145,10 @@ contains
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
 
         do elem = 1, nElemO
-            elnodes = mesh%elem2D_nodes(1:3, elem)        ! triangles (elem2D_nodes is MAX_NV=4) — L15
+            elnodes = mesh%elem2D_nodes(:, elem)
             eta = -g*theta*dt*d_eta(elnodes)
-            Fx  = sum(mesh%gradient_sca(1:3, elem)*eta)
-            Fy  = sum(mesh%gradient_sca(4:6, elem)*eta)
+            Fx  = sum(mesh%gradient_sca(1:4, elem)*eta)
+            Fy  = sum(mesh%gradient_sca(5:8, elem)*eta)
             nzmin = mesh%ulevels(elem)
             nzmax = mesh%nlevels(elem)
             do nz = nzmin, nzmax-1
@@ -137,7 +156,23 @@ contains
                 UV(2,nz,elem) = UV(2,nz,elem) + UV_rhs(2,nz,elem) + Fy
             end do
         end do
-        if (is_multirank(partit)) call exchange_elem(UV, partit)   ! FESOM2 :172 (eDim com_elem2D)
+        if (is_multirank(partit)) then
+            ! One owner per shared element (src/infra/mod_shared_elem.F90): a border element
+            ! is owned by every rank that owns one of its vertices, and each owner has just
+            ! updated its own copy. The copies differ by roundoff (order-dependent sums in the
+            ! viscosity filter), which the rvo_upwind blend can turn into O(1); the ranks
+            ! then compute different fluxes across their common edges and ssh_rhs_old no
+            ! longer sums to zero (linfs mass leak). Every other owner takes the designated
+            ! owner's copy -- what a restart read does -- BEFORE the halo exchange, so the
+            ! eDim halo copies carry the synced value too. FESOM3_SHARED_SYNC=0 skips it.
+            ! (Nested ifs: partit is optional and Fortran does not short-circuit.)
+            if (partit%sync_shared_elem) then
+                call timer_start(TMR_OCE_SHSYNC)
+                call exchange_elem_shared(UV, partit)
+                call timer_stop(TMR_OCE_SHSYNC)
+            end if
+            call exchange_elem(UV, partit)                         ! FESOM2 :172 (eDim com_elem2D)
+        end if
     end subroutine update_vel
 
     !===========================================================================
@@ -147,7 +182,7 @@ contains
         !   ssh_rhs_old = div_h( int(UV) dz )        (edge-scatter, NO alpha here)
         !   hbar_old    = hbar
         !   hbar        = hbar_old + ssh_rhs_old * dt / areasvol
-        !   dhe         = sum(hbar - hbar_old)/3     (per element; feeds update_stiff,
+        !   dhe         = sum(elem_w*(hbar - hbar_old)) (per element; feeds update_stiff,
         !                 which linfs never calls — gated anyway)
         ! Same edge-divergence structure as M2.6 compute_ssh_rhs_ale (same edge order,
         ! gated). linfs skips the water_flux term + its exchange_nod. Writes mesh%hbar/
@@ -156,7 +191,7 @@ contains
         ! the edge-divergence over OWNED edges (owned-node ssh_rhs_old complete, invariant i),
         ! hbar_old=hbar owned+halo, the hbar update OWNED, then exchange_nod(hbar) (:2293,
         ! ALWAYS — outside the linfs water_flux guard) so the dhe loop over OWNED elements can
-        ! read hbar at the element's 3 nodes (within owned+halo). The linfs water_flux term +
+        ! read hbar at the element's vertices (within owned+halo). The linfs water_flux term +
         ! its exchange_nod(ssh_rhs_old) stay skipped.
         type(t_dyn),  intent(inout), target :: dynamics
         type(t_mesh), intent(inout), target :: mesh
@@ -164,7 +199,7 @@ contains
         type(t_partit), intent(in), optional :: partit
         real(kind=WP),  intent(in), optional :: water_flux(:)   ! M6a-3: non-linfs freshwater (zstar)
         !______________________________________________________________________
-        integer       :: ed, el(2), enodes(2), elem, elnodes(3), n, nz, nzmin, nzmax
+        integer       :: ed, el(2), enodes(2), elem, elnodes(MAX_NV), n, nz, nzmin, nzmax
         integer       :: nNodO, nNodL, nEdgeO, nElemO
         real(kind=WP) :: c1, c2, deltaX1, deltaX2, deltaY1, deltaY2
         real(kind=WP), dimension(:,:,:), pointer :: UV
@@ -196,7 +231,7 @@ contains
             !__________________________________________________________________
             ! ... and for el(2), unless ed is a boundary edge
             c2 = 0.0_WP
-            if (el(2) > 0) then
+            if (el(2) /= el(1)) then
                 deltaX2 = mesh%edge_cross_dxdy(3, ed)
                 deltaY2 = mesh%edge_cross_dxdy(4, ed)
                 nzmin   = mesh%ulevels(el(2))
@@ -218,7 +253,7 @@ contains
         if (trim(which_ALE)/='linfs' .and. present(water_flux)) then
             do n = 1, nNodO
                 if (mesh%ulevels_nod2D(n) > 1) cycle
-                ssh_rhs_old(n) = ssh_rhs_old(n) - water_flux(n)*mesh%areasvol(mesh%ulevels_nod2D(n), n)
+                ssh_rhs_old(n) = ssh_rhs_old(n) - water_flux(n)*mesh%areasvol(n)
             end do
             if (is_multirank(partit)) call exchange_nod(ssh_rhs_old, partit)   ! FESOM2 :2270
         end if
@@ -229,16 +264,16 @@ contains
 
         do n = 1, nNodO
             if (mesh%ulevels_nod2D(n) > 1) cycle          ! cavity node: hbar == hbar_old
-            mesh%hbar(n) = mesh%hbar_old(n) + ssh_rhs_old(n)*dt/mesh%areasvol(mesh%ulevels_nod2D(n), n)
+            mesh%hbar(n) = mesh%hbar_old(n) + ssh_rhs_old(n)*dt/mesh%areasvol(n)
         end do
         if (is_multirank(partit)) call exchange_nod(mesh%hbar, partit)   ! FESOM2 :2293
 
         do elem = 1, nElemO
-            elnodes = mesh%elem2D_nodes(1:3, elem)         ! L15
+            elnodes = mesh%elem2D_nodes(:, elem)
             if (mesh%ulevels(elem) > 1) then
                 mesh%dhe(elem) = 0.0_WP
             else
-                mesh%dhe(elem) = sum(mesh%hbar(elnodes) - mesh%hbar_old(elnodes))/3.0_WP
+                mesh%dhe(elem) = sum(mesh%elem_w(:, elem)*(mesh%hbar(elnodes) - mesh%hbar_old(elnodes)))
             end if
         end do
     end subroutine compute_hbar_ale
@@ -339,7 +374,7 @@ contains
 
             c1 = 0.0_WP
             if (Fer_GM) c2 = 0.0_WP
-            if (el(2) > 0) then
+            if (el(2) /= el(1)) then
                 deltaX2 = mesh%edge_cross_dxdy(3, ed)
                 deltaY2 = mesh%edge_cross_dxdy(4, ed)
                 nzmin   = mesh%ulevels(el(2))
@@ -374,8 +409,8 @@ contains
             nzmin = mesh%ulevels_nod2D(n)
             nzmax = mesh%nlevels_nod2D(n) - 1
             do nz = nzmin, nzmax
-                Wvel(nz, n) = Wvel(nz, n)/mesh%area(nz, n)
-                if (Fer_GM) fer_Wvel(nz, n) = fer_Wvel(nz, n)/mesh%area(nz, n)
+                Wvel(nz, n) = Wvel(nz, n)/mesh%area(n)
+                if (Fer_GM) fer_Wvel(nz, n) = fer_Wvel(nz, n)/mesh%area(n)
             end do
         end do
 
@@ -386,14 +421,19 @@ contains
         !   Wvel(nz)      -= (zbar_3d_n(nz)-zbar_3d_n(nzmax)) * dd/dt   (W from the bottom-up
         !                                                                integration of the stretch)
         !   hnode_new(nz)  = hnode(nz) + (zbar_3d_n(nz)-zbar_3d_n(nz+1)) * dd
-        ! All divides scalar (no L29 trap). nzmax uses nlevels_nod2D_MIN (stretch only over
-        ! the part of the column where area(nz)=area(1), i.e. full prisms not cut by the
-        ! bottom). linfs leaves hnode_new=hnode. (Cavity nzmin>1 DEAD; water_flux term is
-        ! M6a-3 forced — omitted here since unforced water_flux=0.)
+        ! All divides scalar (no L29 trap). linfs leaves hnode_new=hnode. (Cavity nzmin>1
+        ! DEAD; water_flux term is M6a-3 forced — omitted here since unforced water_flux=0.)
+        !
+        ! FESOM3 bottom at vertices: nzmax is the vertex's OWN column bottom, not
+        ! nlevels_nod2D_min. The stretch is meant to span the part of the column where
+        ! area(nz)=area(1) -- with the scalar cell now a straight prism that is the WHOLE
+        ! column, so more of it is stretched than under FESOM2. (A real physics change,
+        ! not a rename: nlevels_nod2D_min is several levels shallower than nlevels_nod2D
+        ! over most of a real mesh.)
         if (trim(which_ALE)=='zstar') then
             do n = 1, nNodO
                 nzmin = mesh%ulevels_nod2D(n)
-                nzmax = mesh%nlevels_nod2D_min(n) - 1
+                nzmax = mesh%nlevels_nod2D(n) - 1
                 if (nzmin == 1) then
                     dd1  = mesh%zbar_3d_n(nzmax, n)
                     dd   = mesh%zbar_3d_n(nzmin, n) - dd1
@@ -434,7 +474,8 @@ contains
         ! M2.12c-3: optional partit -> the FESOM2 owned+HALO node loops (:3154/:3161 do node=
         ! 1, myDim_nod2D+eDim_nod2D); Wvel/hnode_new are halo-valid from vert_vel_ale's two
         ! exchange_nod's, so CFL_z is built over owned+halo (feeds compute_Wvel_split's
-        ! owned+halo Wvel_e/Wvel_i, which the NEXT step's momentum advection reads at halo).
+        ! owned+halo Wvel_e/Wvel_i, which the NEXT step's momentum TDMA and vector-invariant
+        ! advection read at the halo vertices of owned elements; test_wsplit S5).
         type(t_dyn),  intent(inout), target :: dynamics
         type(t_mesh), intent(in),    target :: mesh
         real(kind=WP), intent(in) :: dt
@@ -467,21 +508,45 @@ contains
 
     !===========================================================================
     subroutine compute_Wvel_split(dynamics, mesh, partit)
-        ! FESOM2 oce_ale.F90:3217-3265. Split Wvel into explicit (Wvel_e) and implicit
-        ! (Wvel_i) parts according to the vertical CFL, so the explicit part is capped at
-        ! wsplit_maxcfl. use_wsplit=.true. + wsplit_maxcfl=1.0 on pi. OVERWRITES dynamics%
-        ! w_e/w_i (the same arrays prescribed as M2.4/M2.5 inputs — fully consumed before
-        ! this runs; in the real timestep they feed the NEXT step's momadv/ivertvisc).
-        ! M2.12c-3: optional partit -> the FESOM2 owned+HALO node loop (:3251 do node=1,
-        ! myDim_nod2D+eDim_nod2D); Wvel/CFL_z are halo-valid so Wvel_e/Wvel_i are produced
-        ! at owned+halo with no trailing exchange (matches FESOM2).
+        ! Split Wvel into the explicitly (Wvel_e) and implicitly (Wvel_i) advected parts,
+        ! w = w_e + w_i, face by face: w_i = f*w with the implicit share f from
+        ! oce_wsplit::wsplit_implicit_fraction(CFL_z, wsplit_mincfl, wsplit_maxcfl), the C^1
+        ! Shchepetkin function that replaces FESOM2's hard switch (oce_ale.F90:3217-3265;
+        ! WHY, the three branches and the no-hard-switch-mode decision are documented ONCE,
+        ! in oce_wsplit). CFL_z is compute_CFLz's (the face flux counted against BOTH
+        ! adjacent cells, FESOM2's definition, unchanged), so wsplit_maxcfl keeps its FESOM2
+        ! meaning: the explicit CFL_z never exceeds it.
+        !
+        ! Consumers. Same step, OWNED columns: the FCT adv_tra_vert_impl and the non-FCT
+        ! do_wimpl TDMA (both run in the tracer step after vert_vel_ale). NEXT step, at the
+        ! halo vertices of owned elements: the momentum TDMA impl_vert_visc_ale (w_i) and
+        ! the vector-invariant advection momentum_adv_vinv (w_e); momentum_adv_scalar reads
+        ! w_e at owned nodes only. M2.12c-3: optional partit -> the FESOM2 owned+HALO node
+        ! loop (:3251 do node=1, myDim_nod2D+eDim_nod2D); Wvel/CFL_z are halo-valid so
+        ! Wvel_e/Wvel_i are produced at owned+halo with no trailing exchange (matches
+        ! FESOM2; halo == owner bitwise, test_wsplit S5).
+        !
+        ! w_e = w - w_i (not a second product) makes w_e + w_i == w to 1 ulp, bitwise when
+        ! |w_i| >= |w|/2 (Sterbenz); no consumer needs more. use_wsplit=.false. is literally
+        ! the previous off path: w_e = w, w_i = +0 over the same face range, validated
+        ! nothing. OVERWRITES dynamics%w_e/w_i (the same arrays prescribed as M2.4/M2.5
+        ! inputs — fully consumed before this runs). Pinned by test/test_wsplit.F90 part S
+        ! (the identities above on every owned+halo face) and part X (transition
+        ! smoothness on the tracer path).
+        !
+        ! PRECONDITIONS, validated at SETUP and assumed here (stateless kernel, like the
+        ! rest of src/oce): (wsplit_mincfl, wsplit_maxcfl) admissible -- the driver that
+        ! enables use_wsplit called wsplit_assert_params once (the t_dyn default mincfl =
+        ! 0.5 is an ABSOLUTE number, so a driver that lowers maxcfl must set mincfl too);
+        ! every owned column has >= 2 layers, the row layout of the implicit consumers
+        ! adv_tra_vert_impl / do_wimpl (read_mesh's assert_min_layers).
         type(t_dyn),  intent(inout), target :: dynamics
         type(t_mesh), intent(in),    target :: mesh
         type(t_partit), intent(in), optional :: partit
         !______________________________________________________________________
         integer       :: node, nz, nzmin, nzmax
         integer       :: nNodO, nNodL, nEdgeO, nElemO
-        real(kind=WP) :: dd
+        real(kind=WP) :: f
         real(kind=WP), dimension(:,:), pointer :: Wvel, Wvel_e, Wvel_i, CFL_z
 
         Wvel   => dynamics%w
@@ -490,17 +555,25 @@ contains
         CFL_z  => dynamics%cfl_z
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
 
+        if (.not. dynamics%use_wsplit) then
+            do node = 1, nNodL
+                nzmin = mesh%ulevels_nod2D(node)
+                nzmax = mesh%nlevels_nod2D(node)
+                do nz = nzmin, nzmax
+                    Wvel_e(nz, node) = Wvel(nz, node)
+                    Wvel_i(nz, node) = 0.0_WP
+                end do
+            end do
+            return
+        end if
+
         do node = 1, nNodL
             nzmin = mesh%ulevels_nod2D(node)
             nzmax = mesh%nlevels_nod2D(node)
             do nz = nzmin, nzmax
-                Wvel_e(nz, node) = Wvel(nz, node)
-                Wvel_i(nz, node) = 0.0_WP
-                if (dynamics%use_wsplit .and. (CFL_z(nz, node) > dynamics%wsplit_maxcfl)) then
-                    dd = max((CFL_z(nz, node)-dynamics%wsplit_maxcfl), 0.0_WP)/max(dynamics%wsplit_maxcfl, 1.e-12_WP)
-                    Wvel_e(nz, node) = (1.0_WP/(1.0_WP+dd))*Wvel(nz, node)   ! explicit (=1 if dd=0)
-                    Wvel_i(nz, node) = (dd    /(1.0_WP+dd))*Wvel(nz, node)   ! implicit (=1 if dd=inf)
-                end if
+                f = wsplit_implicit_fraction(CFL_z(nz, node), dynamics%wsplit_mincfl, dynamics%wsplit_maxcfl)
+                Wvel_i(nz, node) = f*Wvel(nz, node)
+                Wvel_e(nz, node) = Wvel(nz, node) - Wvel_i(nz, node)
             end do
         end do
     end subroutine compute_Wvel_split
@@ -514,13 +587,13 @@ contains
         !  - M6a-2 zstar (FESOM2 :1378-1436): the stretch from vert_vel_ale is committed.
         !    Node loop (owned+halo: hnode_new was exchange_nod'd in vert_vel_ale) rebuilds
         !    hnode + the depth levels BOTTOM-UP from the fixed anchor zbar_3d_n(nzmax+1)
-        !    (nzmax=nlevels_nod2D_min-2; bottom region not stretched). Element loop (owned)
+        !    (nzmax=nlevels_nod2D-2; deepest layer not stretched). Element loop (owned)
         !    averages hnode -> helem, then exchange_elem(helem). ldiag_DVD off (no
         !    rescue_hnode_old bookkeeping); cavity off (nzmin>1 dead). zlevel not ported
         !    (not a target — see docs/plans/2026-06-24-m6-zstar.md).
         type(t_mesh),   intent(inout), target :: mesh
         type(t_partit), intent(in), optional  :: partit
-        integer :: n, nz, elem, elnodes(3), nzmin, nzmax
+        integer :: n, nz, elem, elnodes(MAX_NV), nzmin, nzmax
         integer :: nNodO, nNodL, nEdgeO, nElemO
 
         if (trim(which_ALE)=='linfs') return   ! no-op (helem unchanged + full-halo-valid)
@@ -531,7 +604,7 @@ contains
             ! commit layer thickness + depth levels at node (owned+halo)
             do n = 1, nNodL
                 nzmin = mesh%ulevels_nod2D(n)
-                nzmax = mesh%nlevels_nod2D_min(n) - 2
+                nzmax = mesh%nlevels_nod2D(n) - 2      ! vertex's own column (see vert_vel_ale)
                 if (nzmin > 1) cycle                       ! cavity (dead)
                 do nz = nzmax, nzmin, -1                   ! bottom-up: zbar_3d_n(nz+1) already updated
                     mesh%hnode(nz,n)     = mesh%hnode_new(nz,n)
@@ -540,14 +613,22 @@ contains
                 end do
             end do
             !__________________________________________________________________
-            ! mean layer thickness at element (owned)
+            ! mean layer thickness at element (owned): kite-weighted mean of hnode
             do elem = 1, nElemO
                 nzmin = mesh%ulevels(elem)
                 nzmax = mesh%nlevels(elem) - 1
                 if (nzmin > 1) cycle                       ! cavity (dead)
-                elnodes = mesh%elem2D_nodes(1:3, elem)
-                do nz = nzmin, nzmax-1
-                    mesh%helem(nz,elem) = sum(mesh%hnode(nz,elnodes))/3.0_WP
+                elnodes = mesh%elem2D_nodes(:, elem)
+                ! FULL element range. FESOM2 stopped one layer short (nzmax-1) and was
+                ! safe: nlevels_nod2D_min(n) <= nlevels(e) for every e adjacent to n, so
+                ! no node ever stretched layer nlevels(e)-1 and the frozen helem there
+                ! still matched. Under the vertex bottom that flips to nlevels(e) <=
+                ! nlevels_nod2D(n) -- the element's deepest layer IS stretched at its
+                ! deeper nodes, so a frozen helem would break helem == sum(elem_w*hnode), and
+                ! helem is the thickness compute_hbar_ale, vert_vel_ale and adv_tra_hor
+                ! all use: the SSH/continuity budget and the tracer volume would disagree.
+                do nz = nzmin, nzmax
+                    mesh%helem(nz,elem) = sum(mesh%elem_w(:,elem)*mesh%hnode(nz,elnodes))
                 end do
             end do
         end if
