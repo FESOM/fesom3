@@ -5,6 +5,10 @@ Full pre-M2.12 milestone detail + the per-gate recipes live in [`HANDOFF-archive
 
 ## Where we are
 
+- **Split-explicit barotropic solver — STARTING (2026-10-17, branch `split-explicit`, worktree
+  `/work/ab0995/a270088/fesom3_se`):** SE subcycling after Sergey's notes, linfs first with zstar designed in, for
+  the bottom at vertices; FESOM_F first, the JAX port follows. Nothing implemented; brainstorm → plan → implement.
+  Start from `plans/2026-10-17-split-explicit-handoff.md`.
 - **Shared-element velocity sync ✅ DONE (2026-10-12, plan `plans/completed/20261012-shared-element-sync.md`,
   on `bottom-at-vertices`):** a border element is owned by every rank that owns one of its vertices;
   `update_vel` now gives every such element one owner for `uv` (the highest vertex-owner rank, whose copy
