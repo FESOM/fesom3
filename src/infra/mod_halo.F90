@@ -77,7 +77,8 @@ module mod_halo
     ! overwrite their own copy (local numbers 1..myDim_elem2D). Same broadcast-only cores;
     ! a no-op on an empty list, and so at 1 rank.
     interface exchange_elem_shared
-        module procedure exchange_elem_shared_2D_i, exchange_elem_shared_blk_r
+        module procedure exchange_elem_shared_2D_i, exchange_elem_shared_3D_r, &
+                         exchange_elem_shared_blk_r
     end interface
 
     ! Copy spread of the shared elements: this rank's max|arr - the designated owner's copy|
@@ -85,7 +86,8 @@ module mod_halo
     ! probe). The value is LOCAL (0 on a rank without receive slots); reduce it with
     ! allreduce_max. 0 <=> every copy equals the designated one.
     interface shared_copy_max_elem
-        module procedure shared_copy_max_elem_2D_r, shared_copy_max_elem_blk_r
+        module procedure shared_copy_max_elem_2D_r, shared_copy_max_elem_3D_r, &
+                         shared_copy_max_elem_blk_r
     end interface
 
     integer, parameter :: HALO_TAG = 1
@@ -179,6 +181,12 @@ contains
         integer,        intent(inout) :: arr(:)       ! (elem), e.g. the builder's self-check
         type(t_partit), intent(in)    :: partit
         call core_2D_i(arr, partit%com_elem2D_shared, partit%MPI_COMM_FESOM)
+    end subroutine
+
+    subroutine exchange_elem_shared_3D_r(arr, partit)
+        real(kind=WP),  intent(inout) :: arr(:,:)     ! (d, elem), e.g. the split-explicit
+        type(t_partit), intent(in)    :: partit       ! barotropic transport (2, elem)
+        call core_3D_r(arr, partit%com_elem2D_shared, partit%MPI_COMM_FESOM)
     end subroutine
 
     subroutine exchange_elem_shared_blk_r(arr, partit)
@@ -439,6 +447,12 @@ contains
         maxdiff = probe(arr, partit%com_elem2D_shared, partit%MPI_COMM_FESOM)
     end function
 
+    real(kind=WP) function shared_copy_max_elem_3D_r(arr, partit) result(maxdiff)
+        real(kind=WP),  intent(in) :: arr(:,:)
+        type(t_partit), intent(in) :: partit
+        maxdiff = probe_3D(arr, partit%com_elem2D_shared, partit%MPI_COMM_FESOM)
+    end function
+
     real(kind=WP) function shared_copy_max_elem_blk_r(arr, partit) result(maxdiff)
         real(kind=WP),  intent(in) :: arr(:,:,:)
         type(t_partit), intent(in) :: partit
@@ -463,6 +477,25 @@ contains
             end do
         end do
     end function probe_blk
+
+    real(kind=WP) function probe_3D(arr, com, comm) result(maxdiff)
+        ! probe on a (d, entity) array through core_3D_r
+        real(kind=WP),    intent(in) :: arr(:,:)
+        type(com_struct), intent(in) :: com
+        integer,          intent(in) :: comm
+        real(kind=WP), allocatable :: cpy(:,:)
+        integer :: i, k, e
+        maxdiff = 0.0_WP
+        if (com%rPEnum == 0 .and. com%sPEnum == 0) return
+        cpy = arr
+        call core_3D_r(cpy, com, comm)
+        do i = 1, com%rPEnum
+            do k = com%rptr(i), com%rptr(i+1) - 1
+                e = com%rlist(k)
+                maxdiff = max(maxdiff, maxval(abs(arr(:,e) - cpy(:,e))))
+            end do
+        end do
+    end function probe_3D
 
     real(kind=WP) function probe(arr, com, comm) result(maxdiff)
         ! Exchange a copy and report max|arr(halo) - exchanged(halo)|. >0 => stale halo.
