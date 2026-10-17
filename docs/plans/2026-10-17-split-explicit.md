@@ -247,18 +247,26 @@ scripts and logs in its `jobs/`)
   (checkpoint and live dump, mid-run and month-boundary splits): **np 1 306 s** (job 28214521), **np 2 144 s**
   (job 28214522). Run dirs: `/scratch/a/a270088/fesom3_se_rgate/np{1,2}_<jobid>`.
 
-#### Task 0.2: Shared-element exchange for real (2, elem) arrays
+#### Task 0.2: Shared-element exchange for real (2, elem) arrays ✅
 
 **Files:**
 - Modify: `src/infra/mod_halo.F90`
 - Modify: `test/test_shared_elem.F90`
 
-- [ ] add `exchange_elem_shared_3D_r` (real (:, elem); the `*_3D_r` naming of `exchange_elem_3D_r`) and a rank-2
-  `shared_copy_max_elem` variant with its own probe, in the generic interfaces (:79-89)
-- [ ] test: on pi np 2/8, fill a (2, elem) array with rank-dependent values on shared elements. After the sync the
+- [x] add `exchange_elem_shared_3D_r` (real (:, elem); the `*_3D_r` naming of `exchange_elem_3D_r`) and a rank-2
+  `shared_copy_max_elem` variant with its own probe, in the generic interfaces (:79-89). Done:
+  `exchange_elem_shared_3D_r` (wrapper over `core_3D_r` on `com_elem2D_shared`), `shared_copy_max_elem_3D_r` and
+  `probe_3D` (additions only)
+- [x] test: on pi np 2/8, fill a (2, elem) array with rank-dependent values on shared elements. After the sync the
   copy spread is exactly 0, and the designated owner's values are kept. Before the sync the probe reports a non-zero
-  spread
-- [ ] ctest green (Intel + GNU)
+  spread. Added to S2 of `test_shared_elem.F90`; the pre-sync probe must equal the spread computed from the designated
+  owners; after the sync every receive slot equals the owner's value, all other slots are bitwise unchanged, probe = 0.
+  Global pre-sync spread printed: 1.00E+07 (pi np 2), 5.00E+07 (pi np 8), 0 (np 1). Existing registrations cover it
+- [x] ctest green (Intel + GNU). **Intel 167/167.** GNU needed the allocate fix of `test_coupling_mixed.F90:193`
+  (the same hunk as jax-oracle 7e6ceac, its own commit); with it **GNU 161/167**, and the base 6cd6449 plus only that
+  fix fails the same 6 (`test_wimpl_tra_np1/np2`, `meshdiag_mixed/quad/pi_w`, `test_shared_elem_np1`: SIGSEGV in S3
+  after S2, GNU np 1 only). GNU pi np 2/8 of `test_shared_elem` pass incl. the new checks. Jobs 28214499, 28215492,
+  28216020 (~0.05 node-h). From here on the GNU baseline is **these 6 failures, no new one**
 
 #### Task 0.3: SE state in t_dyn, env knobs, `se_init`, CFL guard, driver guard, timer ✅
 
