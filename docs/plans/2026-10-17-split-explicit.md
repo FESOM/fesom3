@@ -366,38 +366,71 @@ scripts and logs in its `jobs/`)
   (`test_wimpl_tra_np1/np2`, `meshdiag_mixed/quad/pi_w`, `test_shared_elem_np1`), no new one; `test_ssh_se_np1/np2`
   pass on both. Script `/work/ab0995/a270088/fesom3_se_ref/jobs/t11_build_ctest.sbatch`
 
-#### Task 1.2: Substep loop (`se_subcycle`), inflow scatter, viscosity
+#### Task 1.2: Substep loop (`se_subcycle`), inflow scatter, viscosity ✅
 
 **Files:**
 - Modify: `src/oce/oce_ssh_se.F90`
 - Modify: `test/test_ssh_se.F90`
 
-- [ ] `se_inflow(U, out)`: the inflow edge-scatter of `compute_hbar_ale` (:216-246) over owned edges, with the 2-D Ū
-  in place of Σhelem·uv (same edge order; positive = convergence, the `ssh_rhs_old` sign)
-- [ ] `se_kappa` (built in `se_init` for SE runs, moved here next to its only consumer):
+- [x] `se_inflow(U, out)`: the inflow edge-scatter of `compute_hbar_ale` (:216-246) over owned edges, with the 2-D Ū
+  in place of Σhelem·uv (same edge order; positive = convergence, the `ssh_rhs_old` sign). Signature
+  `se_inflow(mesh, partit, U, out)`; `out` is zeroed on nNodL and complete on owned nodes (halo entries partial,
+  as `ssh_rhs_old` in `compute_hbar_ale`)
+- [x] `se_kappa` (built in `se_init` for SE runs, moved here next to its only consumer):
   - owned centroids via `elem_center`, then `exchange_elem` for the halo neighbours (as `compute_geometry`
     :80-89; `elem2D_nodes` is owned-only);
   - edge length l from the element's own vertices; centroid distance d; κ_{e,k} = A_h·l/(d·A_e);
   - κ = 0 on boundary slots and on a triangle's slot 4
-- [ ] `se_visc(dU, out)`: a gather over `k = 1..elem2D_nnodes(e)` of `elem_neighbors`, H_edge = ½(Hⁿ_e + Hⁿ_nb),
+
+  Routine `se_kappa_build`, called by `se_init` after the cold start. The longitude metric of l and d is the mean
+  elem_cos of the two elements (edge_len's, `compute_edge_geometry`), so l = edge_len on owned edges and l, d,
+  H_edge are bitwise symmetric between the two elements of an edge. pi (A_h = 0.01·l): max κ = 2.1e-6 s⁻¹
+- [x] `se_visc(dU, out)`: a gather over `k = 1..elem2D_nnodes(e)` of `elem_neighbors`, H_edge = ½(Hⁿ_e + Hⁿ_nb),
   V_e = Σ_k κ_{e,k}·H_edge·(dU_nb/Hⁿ_nb − dU_e/Hⁿ_e)
-- [ ] `se_subcycle` for m = 0..M−1, following Technical Details §2 with the halo extents of §1:
+- [x] `se_subcycle` for m = 0..M−1, following Technical Details §2 with the halo extents of §1:
   - the tendency is a separate routine `se_tendency(Ustar, etaA, HA, …)` so that it can be tested;
   - η levels are kept on nNodL;
   - rings are shifted **by copying**, never by index rotation (the ring offset must not become restart state);
   - `exchange_elem(Ū)` is skipped when `se_visc_ah = 0`;
   - TMR_OCE_SE_BT
-- [ ] tests:
+
+  ➕ H^A comes from `se_depth_at(eta, HA)` = Hⁿ + Σ_v elem_w·c·(η − ηⁿ) on owned elements, the one depth function
+  of D3 (exactly Hⁿ under linfs, c ≡ 0). η⁰ = eta_n is copied into `se_etam` at entry, ⟨⟨Ū⟩⟩ is zeroed there; U*,
+  U^{m+1}, the tendency, dU, η^A, I(U*) and H^A are local allocatables of `se_subcycle` (not state, so not in §1).
+  On exit η^M is in `se_etam` (η^{M−1}, η^{M−2} in `se_eta(:,1:2)`, all nNodL and halo-valid), Ū^M in ring level 0,
+  ⟨⟨Ū⟩⟩ in `se_umean` (owned); eta_n/hbar untouched (Task 1.3). ⚠️ With `se_visc_ah = 0` the eDim entries of the
+  Ū ring are never refreshed after the cold start; nothing reads them then, but Task 4.2/4.3 must not expect
+  halo-valid Ū levels in that mode (the partition-independent checkpoint stores owned values)
+- [x] tests (`test_ssh_se` C7-C9, np 1 and np 2, Intel and GNU; the existing registrations cover them):
   - **operator/r-term consistency:** with U* = šⁿ = š_old, η^A = ηⁿ, H^A = Hⁿ and dU = 0, `se_tendency` = G/τ to
-    rounding. This catches a sign or factor mismatch between F and the operator, e.g. in Coriolis;
+    rounding. This catches a sign or factor mismatch between F and the operator, e.g. in Coriolis. C7 (two real
+    `compute_vel_rhs` calls on the same uv, non-trivial eta_n and pgf): **max|tend − G/τ| = 2.8e-17 m²/s² of the
+    largest term 0.39 (7.1e-17; GNU 1.4e-16)**, tolerance 1e-12;
   - **dtbt convergence:** a linear gravity wave on rotated pi, one baroclinic step with M, 2M and 4M against an 8M
-    reference at χ = 0; observed order ≥ 2. This catches swapped ring levels or misplaced coefficients;
-  - rest stays at rest bitwise;
-  - Σ_v areasvol·(η^M − η⁰) = 0 to rounding (closed basin, W = 0);
-  - η-compatibility η^M − η⁰ = τ·I(⟨⟨Ū⟩⟩)/areasvol to rounding;
+    reference at χ = 0; observed order ≥ 2. This catches swapped ring levels or misplaced coefficients. C9d: a 1 m
+    Gaussian bump (e-folding 1500 km) at rest, F = 0, viscosity on, max|η^M − η⁰| = 0.128 m; M = 16/32/64 vs 128:
+    **η errors 1.32e-4 / 3.23e-5 / 6.54e-6 m, observed orders 2.04 and 2.30; Ū orders 2.13 and 2.23** (identical
+    at np 1/2 and Intel/GNU). Second order is what a cold start gives: with flat rings the first two substeps
+    extrapolate U* and η^A to first order only (a pure second-order error reads 2.07/2.32 against an 8M
+    reference). In production only the first step starts cold;
+  - rest stays at rest bitwise (C9b, M = 40: every ring level, η^M and ⟨⟨Ū⟩⟩ exactly 0);
+  - Σ_v areasvol·(η^M − η⁰) = 0 to rounding (closed basin, W = 0). C9c (hashed η, three Ū levels and F, M = 40,
+    viscosity on): **6.6e-5 m³ of Σ areasvol·|Δη| = 2.9e13 m³ (2.3e-18)**, np 2 1.5e-5, GNU ≤ 2.7e-4 m³;
+  - η-compatibility η^M − η⁰ = τ·I(⟨⟨Ū⟩⟩)/areasvol to rounding. C9c: **max residual 3.4e-16 m** of
+    max(|η⁰|, |Δη|) = 0.41 m (GNU 3.1e-16); tolerance 1e-12;
   - Σ_e A_e·V_e = 0 to rounding (this also catches a double-counted triangle slot); V of a uniform velocity over a
-    flat bottom is 0
-- [ ] ctest green
+    flat bottom is 0. C8: **Σ A_e·V_e = (6.1e-7, 3.5e-8) of Σ A_e·|V_e| = 1.2e11 (5e-18)**, each element counted
+    once (on its first vertex's owner) at np 2; V(uniform, flat bottom) == 0 exactly, and also 0 over the real
+    bottom; κ = 0 on boundary slots and triangle slot 4, > 0 elsewhere, and equal to an independent recomputation
+    from edge_len and the centroid distance to 4.3e-16
+  - ➕ C9a, M = 1: the rings shift by copying (bitwise), ⟨⟨Ū⟩⟩ = U*, η¹ and Ū¹ equal the operators called directly
+    (to 1e-13: GNU's `-march=znver3` contracts `a + b*c` into FMAs differently in test and module); C9c at np 2:
+    η levels and Ū^M halo-valid after the substeps (stale-halo probes 0)
+- [x] ctest green. Job 28216792 (shared, 2 min): **Intel 172/172; GNU 166/172, the 6 known failures**, no new one.
+  GATE G0 (SE off): job 28216833 (5.2 min), **G0 GREEN**: linfs and zstar CORE2 (99 checkpoint variables,
+  1 649 154 dump records max|Δ| = 0, 20 step lines equal) and conserve (249 log lines, 26 configs) byte-identical
+  to the frozen main references; new `fesom_lifecycle_native_mr` sha256 `5ccb664fe4ed9d37…`. Scripts
+  `/work/ab0995/a270088/fesom3_se_ref/jobs/t11_build_ctest.sbatch` (TAG=t12), `t12_g0.sbatch`
 
 #### Task 1.3: Trim, finish and the `step_oce` branch
 

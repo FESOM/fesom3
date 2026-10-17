@@ -35,6 +35,35 @@ program test_ssh_se
     !       rounding again. se_ubtn == ring level 0 (bitwise, owned + eDim).
     !       Tolerances are relative to the largest Coriolis term max|f s|; the measured residuals
     !       are printed.
+    !   C7  operator / r-term consistency (Task 1.2): the real compute_vel_rhs twice on the SAME uv
+    !       (so s^n = s^{n-1}) with a non-trivial eta_n and pgf, se_bt_forcing after each; then
+    !       se_tendency with U* = s^n, eta^A = eta^n, H^A = H^n, dU = 0 equals G/tau = sum_k
+    !       helem*UV_rhs/tau to 1e-12 of the largest term. A sign or factor mismatch between F
+    !       and the operator (Coriolis, pressure) fails this.
+    !   C8  the viscosity (Task 1.2): kappa >= 0, kappa = 0 exactly on boundary slots and on a
+    !       triangle's slot 4, > 0 on every interior slot; kappa = A_h*l/(d*A_e) against an
+    !       independent recomputation from edge_len (owned edges) and the elem_center distance;
+    !       sum_e A_e*V_e = 0 to 1e-12 of sum_e A_e*|V_e| for a hashed halo-valid dU (each
+    !       element counted once: on the rank owning its first vertex); V of a uniform velocity is
+    !       exactly 0 over a flat bottom and 0 to rounding over the real one.
+    !   C9  se_subcycle (Task 1.2):
+    !       a) M = 1 on a hashed state: the rings shift by copying (eta^{-2/M} <- eta^{-1/M} <-
+    !          eta_n, U levels 2 <- 1 <- 0; bitwise), and <<U>> = the AB3 transport U*, eta^1 =
+    !          eta^0 + dtbt*I(U*)/areasvol, U^1 = U^0 + dtbt*se_tendency against the operators
+    !          called directly (to 1e-13: GNU may contract a + b*c into an FMA differently here);
+    !       b) rest stays at rest: eta = 0, U = 0, F = 0 -> every ring level and <<U>> exactly 0
+    !          after M = 40 substeps;
+    !       c) a hashed state (eta, the three U levels, F), M = 40, viscosity on: the volume
+    !          sum_v areasvol*(eta^M - eta^0) = 0 (closed basin, linfs) to 1e-12 of
+    !          sum_v areasvol*|eta^M - eta^0|; the eta-compatibility eta^M - eta^0 =
+    !          tau*I(<<U>>)/areasvol on owned nodes to 1e-12 of max(|eta^0|, |eta^M - eta^0|); at
+    !          npes > 1 the eta levels and U^M are halo-valid (stale-halo probes = 0);
+    !       d) dtbt convergence: a gravity wave from a Gaussian bump (1 m, e-folding 1500 km, at
+    !          the node with global id 1000; U = 0, F = 0), chi = 0, viscosity on, one baroclinic
+    !          step with M = 16, 32, 64
+    !          against an M = 128 reference: the observed orders log2(e(M)/e(2M)) of max|eta|
+    !          and max|U| are >= 2 (a swapped ring level or a misplaced weight drops it to 1).
+    !       Residuals and orders are printed.
     ! FESOM3_MESH_DIR (default pi), FESOM3_TEST_ROTATE=1 reads it rotated (setup_test_mesh).
     use mpi
     use mod_precision,    only: WP, MP, MPI_WP
@@ -45,10 +74,15 @@ program test_ssh_se
     use mod_dyn,          only: t_dyn
     use mod_part_bounds,  only: local_dims
     use mod_config,       only: ab_epsilon
+    use mod_constants,    only: r_earth
+    use mod_halo,         only: stale_halo_max_nod, stale_halo_max_elem
+    use mod_mesh_areas,   only: elem_center
+    use mod_mesh_rotate,  only: trim_cyclic
     use oce_dyn_velrhs,   only: compute_vel_rhs
     use oce_ssh_se,       only: se_env_requested, se_parse_knob, se_init, se_sm_coeffs, &
                                 se_cfl_dtbt_limit, se_cfl_m_min, se_cfl_decision, &
-                                SE_CFL_OK, SE_CFL_FORCED, SE_CFL_DIE, se_bt_forcing
+                                SE_CFL_OK, SE_CFL_FORCED, SE_CFL_DIE, se_bt_forcing, &
+                                se_elem_depth, se_subcycle, se_inflow, se_visc, se_tendency
     use test_util,        only: setup_test_mesh, check, finish, sum_all, max_all, hval
     implicit none
 
@@ -67,6 +101,9 @@ program test_ssh_se
     call c4_se_init()
     call c5_forcing_pressure()
     call c6_forcing_coriolis()
+    call c7_consistency()
+    call c8_visc()
+    call c9_subcycle()
     call finish(partit, 'test_ssh_se')
 
 contains
@@ -397,5 +434,322 @@ contains
             'test_ssh_se: C6 Coriolis part: lfirst max|F| = ', res1, ', AB2 step max|F| = ', res2, &
             ' m2/s2, max|f s| = ', max(scale1, scale2), '; wrong-weight residual ', resw
     end subroutine c6_forcing_coriolis
+
+    subroutine c7_consistency()
+        type(t_dyn) :: dyn
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, n, e, nz
+        integer :: elnodes(MAX_NV)
+        real(kind=WP), allocatable :: ustar(:,:), dU(:,:), tend(:,:), HA(:)
+        real(kind=WP) :: gb(2), res, scale, pre(MAX_NV), Fx, Fy     ! gb: G (g is gravity)
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        call new_dyn(dyn)
+        call set_uv(dyn, 0)
+        do n = 1, nNodL
+            dyn%eta_n(n) = 0.5_WP*hval(partit%myList_nod2D(n), 3)
+        end do
+        do e = 1, nElemF
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                dyn%work%pgf_x(nz, e) = 1.0e-5_WP*hval(partit%myList_elem2D(e), 10*nz + 7)
+                dyn%work%pgf_y(nz, e) = 1.0e-5_WP*hval(partit%myList_elem2D(e), 10*nz + 8)
+            end do
+        end do
+        call se_init(dyn, mesh, partit, dt)
+        call compute_vel_rhs(dyn, mesh, dt, .true., partit)       ! s_old <- s(uv)
+        call se_bt_forcing(dyn, mesh, partit, dt, .true.)
+        call compute_vel_rhs(dyn, mesh, dt, .false., partit)      ! the same uv: s^n = s^{n-1}
+        call se_bt_forcing(dyn, mesh, partit, dt, .false.)
+
+        allocate(ustar(2, nElemL), dU(2, nElemL), tend(2, nElemL), HA(nElemL))
+        ustar = dyn%se_sbar_old                                   ! = s^n
+        dU    = 0.0_WP
+        HA    = dyn%se_H
+        call se_tendency(dyn, mesh, partit, ustar, dyn%eta_n, HA, dU, tend)
+        res = 0.0_WP; scale = 0.0_WP
+        do e = 1, nElemO
+            gb = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                gb = gb + mesh%helem(nz, e)*dyn%uv_rhs(:, nz, e)
+            end do
+            elnodes = mesh%elem2D_nodes(:, e)
+            pre = -(g*dyn%eta_n(elnodes))
+            Fx  = sum(mesh%gradient_sca(1:4, e)*pre)
+            Fy  = sum(mesh%gradient_sca(5:8, e)*pre)
+            scale = max(scale, maxval(abs(gb))/dt, abs(mesh%coriolis(e))*maxval(abs(ustar(:, e))), &
+                        dyn%se_H(e)*max(abs(Fx), abs(Fy)))
+            res = max(res, maxval(abs(tend(:, e) - gb/dt)))
+        end do
+        call max_all(res, partit); call max_all(scale, partit)
+        call check(res <= 1.0e-12_WP*scale, 'C7 se_tendency(U* = s^n = s_old, eta^A = eta^n, H^A = H^n, '// &
+                   'dU = 0) == G/tau', partit%mype)
+        if (partit%mype == 0) write(*,'(a,es10.3,a,es10.3,a,es10.3)') &
+            'test_ssh_se: C7 consistency: max|tend - G/tau| = ', res, ' m2/s2, largest term ', scale, &
+            ', ratio ', res/scale
+    end subroutine c7_consistency
+
+    subroutine c8_visc()
+        type(t_dyn) :: dyn
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, e, k, nb, ed, c, nbad
+        integer :: nbad_zero, nbad_pos
+        real(kind=WP), allocatable :: dU(:,:), V(:,:)
+        real(kind=WP) :: cxe, cye, cxn, cyn, b1, b2, cosm, d, expect, err, ssum(2), sabs(2)
+        real(kind=WP) :: vmax, vscale, u0(2)
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        call new_dyn(dyn)
+        call se_init(dyn, mesh, partit, dt)
+        call se_elem_depth(dyn, mesh, partit)
+        call check(dyn%se_visc_ah > 0.0_WP, 'C8 the viscosity is on by default', partit%mype)
+
+        ! ---- kappa: structure and value ----
+        nbad_zero = 0; nbad_pos = 0; nbad = 0; err = 0.0_WP
+        do e = 1, nElemO
+            do k = 1, MAX_NV
+                nb = mesh%elem_neighbors(k, e)
+                if (k > mesh%elem2D_nnodes(e) .or. nb == e) then
+                    if (dyn%se_kappa(k, e) /= 0.0_WP) nbad_zero = nbad_zero + 1
+                    cycle
+                end if
+                if (.not. (dyn%se_kappa(k, e) > 0.0_WP)) nbad_pos = nbad_pos + 1
+                ed = mesh%elem_edges(k, e)
+                if (nb > nElemO .or. ed > nEdgeO) cycle
+                call elem_center(mesh, e,  cxe, cye)
+                call elem_center(mesh, nb, cxn, cyn)
+                cosm = 0.5_WP*(mesh%elem_cos(e) + mesh%elem_cos(nb))
+                b1 = cxn - cxe; call trim_cyclic(b1)
+                b2 = cyn - cye
+                d  = sqrt((b1*cosm*r_earth)**2 + (b2*r_earth)**2)
+                expect = dyn%se_visc_ah*mesh%edge_len(ed)**2/(d*mesh%elem_area(e))
+                err = max(err, abs(dyn%se_kappa(k, e) - expect)/expect)
+                nbad = nbad + 1
+            end do
+        end do
+        call sum_all(nbad_zero, partit); call sum_all(nbad_pos, partit); call max_all(err, partit)
+        call sum_all(nbad, partit)
+        call check(nbad_zero == 0, 'C8 kappa == 0 on boundary slots and triangle slot 4', partit%mype)
+        call check(nbad_pos == 0, 'C8 kappa > 0 on every interior slot', partit%mype)
+        call check(nbad > 0 .and. err <= 1.0e-12_WP, &
+                   'C8 kappa = visc_ah*edge_len^2/(d*A_e) (owned edges, owned neighbours)', partit%mype)
+
+        ! ---- sum_e A_e V_e = 0 for a hashed dU ----
+        allocate(dU(2, nElemL), V(2, nElemL))
+        do e = 1, nElemL
+            do c = 1, 2
+                dU(c, e) = dyn%se_H(e)*0.5_WP*hval(partit%myList_elem2D(e), 40 + c)
+            end do
+        end do
+        V = 0.0_WP
+        call se_visc(dyn, mesh, partit, dU, V)
+        ssum = 0.0_WP; sabs = 0.0_WP
+        do e = 1, nElemO
+            if (mesh%elem2D_nodes(1, e) > nNodO) cycle        ! counted on its first vertex's owner
+            ssum = ssum + mesh%elem_area(e)*V(:, e)
+            sabs = sabs + mesh%elem_area(e)*abs(V(:, e))
+        end do
+        call sum_all(ssum, partit); call sum_all(sabs, partit)
+        call check(all(sabs > 0.0_WP), 'C8 V of a hashed dU is non-trivial', partit%mype)
+        call check(all(abs(ssum) <= 1.0e-12_WP*sabs), 'C8 sum_e A_e*V_e = 0', partit%mype)
+        if (partit%mype == 0) write(*,'(a,2es10.3,a,2es10.3)') &
+            'test_ssh_se: C8 viscosity: sum_e A_e V_e = ', ssum, ' of sum_e A_e |V_e| = ', sabs
+        if (partit%mype == 0) write(*,'(a,es10.3,a,es10.3)') &
+            'test_ssh_se: C8 kappa vs edge_len/centroid recomputation: max rel err ', err, &
+            ', max kappa ', maxval(dyn%se_kappa)
+
+        ! ---- uniform velocity ----
+        u0 = [0.3_WP, -0.2_WP]
+        do e = 1, nElemL
+            dU(:, e) = dyn%se_H(e)*u0
+        end do
+        call se_visc(dyn, mesh, partit, dU, V)
+        vmax = maxval(abs(V(:, 1:nElemO))); vscale = maxval(dyn%se_kappa)*maxval(dyn%se_H)*maxval(abs(u0))
+        call max_all(vmax, partit); call max_all(vscale, partit)
+        call check(vmax <= 1.0e-12_WP*vscale, 'C8 V(uniform velocity, real bottom) = 0 to rounding', partit%mype)
+        dyn%se_H = 4000.0_WP
+        do e = 1, nElemL
+            dU(:, e) = dyn%se_H(e)*u0
+        end do
+        call se_visc(dyn, mesh, partit, dU, V)
+        nbad = count(V(:, 1:nElemO) /= 0.0_WP)
+        call sum_all(nbad, partit)
+        call check(nbad == 0, 'C8 V(uniform velocity, flat bottom) == 0 exactly', partit%mype)
+        if (partit%mype == 0) write(*,'(a,es10.3,a,es10.3)') &
+            'test_ssh_se: C8 uniform velocity, real bottom: max|V| = ', vmax, ' of kappa*H*u ', vscale
+    end subroutine c8_visc
+
+    subroutine c9_subcycle()
+        type(t_dyn) :: d0, d, dref
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, n, e, c, nbad, i, Mk(4)
+        real(kind=WP), allocatable :: ustar(:,:), tend(:,:), dU(:,:), HA(:), infl(:), eta1(:)
+        real(kind=WP), allocatable :: etaM(:,:), uM(:,:,:), tmp(:)
+        real(kind=WP) :: w0, w1, w2, x, y, z, ev(3), eu(3), pe(2), pu(2), vsum, vabs
+        real(kind=WP) :: res, scale, stale, p0(3)
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        allocate(ustar(2, nElemL), tend(2, nElemL), dU(2, nElemL), HA(nElemL), infl(nNodL), eta1(nNodL))
+
+        ! ---- a hashed state: eta^n, the eta ring, the three U levels, F; then copy U^n ----
+        call new_dyn(d0)
+        do n = 1, nNodL
+            d0%eta_n(n) = 0.1_WP*hval(partit%myList_nod2D(n), 11)
+        end do
+        call se_init(d0, mesh, partit, dt)
+        call se_elem_depth(d0, mesh, partit)
+        do n = 1, nNodL
+            d0%se_eta(n, 1) = 0.1_WP*hval(partit%myList_nod2D(n), 12)
+            d0%se_eta(n, 2) = 0.1_WP*hval(partit%myList_nod2D(n), 13)
+        end do
+        do e = 1, nElemL
+            do c = 1, 2
+                d0%se_ubt(c, e, 0) = d0%se_H(e)*0.01_WP*hval(partit%myList_elem2D(e), 20 + c)
+                d0%se_ubt(c, e, 1) = d0%se_H(e)*0.01_WP*hval(partit%myList_elem2D(e), 22 + c)
+                d0%se_ubt(c, e, 2) = d0%se_H(e)*0.01_WP*hval(partit%myList_elem2D(e), 24 + c)
+                d0%se_force(c, e)  = 1.0e-3_WP*hval(partit%myList_elem2D(e), 26 + c)
+            end do
+            d0%se_ubtn(:, e) = d0%se_ubt(:, e, 0)
+        end do
+
+        ! ---- a) M = 1: the ring shifts, <<U>>, and one substep against the operators ----
+        d = d0
+        d%se_M = 1
+        call se_subcycle(d, mesh, partit, dt)
+        w0 = 1.5_WP + d0%se_beta; w1 = -(0.5_WP + 2.0_WP*d0%se_beta); w2 = d0%se_beta
+        do e = 1, nElemO
+            ustar(:, e) = w0*d0%se_ubt(:, e, 0) + w1*d0%se_ubt(:, e, 1) + w2*d0%se_ubt(:, e, 2)
+        end do
+        call se_inflow(mesh, partit, ustar, infl)
+        eta1 = 0.0_WP
+        do n = 1, nNodO
+            eta1(n) = d0%eta_n(n) + infl(n)*dt/mesh%areasvol(n)
+        end do
+        nbad = count(d%se_eta(:, 2) /= d0%se_eta(:, 1)) + count(d%se_eta(:, 1) /= d0%eta_n(1:nNodL)) &
+             + count(d%se_etanew /= d%se_etam)
+        call sum_all(nbad, partit)
+        call check(nbad == 0, 'C9a eta ring shifted by copy (bitwise)', partit%mype)
+        res = maxval(abs(d%se_etam(1:nNodO) - eta1(1:nNodO)))
+        scale = max(maxval(abs(eta1(1:nNodO))), maxval(abs(d0%eta_n(1:nNodO))))
+        call max_all(res, partit); call max_all(scale, partit)
+        call check(res <= 1.0e-13_WP*scale, 'C9a eta^1 = eta^0 + dtbt*I(U*)/areasvol', partit%mype)
+        nbad = count(d%se_ubt(:, 1:nElemL, 2) /= d0%se_ubt(:, 1:nElemL, 1)) &
+             + count(d%se_ubt(:, 1:nElemL, 1) /= d0%se_ubt(:, 1:nElemL, 0))
+        call sum_all(nbad, partit)
+        call check(nbad == 0, 'C9a U ring shifted by copy (bitwise)', partit%mype)
+        res = maxval(abs(d%se_umean(:, 1:nElemO) - ustar(:, 1:nElemO)))
+        scale = maxval(abs(d0%se_ubt(:, 1:nElemO, :)))
+        call max_all(res, partit); call max_all(scale, partit)
+        call check(res <= 1.0e-13_WP*scale, 'C9a <<U>> = U* for M = 1', partit%mype)
+        ! U^1 from the operators: eta^A on owned + halo with eta^1 exchanged as se_subcycle does
+        eta1(1:nNodL) = d%se_etam(1:nNodL)
+        do n = 1, nNodL
+            infl(n) = d0%se_delta*eta1(n) + (1.0_WP - d0%se_delta - d0%se_gamma - d0%se_zeta)*d0%eta_n(n) &
+                    + d0%se_gamma*d0%se_eta(n, 1) + d0%se_zeta*d0%se_eta(n, 2)
+        end do
+        HA = d0%se_H
+        dU = 0.0_WP
+        call se_tendency(d0, mesh, partit, ustar, infl, HA, dU, tend)
+        res = 0.0_WP; scale = 0.0_WP
+        do e = 1, nElemO
+            res   = max(res, maxval(abs(d%se_ubt(:, e, 0) - (d0%se_ubt(:, e, 0) + dt*tend(:, e)))))
+            scale = max(scale, maxval(abs(d0%se_ubt(:, e, 0))), dt*maxval(abs(tend(:, e))))
+        end do
+        call max_all(res, partit); call max_all(scale, partit)
+        call check(res <= 1.0e-13_WP*scale, 'C9a U^1 = U^0 + dtbt*se_tendency', partit%mype)
+
+        ! ---- b) rest stays at rest ----
+        d = d0
+        d%eta_n = 0.0_WP; d%se_eta = 0.0_WP; d%se_ubt = 0.0_WP; d%se_ubtn = 0.0_WP; d%se_force = 0.0_WP
+        d%se_M = 40
+        call se_subcycle(d, mesh, partit, dt)
+        nbad = count(d%se_eta /= 0.0_WP) + count(d%se_etam /= 0.0_WP) + count(d%se_ubt(:, 1:nElemO, :) /= 0.0_WP) &
+             + count(d%se_umean(:, 1:nElemO) /= 0.0_WP)
+        call sum_all(nbad, partit)
+        call check(nbad == 0, 'C9b rest stays at rest (bitwise, M = 40)', partit%mype)
+
+        ! ---- c) volume and eta-compatibility, M = 40 ----
+        d = d0
+        d%se_M = 40
+        call se_subcycle(d, mesh, partit, dt)
+        vsum = 0.0_WP; vabs = 0.0_WP
+        do n = 1, nNodO
+            vsum = vsum + mesh%areasvol(n)*(d%se_etam(n) - d0%eta_n(n))
+            vabs = vabs + mesh%areasvol(n)*abs(d%se_etam(n) - d0%eta_n(n))
+        end do
+        call sum_all(vsum, partit); call sum_all(vabs, partit)
+        call check(vabs > 0.0_WP .and. abs(vsum) <= 1.0e-12_WP*vabs, &
+                   'C9c sum_v areasvol*(eta^M - eta^0) = 0 (closed basin)', partit%mype)
+        call se_inflow(mesh, partit, d%se_umean, infl)
+        res = 0.0_WP; scale = 0.0_WP
+        do n = 1, nNodO
+            res   = max(res, abs((d%se_etam(n) - d0%eta_n(n)) - dt*infl(n)/mesh%areasvol(n)))
+            scale = max(scale, abs(d0%eta_n(n)), abs(d%se_etam(n) - d0%eta_n(n)))
+        end do
+        call max_all(res, partit); call max_all(scale, partit)
+        call check(res <= 1.0e-12_WP*scale, 'C9c eta^M - eta^0 = tau*I(<<U>>)/areasvol', partit%mype)
+        if (partit%mype == 0) write(*,'(a,es10.3,a,es10.3,a,es10.3,a,es10.3)') &
+            'test_ssh_se: C9c M = 40: sum areasvol*d(eta) = ', vsum, ' m3 of ', vabs, &
+            '; eta-compatibility max residual ', res, ' m of ', scale
+        if (partit%npes > 1) then
+            allocate(tmp(nElemL))
+            stale = max(stale_halo_max_nod(d%se_etam, partit), stale_halo_max_nod(d%se_eta(:, 1), partit), &
+                        stale_halo_max_nod(d%se_eta(:, 2), partit))
+            do c = 1, 2
+                tmp = d%se_ubt(c, 1:nElemL, 0)
+                stale = max(stale, stale_halo_max_elem(tmp, partit))
+            end do
+            call max_all(stale, partit)
+            call check(stale == 0.0_WP, 'C9c eta levels and U^M halo-valid after the substeps', partit%mype)
+            deallocate(tmp)
+        end if
+
+        ! ---- d) dtbt convergence: a smooth gravity wave, chi = 0 ----
+        call new_dyn(dref)
+        ! the bump centre: the position of the node with global id 1000 (MAX over the ranks
+        ! holding a copy; every copy has the same coordinates)
+        p0 = -huge(1.0_WP)
+        do n = 1, nNodL
+            if (partit%myList_nod2D(n) /= 1000) cycle
+            p0(1) = cos(mesh%coord_nod2D(2, n))*cos(mesh%coord_nod2D(1, n))
+            p0(2) = cos(mesh%coord_nod2D(2, n))*sin(mesh%coord_nod2D(1, n))
+            p0(3) = sin(mesh%coord_nod2D(2, n))
+        end do
+        do c = 1, 3
+            call max_all(p0(c), partit)
+        end do
+        do n = 1, nNodL
+            x = cos(mesh%coord_nod2D(2, n))*cos(mesh%coord_nod2D(1, n)) - p0(1)
+            y = cos(mesh%coord_nod2D(2, n))*sin(mesh%coord_nod2D(1, n)) - p0(2)
+            z = sin(mesh%coord_nod2D(2, n)) - p0(3)
+            dref%eta_n(n) = exp(-(x*x + y*y + z*z)*(r_earth/1.5e6_WP)**2)     ! chord distance
+        end do
+        call se_init(dref, mesh, partit, dt)                    ! eta ring = eta_n, U = 0, F = 0
+        call se_elem_depth(dref, mesh, partit)
+        dref%se_chi = 0.0_WP
+        call se_sm_coeffs(0.0_WP, dref%se_beta, dref%se_zeta, dref%se_gamma, dref%se_delta)
+        Mk = [16, 32, 64, 128]
+        allocate(etaM(nNodO, 4), uM(2, nElemO, 4))
+        do i = 1, 4
+            d = dref
+            d%se_M = Mk(i)
+            call se_subcycle(d, mesh, partit, dt)
+            etaM(:, i) = d%se_etam(1:nNodO)
+            uM(:, :, i) = d%se_ubt(:, 1:nElemO, 0)
+        end do
+        do i = 1, 3
+            ev(i) = maxval(abs(etaM(:, i) - etaM(:, 4)))
+            eu(i) = maxval(abs(uM(:, :, i) - uM(:, :, 4)))
+            call max_all(ev(i), partit); call max_all(eu(i), partit)
+        end do
+        res = maxval(abs(etaM(:, 4) - dref%eta_n(1:nNodO)))
+        call max_all(res, partit)
+        pe = log(ev(1:2)/ev(2:3))/log(2.0_WP)
+        pu = log(eu(1:2)/eu(2:3))/log(2.0_WP)
+        call check(res > 1.0e-2_WP, 'C9d the wave moves eta by > 1 cm in one step', partit%mype)
+        call check(all(pe >= 2.0_WP) .and. all(pu >= 2.0_WP), 'C9d dtbt convergence order >= 2 (eta, U)', &
+                   partit%mype)
+        if (partit%mype == 0) then
+            write(*,'(a,es10.3,a)') 'test_ssh_se: C9d gravity wave, chi = 0: max|eta^M - eta^0| = ', res, ' m'
+            write(*,'(a,3es10.3,a,2f6.2)') 'test_ssh_se: C9d   eta errors vs M = 128 (M = 16, 32, 64): ', &
+                ev, '; orders ', pe
+            write(*,'(a,3es10.3,a,2f6.2)') 'test_ssh_se: C9d   U   errors vs M = 128 (M = 16, 32, 64): ', &
+                eu, '; orders ', pu
+        end if
+        deallocate(etaM, uM)
+    end subroutine c9_subcycle
 
 end program test_ssh_se

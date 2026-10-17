@@ -18,8 +18,16 @@ module oce_ssh_se
     !
     ! IN PLACE: the knobs, the state in t_dyn, se_init (coefficients, cold start, CFL guard) and
     ! the step_oce guard (Task 0.3); the element depth H^n and the barotropic forcing F
-    ! (se_elem_depth, se_bt_forcing; Task 1.1). Still to come: the substeps (se_subcycle, Task
-    ! 1.2) and the trim (se_trim_finish, Task 1.3).
+    ! (se_elem_depth, se_bt_forcing; Task 1.1); the substeps (se_subcycle) with their operators
+    ! (se_inflow, se_visc, se_tendency, se_depth_at) and the viscosity coefficients (se_kappa_build,
+    ! from se_init; Task 1.2). Still to come: the trim (se_trim_finish, Task 1.3).
+    !
+    ! DETERMINISM (plan D2): every per-element operator of the substeps is a GATHER over the
+    ! element's own vertex / neighbour slots in fixed slot order, never a scatter into elements.
+    ! A shared border element (owned by every rank that owns one of its vertices) is then
+    ! computed from bitwise-equal inputs on every owner, once F is synced (se_bt_forcing), so its
+    ! copies of U stay bitwise equal without a per-substep sync. The one scatter, I(U) into the
+    ! nodes, writes owned nodes only from owned edges (one owner per node).
     !
     ! KNOBS (env only, like every run switch of FESOM_F):
     !   FESOM3_SSH_SE      0 (default) = semi-implicit CG, 1 = split-explicit
@@ -47,18 +55,21 @@ module oce_ssh_se
     use, intrinsic :: iso_fortran_env, only: output_unit
     use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
     use mod_precision,   only: WP, MPI_WP
-    use mod_constants,   only: g
+    use mod_constants,   only: g, r_earth
     use mod_config,      only: ab_epsilon, which_ALE
     use mod_mesh,        only: t_mesh, MAX_NV
     use mod_dyn,         only: t_dyn
     use mod_partit,      only: t_partit
     use mod_part_bounds, only: local_dims, is_multirank
-    use mod_halo,        only: exchange_elem_shared
-    use mod_timer,       only: timer_start, timer_stop, TMR_OCE_SHSYNC
+    use mod_halo,        only: exchange_elem_shared, exchange_elem, exchange_nod
+    use mod_timer,       only: timer_start, timer_stop, TMR_OCE_SHSYNC, TMR_OCE_SE_BT
+    use mod_mesh_rotate, only: trim_cyclic
+    use mod_mesh_areas,  only: elem_center
     implicit none
     private
     public :: se_env_requested, se_read_env, se_parse_knob, se_init, se_step_guard
-    public :: se_elem_depth, se_bt_forcing
+    public :: se_elem_depth, se_bt_forcing, se_subcycle
+    public :: se_inflow, se_visc, se_tendency, se_depth_at, se_kappa_build
     public :: se_sm_coeffs, se_cfl_dtbt_limit, se_cfl_m_min, se_cfl_decision
     public :: SE_CFL_OK, SE_CFL_FORCED, SE_CFL_DIE
 
@@ -238,7 +249,7 @@ contains
         ! after its cold init and before a restart read (which then overwrites the cold rings).
         ! A silent no-op unless FESOM3_SSH_SE=1. Otherwise: the knobs, the guards (AB2 momentum,
         ! no cavity), the SM coefficients, the state of the plan's Technical Details §1, the
-        ! cold start, the CFL guard, and se_ready.
+        ! cold start, the viscosity coefficients (se_kappa_build), the CFL guard, and se_ready.
         ! Cold start: the eta ring holds eta_n (eta^{-1/M} = eta^{-2/M} = eta^n), the U ring the
         ! depth-integrated velocity sum_k helem*uv on owned + eDim elements (helem and uv are
         ! halo-valid), and s_old = 0 (the first step is lfirst: its Coriolis weight on s_old is
@@ -293,6 +304,9 @@ contains
             dyn%se_ubt(:, e, 2) = ub
         end do
         dyn%se_sbar_old = 0.0_WP
+
+        ! ---- BT viscosity coefficients (geometry, once) ----
+        call se_kappa_build(dyn, mesh, partit)
 
         ! ---- CFL guard ----
         lim   = se_cfl_dtbt_limit(mesh, partit)
@@ -445,6 +459,315 @@ contains
             end if
         end if
     end subroutine se_bt_forcing
+
+    !===========================================================================
+    subroutine se_kappa_build(dyn, mesh, partit)
+        ! The BT viscosity coefficients (plan D5), once from the geometry. Slot k of an OWNED
+        ! element e is the edge between its vertex slots k and k+1, nb = elem_neighbors(k,e) the
+        ! element across it:
+        !     kappa(k,e) = A_h*l/(d*A_e),  A_h = se_visc_ah*l     (the notes' A_h = 0.01 l_e)
+        ! l the edge length, d the distance between the centroids of e and nb, A_e = elem_area.
+        ! se_visc then forms V_e = sum_k kappa(k,e)*H_edge*(dU_nb/H_nb - dU_e/H_e), the flux
+        ! A_h*H_edge*grad(U/H) through each edge divided by the element area. kappa = 0 on a
+        ! boundary slot (nb == e: no flux through a coast) and on a triangle's slot 4 (never
+        ! visited by se_visc).
+        ! Geometry from the element's own vertices: edge_dxdy exists for owned edges only and an
+        ! owned element can have one halo edge (build_elem_adjacency). Centroids by elem_center for
+        ! the owned elements, the eDim neighbours' through exchange_elem (elem2D_nodes is stored
+        ! for owned elements only), as compute_geometry does (mod_mesh_areas.F90:80-89). The
+        ! longitude metric is the mean elem_cos of the two elements, as edge_len's
+        ! (compute_edge_geometry), so l equals edge_len for an owned edge, and l, d and H_edge
+        ! come out bitwise the same seen from either element: A_e*kappa(k,e) and the neighbour's
+        ! A_nb*kappa agree to rounding, which is what makes sum_e A_e*V_e = 0.
+        ! Collective at npes > 1 (the centroid exchange).
+        type(t_dyn),    intent(inout) :: dyn
+        type(t_mesh),   intent(in)    :: mesh
+        type(t_partit), intent(in)    :: partit
+        integer       :: e, k, nv, nb, v1, v2
+        integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
+        real(kind=WP) :: a1, a2, b1, b2, cosm, l, d
+        real(kind=WP), allocatable :: cx(:), cy(:)
+
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        allocate(cx(nElemL), cy(nElemL))
+        cx = 0.0_WP; cy = 0.0_WP
+        do e = 1, nElemO
+            call elem_center(mesh, e, cx(e), cy(e))
+        end do
+        if (is_multirank(partit)) then
+            call exchange_elem(cx, partit)
+            call exchange_elem(cy, partit)
+        end if
+
+        dyn%se_kappa = 0.0_WP
+        do e = 1, nElemO
+            nv = mesh%elem2D_nnodes(e)
+            do k = 1, nv
+                nb = mesh%elem_neighbors(k, e)
+                if (nb == e) cycle                                   ! boundary slot
+                v1 = mesh%elem2D_nodes(k, e)
+                v2 = mesh%elem2D_nodes(mod(k, nv) + 1, e)
+                cosm = 0.5_WP*(mesh%elem_cos(e) + mesh%elem_cos(nb))
+                a1 = mesh%coord_nod2D(1, v2) - mesh%coord_nod2D(1, v1)
+                call trim_cyclic(a1)
+                a2 = mesh%coord_nod2D(2, v2) - mesh%coord_nod2D(2, v1)
+                l  = sqrt((a1*cosm*r_earth)**2 + (a2*r_earth)**2)  ! [m], = edge_len
+                b1 = cx(nb) - cx(e)
+                call trim_cyclic(b1)
+                b2 = cy(nb) - cy(e)
+                d  = sqrt((b1*cosm*r_earth)**2 + (b2*r_earth)**2)  ! [m]
+                dyn%se_kappa(k, e) = dyn%se_visc_ah*l*l/(d*mesh%elem_area(e))
+            end do
+        end do
+        deallocate(cx, cy)
+    end subroutine se_kappa_build
+
+    !===========================================================================
+    subroutine se_inflow(mesh, partit, U, out)
+        ! I(U): the inflow edge-scatter of compute_hbar_ale (oce_ale.F90:216-246) with the 2-D
+        ! transport U(2, elem) in place of sum_k helem*uv. Over the OWNED edges in their order:
+        !     c = (U2(el1)*dX1 - U1(el1)*dY1) - (U2(el2)*dX2 - U1(el2)*dY2)  [el2: off a boundary]
+        !     out(n1) += c,  out(n2) -= c
+        ! (dX, dY = edge_cross_dxdy). Positive = convergence, the ssh_rhs_old sign: eta
+        ! advances by dt*out/areasvol. out is zeroed on owned + halo nodes and complete on the
+        ! OWNED nodes (every edge of an owned node is owned); its halo entries are partial sums.
+        ! U is read on owned elements only (both elements of an owned edge are owned).
+        type(t_mesh),   intent(in)  :: mesh
+        type(t_partit), intent(in)  :: partit
+        real(kind=WP),  intent(in)  :: U(:,:)       ! (2, >= nElemO)
+        real(kind=WP),  intent(out) :: out(:)       ! (>= nNodL)
+        integer       :: ed, el(2), enodes(2), n
+        integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
+        real(kind=WP) :: c1, c2
+
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        do n = 1, nNodL
+            out(n) = 0.0_WP
+        end do
+        do ed = 1, nEdgeO
+            enodes = mesh%edges(:, ed)
+            el     = mesh%edge_tri(:, ed)
+            c1 = U(2, el(1))*mesh%edge_cross_dxdy(1, ed) - U(1, el(1))*mesh%edge_cross_dxdy(2, ed)
+            c2 = 0.0_WP
+            if (el(2) /= el(1)) &
+                c2 = -(U(2, el(2))*mesh%edge_cross_dxdy(3, ed) - U(1, el(2))*mesh%edge_cross_dxdy(4, ed))
+            out(enodes(1)) = out(enodes(1)) + (c1+c2)
+            out(enodes(2)) = out(enodes(2)) - (c1+c2)
+        end do
+    end subroutine se_inflow
+
+    !===========================================================================
+    subroutine se_visc(dyn, mesh, partit, dU, out)
+        ! V(dU) on the OWNED elements, a gather over the slots k = 1..elem2D_nnodes(e) in fixed
+        ! order (plan D2):
+        !     V_e = sum_k kappa(k,e)*H_edge*(dU_nb/H_nb - dU_e/H_e),   H_edge = (H_e + H_nb)/2
+        ! nb = elem_neighbors(k,e), H = H^n (se_H, frozen over the substeps). The linear
+        ! harmonic flux form A_h*H_edge*grad(U/H) of the notes (plan D5): V of a uniform velocity
+        ! U/H is 0, and sum_e A_e*V_e = 0 (an interior edge enters from both sides with opposite
+        ! signs; se_kappa_build). Reads dU and H at eDim neighbours: dU must be halo-valid.
+        type(t_dyn),    intent(in)  :: dyn
+        type(t_mesh),   intent(in)  :: mesh
+        type(t_partit), intent(in)  :: partit
+        real(kind=WP),  intent(in)  :: dU(:,:)      ! (2, >= nElemL)
+        real(kind=WP),  intent(out) :: out(:,:)     ! (2, >= nElemO)
+        integer       :: e, k, nb
+        integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
+        real(kind=WP) :: He, Hnb, kh, qx, qy, vx, vy
+
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        do e = 1, nElemO
+            He = dyn%se_H(e)
+            qx = dU(1, e)/He
+            qy = dU(2, e)/He
+            vx = 0.0_WP
+            vy = 0.0_WP
+            do k = 1, mesh%elem2D_nnodes(e)
+                nb  = mesh%elem_neighbors(k, e)
+                Hnb = dyn%se_H(nb)
+                kh  = dyn%se_kappa(k, e)*(0.5_WP*(He + Hnb))
+                vx  = vx + kh*(dU(1, nb)/Hnb - qx)
+                vy  = vy + kh*(dU(2, nb)/Hnb - qy)
+            end do
+            out(1, e) = vx
+            out(2, e) = vy
+        end do
+    end subroutine se_visc
+
+    !===========================================================================
+    subroutine se_depth_at(dyn, mesh, partit, eta, HA)
+        ! H_e(eta) = H^n_e + sum_v elem_w(v,e)*c(v,e)*(eta_v - eta^n_v) on the OWNED elements:
+        ! the one depth function of the substeps (plan D3), no ALE branch in the loop. Under
+        ! linfs c == 0 and H_e(eta) = H^n_e exactly. eta and eta^n (eta_n) are read at the
+        ! element's vertices (owned + halo).
+        type(t_dyn),    intent(in)  :: dyn
+        type(t_mesh),   intent(in)  :: mesh
+        type(t_partit), intent(in)  :: partit
+        real(kind=WP),  intent(in)  :: eta(:)       ! (nNodL)
+        real(kind=WP),  intent(out) :: HA(:)        ! (>= nElemO)
+        integer :: e, elnodes(MAX_NV)
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
+
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        do e = 1, nElemO
+            elnodes = mesh%elem2D_nodes(:, e)
+            HA(e) = dyn%se_H(e) + sum(mesh%elem_w(:, e)*dyn%se_c(:, e)*(eta(elnodes) - dyn%eta_n(elnodes)))
+        end do
+    end subroutine se_depth_at
+
+    !===========================================================================
+    subroutine se_tendency(dyn, mesh, partit, ustar, etaA, HA, dU, tend)
+        ! The right-hand side of the U substep on the OWNED elements (plan Technical Details §2):
+        !     tend = -f e_z x U* - g H^A grad(eta^A) + F + V(dU)
+        ! -f e_z x U* = f*(U*_2, -U*_1), compute_vel_rhs's (v*ff, -u*ff); -g grad(eta^A) = Fx, Fy
+        ! through gradient_sca exactly as in compute_vel_rhs and se_bt_forcing. So with U* = s^n
+        ! = s^{n-1}, eta^A = eta^n, H^A = H^n and dU = 0 the r-term inside F cancels and tend =
+        ! G/tau to rounding (test_ssh_se C7: the sign/factor consistency of F and the operator).
+        ! V(dU) only when se_visc_ah > 0. Reads eta^A at the element's vertices, dU at eDim
+        ! neighbours (se_visc).
+        type(t_dyn),    intent(in)  :: dyn
+        type(t_mesh),   intent(in)  :: mesh
+        type(t_partit), intent(in)  :: partit
+        real(kind=WP),  intent(in)  :: ustar(:,:)   ! (2, >= nElemO) U*, the AB3 transport
+        real(kind=WP),  intent(in)  :: etaA(:)      ! (nNodL) eta^A, the AM4 elevation
+        real(kind=WP),  intent(in)  :: HA(:)        ! (>= nElemO) H^A = H_e(eta^A)
+        real(kind=WP),  intent(in)  :: dU(:,:)      ! (2, >= nElemL) U^m - U^n
+        real(kind=WP),  intent(out) :: tend(:,:)    ! (2, >= nElemO)
+        integer       :: e, elnodes(MAX_NV)
+        integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
+        real(kind=WP) :: f, Fx, Fy, pre(MAX_NV)
+
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        if (dyn%se_visc_ah > 0.0_WP) then
+            call se_visc(dyn, mesh, partit, dU, tend)
+        else
+            do e = 1, nElemO
+                tend(:, e) = 0.0_WP
+            end do
+        end if
+        do e = 1, nElemO
+            elnodes = mesh%elem2D_nodes(:, e)
+            pre = -(g*etaA(elnodes))
+            Fx  = sum(mesh%gradient_sca(1:4, e)*pre)
+            Fy  = sum(mesh%gradient_sca(5:8, e)*pre)
+            f   = mesh%coriolis(e)
+            tend(1, e) =  f*ustar(2, e) + HA(e)*Fx + dyn%se_force(1, e) + tend(1, e)
+            tend(2, e) = -f*ustar(1, e) + HA(e)*Fy + dyn%se_force(2, e) + tend(2, e)
+        end do
+    end subroutine se_tendency
+
+    !===========================================================================
+    subroutine se_subcycle(dyn, mesh, partit, dt)
+        ! The M barotropic substeps m = 0..M-1 of one baroclinic step tau = dt, after
+        ! se_bt_forcing (plan Technical Details §2), dtbt = tau/M:
+        !     U*        = (3/2+beta) U^m - (1/2+2 beta) U^{m-1} + beta U^{m-2}     owned elements
+        !     <<U>>    += U*/M                                                   owned elements
+        !     eta^{m+1} = eta^m + I(U*)*dtbt/areasvol            owned nodes, then exchange_nod
+        !     eta^A     = delta eta^{m+1} + (1-delta-gamma-zeta) eta^m + gamma eta^{m-1}
+        !                 + zeta eta^{m-2}                                       owned + halo nodes
+        !     H^A       = H_e(eta^A)                                             owned elements
+        !     U^{m+1}   = U^m + dtbt*se_tendency(U*, eta^A, H^A, U^m - U^n)      owned elements
+        ! eta^0 = eta_n (= eta^n), U^0 = ring level 0. The rings shift BY COPYING, so no ring
+        ! offset becomes restart state. With the viscosity on, exchange_elem(U^{m+1}) follows:
+        ! V reads U at eDim neighbours. Without it nothing reads U off the owned elements (I reads
+        ! owned elements only), the exchange is skipped and the eDim entries of the U ring stay
+        ! stale (and unused). Per substep: one 2-D exchange_nod and, with the viscosity, one 2-D
+        ! exchange_elem; no reductions. Timer TMR_OCE_SE_BT.
+        ! On exit: eta^M in se_etam (eta^{M-1}, eta^{M-2} in se_eta(:,1), se_eta(:,2); all on
+        ! owned + halo nodes), U^M in ring level 0 (U^{M-1}, U^{M-2} in levels 1, 2), <<U>> in
+        ! se_umean (owned elements). eta_n and hbar are untouched: se_trim_finish commits them.
+        type(t_dyn),    intent(inout) :: dyn
+        type(t_mesh),   intent(in)    :: mesh
+        type(t_partit), intent(in)    :: partit
+        real(kind=WP),  intent(in)    :: dt       ! tau, the baroclinic step
+        integer       :: m, M_sub, n, e
+        integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
+        real(kind=WP) :: rM, dtbt, w0, w1, w2, d0, d1, d2, d3
+        logical       :: visc
+        real(kind=WP), allocatable :: ustar(:,:), unew(:,:), tend(:,:), dU(:,:)
+        real(kind=WP), allocatable :: etaA(:), inflow(:), HA(:)
+
+        call timer_start(TMR_OCE_SE_BT)
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        M_sub = dyn%se_M
+        rM    = real(M_sub, WP)
+        dtbt  = dt/rM
+        ! AB3: w0 U^m + w1 U^{m-1} + w2 U^{m-2};  AM4: d3 eta^{m+1} + d0 eta^m + d1 eta^{m-1} + d2 eta^{m-2}
+        w0 =  1.5_WP + dyn%se_beta
+        w1 = -(0.5_WP + 2.0_WP*dyn%se_beta)
+        w2 =  dyn%se_beta
+        d3 =  dyn%se_delta
+        d0 =  1.0_WP - dyn%se_delta - dyn%se_gamma - dyn%se_zeta
+        d1 =  dyn%se_gamma
+        d2 =  dyn%se_zeta
+        visc = (dyn%se_visc_ah > 0.0_WP)
+
+        allocate(ustar(2, nElemL), unew(2, nElemL), tend(2, nElemL), dU(2, nElemL))
+        allocate(etaA(nNodL), inflow(nNodL), HA(nElemL))
+        ustar = 0.0_WP; unew = 0.0_WP; tend = 0.0_WP; dU = 0.0_WP
+        etaA  = 0.0_WP; inflow = 0.0_WP; HA = 0.0_WP
+
+        do n = 1, nNodL
+            dyn%se_etam(n) = dyn%eta_n(n)
+        end do
+        dyn%se_umean = 0.0_WP
+
+        do m = 0, M_sub - 1
+            ! AB3 transport and the running mean
+            do e = 1, nElemO
+                ustar(1, e) = w0*dyn%se_ubt(1, e, 0) + w1*dyn%se_ubt(1, e, 1) + w2*dyn%se_ubt(1, e, 2)
+                ustar(2, e) = w0*dyn%se_ubt(2, e, 0) + w1*dyn%se_ubt(2, e, 1) + w2*dyn%se_ubt(2, e, 2)
+                dyn%se_umean(1, e) = dyn%se_umean(1, e) + ustar(1, e)/rM
+                dyn%se_umean(2, e) = dyn%se_umean(2, e) + ustar(2, e)/rM
+            end do
+
+            ! elevation (closed basin, linfs: no freshwater term -- Task 3.1)
+            call se_inflow(mesh, partit, ustar, inflow)
+            do n = 1, nNodO
+                dyn%se_etanew(n) = dyn%se_etam(n) + inflow(n)*dtbt/mesh%areasvol(n)
+            end do
+            if (is_multirank(partit)) call exchange_nod(dyn%se_etanew, partit)
+
+            ! AM4 elevation and its depth, on the levels held on owned + halo nodes
+            do n = 1, nNodL
+                etaA(n) = d3*dyn%se_etanew(n) + d0*dyn%se_etam(n) + d1*dyn%se_eta(n, 1) &
+                        + d2*dyn%se_eta(n, 2)
+            end do
+            call se_depth_at(dyn, mesh, partit, etaA, HA)
+
+            ! transport
+            if (visc) then
+                do e = 1, nElemL
+                    dU(1, e) = dyn%se_ubt(1, e, 0) - dyn%se_ubtn(1, e)
+                    dU(2, e) = dyn%se_ubt(2, e, 0) - dyn%se_ubtn(2, e)
+                end do
+            end if
+            call se_tendency(dyn, mesh, partit, ustar, etaA, HA, dU, tend)
+            do e = 1, nElemO
+                unew(1, e) = dyn%se_ubt(1, e, 0) + dtbt*tend(1, e)
+                unew(2, e) = dyn%se_ubt(2, e, 0) + dtbt*tend(2, e)
+            end do
+
+            ! shift the rings by copying
+            do n = 1, nNodL
+                dyn%se_eta(n, 2) = dyn%se_eta(n, 1)
+                dyn%se_eta(n, 1) = dyn%se_etam(n)
+                dyn%se_etam(n)   = dyn%se_etanew(n)
+            end do
+            do e = 1, nElemL
+                dyn%se_ubt(:, e, 2) = dyn%se_ubt(:, e, 1)
+                dyn%se_ubt(:, e, 1) = dyn%se_ubt(:, e, 0)
+            end do
+            do e = 1, nElemO
+                dyn%se_ubt(:, e, 0) = unew(:, e)
+            end do
+            if (visc) then
+                if (is_multirank(partit)) call exchange_elem(dyn%se_ubt(:, :, 0), partit)
+            end if
+        end do
+
+        deallocate(ustar, unew, tend, dU, etaA, inflow, HA)
+        call timer_stop(TMR_OCE_SE_BT)
+    end subroutine se_subcycle
 
     !===========================================================================
     ! ---- helpers ----
