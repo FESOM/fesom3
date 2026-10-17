@@ -69,6 +69,7 @@ module mod_step_oce
     use oce_ale,            only: compute_vel_nodes, update_vel, compute_hbar_ale, &
                                   update_eta_n, vert_vel_ale, update_thickness_ale
     use oce_ale_tracer,     only: solve_tracers_ale
+    use oce_ssh_se,         only: se_step_guard
     use mod_timer,          only: timer_start, timer_stop, &
                                   TMR_OCE_MIXPRES, TMR_OCE_DYN, TMR_OCE_SSH, &
                                   TMR_OCE_SOLVE, TMR_OCE_GMREDI, TMR_OCE_TRACER
@@ -101,9 +102,17 @@ contains
 
         logical :: is_kpp, is_tke
         integer :: node, nNodO, nNodL, nEdgeO, nElemO
+        logical, save :: se_checked = .false.
 
         is_kpp = (mix_scheme_nmb == 1)
         is_tke = (mix_scheme_nmb == 5)
+
+        ! split-explicit driver guard, first call only (oce_ssh_se): with FESOM3_SSH_SE=1, a
+        ! driver that did not run se_init would silently get the CG solve below
+        if (.not. se_checked) then
+            call se_step_guard(dynamics, partit)
+            se_checked = .true.
+        end if
 
         !_______________________________________________________________________
         ! nodal velocity (the REAL uvnode source, was prescribed at M2.8)

@@ -39,6 +39,8 @@ program fesom_lifecycle_native_mr
     !   FESOM3_NSTEPS       number of steps                     (default: 3)
     !   FESOM3_SHARED_SYNC  1 = one owner per shared element: update_vel syncs uv (default);
     !                       0 = off (unsynced copies, A/B only). Read in src/infra/mod_shared_elem.F90.
+    !   FESOM3_SSH_SE       1 = split-explicit barotropic solver (knobs FESOM3_SE_*); default 0 =
+    !                       the semi-implicit CG solve. Read in src/oce/oce_ssh_se.F90.
     use mpi
     use mod_timer           ! permanent per-component wall-clock timing (TMR_* ids, timer_start/stop/report)
     use, intrinsic :: ieee_arithmetic   ! M8c Step-3 fix: control flush-to-zero (denormal) underflow mode
@@ -95,6 +97,7 @@ program fesom_lifecycle_native_mr
     use oce_muscl_adv,      only: muscl_adv_init
     use oce_ssh_rhs,        only: init_stiff_mat_ale
     use mod_step_oce,       only: step_oce
+    use oce_ssh_se,         only: se_init
     use mod_io_meshdiag,    only: meshdiag_write
     use mod_io_means,       only: t_io_means, t_io_config, t_io_entry, t_means_clock, MEANS_MAXF, &
                                   means_init, means_read_namelist, means_define_node2d, &
@@ -903,6 +906,12 @@ program fesom_lifecycle_native_mr
             end if
         end if
     end if
+
+    !===========================================================================
+    ! Split-explicit barotropic solver (FESOM3_SSH_SE; a silent no-op when unset): knobs, SE
+    ! state, cold-start rings from eta_n/uv, CFL guard. After the whole cold init, before the
+    ! restart block, so that a restart read overwrites the cold rings.
+    call se_init(dyn, mesh, partit, dt)
 
     !===========================================================================
     ! Restart Stage 5 (Task 5.3 REGISTER + Task 5.1 READ). When FESOM3_RESTART=<dir> is set, register the

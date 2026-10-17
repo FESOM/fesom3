@@ -486,3 +486,36 @@ set_tests_properties(fesom_conserve_linfs_vinv_shsync_np2 PROPERTIES
     PASS_REGULAR_EXPRESSION "shared elements \\(sync ON\\).* -- OK within tol"
     FAIL_REGULAR_EXPRESSION "VIOLATED"
     SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+
+# Split-explicit barotropic solver (docs/plans/2026-10-17-split-explicit.md), test_ssh_se on the
+# rotated pi: the SM coefficients against literal numbers, knob parsing, the CFL guard (M_min
+# identical on all ranks at np 2, the decision for M = 1) and se_init's cold start under
+# FESOM3_SSH_SE=1 FESOM3_SE_M=40.
+set(_se_env FESOM3_TEST_ROTATE=1 FESOM3_SSH_SE=1 FESOM3_SE_M=40)
+add_fesom_test(test_ssh_se 1)
+set_tests_properties(test_ssh_se_np1 PROPERTIES ENVIRONMENT "FESOM3_MESH_DIR=${_mesh_pi};${_se_env}")
+require_files(test_ssh_se_np1 ${_mesh_pi}/nod2d.out)
+add_mesh_test(test_ssh_se_np2 test_ssh_se ${_mesh_pi} 2 ${_se_env})
+# The driver-facing stops in fesom_conserve's se_init (the regex pair of the wsplit guards: the
+# message, and the step-0 line the driver prints only if it went on): a bad FESOM3_SSH_SE, a bad
+# FESOM3_SE_M, and M = 1 below the CFL-guard minimum.
+set(_se_conserve "FESOM3_MESH_DIR=${_mesh_pi};FESOM3_IC_FILE=${_icf};FESOM3_NSTEPS=1")
+foreach(_case badswitch badm cfl)
+    if(_case STREQUAL "badswitch")
+        set(_knobs "FESOM3_SSH_SE=2")
+        set(_msg "FESOM3_SSH_SE must be 0 or 1: \"2\"")
+    elseif(_case STREQUAL "badm")
+        set(_knobs "FESOM3_SSH_SE=1;FESOM3_SE_M=0")
+        set(_msg "FESOM3_SE_M must be an integer >= 1: \"0\"")
+    else()
+        set(_knobs "FESOM3_SSH_SE=1;FESOM3_SE_M=1")
+        set(_msg "M = 1 is below the CFL-guard minimum M_min = [0-9]+")
+    endif()
+    add_test(NAME fesom_conserve_se_${_case}_np1
+             COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np 1 $<TARGET_FILE:fesom_conserve>)
+    set_tests_properties(fesom_conserve_se_${_case}_np1 PROPERTIES
+        ENVIRONMENT "${_se_conserve};${_knobs}"
+        PASS_REGULAR_EXPRESSION "${_msg}"
+        FAIL_REGULAR_EXPRESSION "fesom_conserve: step "
+        SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+endforeach()

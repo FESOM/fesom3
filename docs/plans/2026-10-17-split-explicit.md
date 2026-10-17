@@ -260,7 +260,7 @@ scripts and logs in its `jobs/`)
   spread
 - [ ] ctest green (Intel + GNU)
 
-#### Task 0.3: SE state in t_dyn, env knobs, `se_init`, CFL guard, driver guard, timer
+#### Task 0.3: SE state in t_dyn, env knobs, `se_init`, CFL guard, driver guard, timer ✅
 
 **Files:**
 - Create: `src/oce/oce_ssh_se.F90`
@@ -270,13 +270,18 @@ scripts and logs in its `jobs/`)
 - Modify: `src/step/mod_step_oce.F90`
 - Create: `test/test_ssh_se.F90`; Modify: `test/CMakeLists.txt`
 
-- [ ] `t_dyn` (`mod_dyn.F90:104-146`): add the scalars and arrays of Technical Details §1. Extend
-  `write_t_dyn`/`read_t_dyn` symmetrically only if test_types needs it
-- [ ] `oce_ssh_se`:
+- [x] `t_dyn` (`mod_dyn.F90:104-146`): add the scalars and arrays of Technical Details §1. Extend
+  `write_t_dyn`/`read_t_dyn` symmetrically only if test_types needs it. test_types does not need it, so they are
+  not serialized (the carried arrays go to the Zarr checkpoint in Task 4.2). ➕ One scalar beyond §1:
+  `se_m_force` (FESOM3_SE_M_FORCE), so that the parser writes every knob into `t_dyn` and the test can check it
+- [x] `oce_ssh_se`:
   - `se_env_requested()` (parses `FESOM3_SSH_SE` once, 0/1, any other value dies);
   - `se_read_env` for `FESOM3_SE_M` (int ≥ 1), `FESOM3_SE_CHI` (0 ≤ χ ≤ 0.25), `FESOM3_SE_VISC_AH` (≥ 0),
-    `FESOM3_SE_CHECK` (0/1), `FESOM3_SE_M_FORCE` (0/1). Values are checked as for `FESOM3_SHARED_SYNC`
-- [ ] `se_init(dyn, mesh, partit, dt)`:
+    `FESOM3_SE_CHECK` (0/1), `FESOM3_SE_M_FORCE` (0/1). Values are checked as for `FESOM3_SHARED_SYNC`.
+    The parsing is `se_parse_knob(name, str, dyn, ok, msg)` (no output, no stop; switches exactly `0`/`1`, M digits
+    only, the reals plain-number characters and a finite value, so `nan`, `inf` and `0.1 0.2` are rejected); the
+    driver-facing wrappers stop through `se_die` (MPI_Abort)
+- [x] `se_init(dyn, mesh, partit, dt)`:
   - silent no-op when SE is off;
   - guards: `AB_order == 2`; no cavity (`ulevels_nod2D > 1` anywhere → die);
   - allocates the state and computes the SM coefficients;
@@ -284,17 +289,35 @@ scripts and logs in its `jobs/`)
   - CFL guard as in port_kokkos: owned surface nodes, `mesh_resolution`, depth from the vertex column, 0.5 safety;
     **allreduce MIN** of the limit before deciding; print M_min on rank 0; die if M < M_min unless FORCE;
   - sets `se_ready`
-- [ ] call `se_init` in `fesom_lifecycle_native_mr` right before the restart block (:909) and in `fesom_conserve`
-  after its cold init
-- [ ] `step_oce`, first call: if `se_env_requested()` and not `se_ready`, die ("FESOM3_SSH_SE=1 but this driver does
-  not initialise split-explicit"). Without this check, other drivers would silently run SI
-- [ ] timer `TMR_OCE_SE_BT` nested under TMR_OCE_SSH (ids, NTIMER, TNAME/TPARENT/TSUBSET)
-- [ ] tests (`test_ssh_se`, rotated pi, np 1):
+
+  The guard is factored into `se_cfl_dtbt_limit` (limit, MIN-reduced), `se_cfl_m_min` and the pure
+  `se_cfl_decision` (OK / FORCED / DIE). **pi (dt 1800 s): limit 233.653 s, M_min = 8** (np 1 and np 2).
+- [x] call `se_init` in `fesom_lifecycle_native_mr` right before the restart block (:909) and in `fesom_conserve`
+  after its cold init (after the sea-ice setup, before `check_invariants(0)`)
+- [x] `step_oce`, first call: if `se_env_requested()` and not `se_ready`, die ("FESOM3_SSH_SE=1 but this driver does
+  not initialise split-explicit"). Without this check, other drivers would silently run SI. ➕ Until Task 1.3 adds
+  the SE branch, `se_step_guard` also stops an *initialised* SE run ("step_oce has no split-explicit step yet"), for
+  the same reason; **Task 1.3 removes that second stop**
+- [x] timer `TMR_OCE_SE_BT` nested under TMR_OCE_SSH (ids, NTIMER, TNAME/TPARENT/TSUBSET). ➕ A `TQUIET` flag
+  (one extra MPI_MAX of the counts in `timer_report`) drops the line when the timer never ran, so SI runs print
+  no zero SE line (checked in the G0 linfs log). No other code uses the ids by number
+- [x] tests (`test_ssh_se`, rotated pi, np 1):
   - the coefficients at χ = 0.1 equal **literal numbers** worked out by hand from the notes (ζ = −0.003689497,
     γ = 0.0320866, δ = 0.724707606), which catches a typo in the constants;
   - M_min on pi is finite, identical on all ranks at np 2, and the guard fires for M = 1;
   - env parsing rejects bad values
-- [ ] **GATE G0:** ctest Intel + GNU; `tools/run_g0_se.sh` byte-identical; restart gate green
+
+  Registered as `test_ssh_se_np1` and `test_ssh_se_np2` (`FESOM3_TEST_ROTATE=1 FESOM3_SSH_SE=1 FESOM3_SE_M=40`):
+  C1 coefficients (also χ = 0), C2 32 rejected / 11 accepted knob values, C3 the limit against an independent
+  per-rank recomputation and the decision at M = 1, M_min − 1, M_min, 50, C4 `se_init` from the environment
+  (extents, cold-start rings, coefficients, `se_ready`). Plus three regex ctests of the driver-facing stops in
+  `fesom_conserve` (`fesom_conserve_se_{badswitch,badm,cfl}_np1`)
+- [x] **GATE G0:** ctest Intel + GNU; `tools/run_g0_se.sh` byte-identical; restart gate green. 2026-10-18, job
+  28216244 (shared, 32 cores, 12.7 min, 0.16 node-h): **Intel 172/172** (167 + 5 new). **GNU 161/172**, the same 11
+  pre-existing failures as Task 0.1 and no new one; the 5 new tests pass on GNU. **G0 GREEN** (linfs, zstar,
+  conserve byte-identical to the frozen main references; 281 s). **Restart gate GREEN, max|Δ| = 0: np 1 203 s,
+  np 2 149 s.** New `fesom_lifecycle_native_mr` sha256 `103151b26b8445df…`. Job scripts and logs:
+  `/work/ab0995/a270088/fesom3_se_ref/jobs/t03_*` (verbose test output: job 28216531)
 
 ### Stage 1 — linfs, one rank
 *The whole scheme on the simplest decomposition, with every invariant visible.*
@@ -370,6 +393,7 @@ scripts and logs in its `jobs/`)
   - Ū^M stays in the ring
 - [ ] `step_oce`: `if (dynamics%use_ssh_se) then` call the three SE routines under TMR_OCE_SSH, `else` the existing
   block **verbatim**. Add `dump_node_2d` for hbar/eta_n at the same substep ids
+- [ ] ➕ remove the temporary second stop in `se_step_guard` ("step_oce has no split-explicit step yet", Task 0.3)
 - [ ] test: Σₖhelemⁿ·uv = ⟨⟨Ū⟩⟩ to rounding after the trim; the correction is depth-uniform in velocity
 - [ ] ctest green; G0
 
