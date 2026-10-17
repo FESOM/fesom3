@@ -330,26 +330,41 @@ scripts and logs in its `jobs/`)
 ### Stage 1 — linfs, one rank
 *The whole scheme on the simplest decomposition, with every invariant visible.*
 
-#### Task 1.1: Barotropic forcing (`se_bt_forcing`) and the element depth function
+#### Task 1.1: Barotropic forcing (`se_bt_forcing`) and the element depth function ✅
 
 **Files:**
 - Modify: `src/oce/oce_ssh_se.F90`
 - Modify: `test/test_ssh_se.F90`
 
-- [ ] `se_elem_depth`: Hⁿ_e = Σₖhelemⁿ over `ulevels(e)..nlevels(e)−1` for **owned + eDim** elements (nElemL;
-  helem is halo-valid). c_{e,v} ≡ 0 under linfs (the zstar branch comes in Task 3.1)
-- [ ] `se_bt_forcing`, on owned elements:
+- [x] `se_elem_depth`: Hⁿ_e = Σₖhelemⁿ over `ulevels(e)..nlevels(e)−1` for **owned + eDim** elements (nElemL;
+  helem is halo-valid). c_{e,v} ≡ 0 under linfs (the zstar branch comes in Task 3.1). ➕ Until Task 3.1 a
+  non-linfs run stops in `se_elem_depth` ("split-explicit supports which_ALE = linfs only so far"), so a zstar SE
+  run cannot silently use c = 0 once Task 1.3 wires SE in; **Task 3.1 replaces that stop**
+- [x] `se_bt_forcing`, on owned elements:
   - G = Σₖhelemⁿ·UV_rhs;
   - šⁿ = Σₖhelemⁿ·uv;
   - F = G/τ + g·Hⁿ·∇ηⁿ + f·e_z×(a₂šⁿ + a₁š^{n−1}), with ∇ through `gradient_sca` exactly as
     `oce_dyn_velrhs.F90:105-111`, a₂ = 1.5+ε (1 on lfirst), a₁ = −(0.5+ε);
   - copy Ūⁿ (ring level 0, nElemL) into `se_ubtn` for the viscosity;
   - then š_old ← šⁿ
-- [ ] test (pressure part): uv = 0, pgf = 0, a non-trivial eta_n, the **real** `compute_vel_rhs` → F = 0 to rounding
-- [ ] test (Coriolis part): **momentum advection off** (`momadv_opt = 0`, so neither branch at :132-136 runs),
+
+  In code: F(1) = G(1)/τ − Hⁿ·Fx − f·S(2), F(2) = G(2)/τ − Hⁿ·Fy + f·S(1), with Fx, Fy = gradient_sca·(−gηⁿ)
+  (the compute_vel_rhs expression) and S = a₂šⁿ + a₁š^{n−1}. ➕ The one-owner sync of F
+  (`exchange_elem_shared(se_force)` under `partit%sync_shared_elem`, timer TMR_OCE_SHSYNC, a no-op at np 1) is
+  already the last statement of `se_bt_forcing` (§2 pseudo-code); Task 2.1 keeps only its tests
+- [x] test (pressure part): uv = 0, pgf = 0, a non-trivial eta_n, the **real** `compute_vel_rhs` → F = 0 to rounding.
+  `test_ssh_se` C5 (np 1 and np 2): **max|F| = 1.4e-16 m²/s² against max|gHⁿ∇ηⁿ| = 0.39 m²/s² (ratio 3.6e-16
+  Intel, 3.5e-16 GNU)**; tolerance 1e-12 × the pressure term. C5 also checks se_H == Σₖhelem bitwise on owned + eDim
+- [x] test (Coriolis part): **momentum advection off** (`momadv_opt = 0`, so neither branch at :132-136 runs),
   UV_rhsAB built by a previous real `compute_vel_rhs` call from a known uv^{n−3/2}, š_old consistent, helem constant
-  → F = 0 to rounding; plus the lfirst coefficient
-- [ ] ctest green
+  → F = 0 to rounding; plus the lfirst coefficient. `test_ssh_se` C6: step 1 (lfirst, cold uv_rhsAB, š_old = 0)
+  **max|F| = 7.4e-18**, step 2 (AB2 blend of uv^{n−1/2} and uv^{n−3/2}) **max|F| = 1.3e-17 m²/s²**, against
+  max|f·š| = 3.8e-3 (ratios 1.9e-15 and 3.4e-15; GNU 5.4e-18 / 1.2e-17). The lfirst weight: the step-1 UV_rhs taken
+  as a non-lfirst step leaves exactly (0.5+ε)·f e_z×šⁿ (residual 7.4e-18). š_old == šⁿ and se_ubtn == ring level 0
+  bitwise. Tolerance 1e-12 × max|f·š|
+- [x] ctest green. Job 28216760 (shared, 2 min): **Intel 172/172; GNU 166/172, the 6 known failures**
+  (`test_wimpl_tra_np1/np2`, `meshdiag_mixed/quad/pi_w`, `test_shared_elem_np1`), no new one; `test_ssh_se_np1/np2`
+  pass on both. Script `/work/ab0995/a270088/fesom3_se_ref/jobs/t11_build_ctest.sbatch`
 
 #### Task 1.2: Substep loop (`se_subcycle`), inflow scatter, viscosity
 

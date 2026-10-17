@@ -16,9 +16,10 @@ module oce_ssh_se
     ! chi the dissipation parameter. Afterwards the 3-D velocity is trimmed to the mean transport
     ! <<U>>, and the existing ALE tail consumes the result through hbar/hbar_old.
     !
-    ! IN PLACE (Task 0.3): the knobs, the state in t_dyn, se_init (coefficients, cold start, CFL
-    ! guard) and the step_oce guard. The step itself (se_bt_forcing, se_subcycle, se_trim_finish)
-    ! is Stage 1 of the plan.
+    ! IN PLACE: the knobs, the state in t_dyn, se_init (coefficients, cold start, CFL guard) and
+    ! the step_oce guard (Task 0.3); the element depth H^n and the barotropic forcing F
+    ! (se_elem_depth, se_bt_forcing; Task 1.1). Still to come: the substeps (se_subcycle, Task
+    ! 1.2) and the trim (se_trim_finish, Task 1.3).
     !
     ! KNOBS (env only, like every run switch of FESOM_F):
     !   FESOM3_SSH_SE      0 (default) = semi-implicit CG, 1 = split-explicit
@@ -47,13 +48,17 @@ module oce_ssh_se
     use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
     use mod_precision,   only: WP, MPI_WP
     use mod_constants,   only: g
+    use mod_config,      only: ab_epsilon, which_ALE
     use mod_mesh,        only: t_mesh, MAX_NV
     use mod_dyn,         only: t_dyn
     use mod_partit,      only: t_partit
-    use mod_part_bounds, only: local_dims
+    use mod_part_bounds, only: local_dims, is_multirank
+    use mod_halo,        only: exchange_elem_shared
+    use mod_timer,       only: timer_start, timer_stop, TMR_OCE_SHSYNC
     implicit none
     private
     public :: se_env_requested, se_read_env, se_parse_knob, se_init, se_step_guard
+    public :: se_elem_depth, se_bt_forcing
     public :: se_sm_coeffs, se_cfl_dtbt_limit, se_cfl_m_min, se_cfl_decision
     public :: SE_CFL_OK, SE_CFL_FORCED, SE_CFL_DIE
 
@@ -332,6 +337,114 @@ contains
         call se_die('FESOM3_SSH_SE=1: step_oce has no split-explicit step yet '// &
                     '(docs/plans/2026-10-17-split-explicit.md, Task 1.3)', partit)
     end subroutine se_step_guard
+
+    !===========================================================================
+    subroutine se_elem_depth(dyn, mesh, partit)
+        ! H^n_e = sum_k helem^n over the layers ulevels(e)..nlevels(e)-1 (the loop of se_init's
+        ! cold-start transport), on the OWNED + eDim elements: helem is halo-valid, and the
+        ! viscosity gather reads H at eDim neighbours. The substeps use the depth law of plan D3,
+        ! H_e(eta) = H^n_e + sum_v elem_w(v,e)*c(v,e)*(eta_v - eta^n_v). Under linfs c == 0 (se_c
+        ! keeps the zero of se_init), so H_e(eta) = H^n_e. The zstar weights c come with Task
+        ! 3.1; until then a non-linfs run stops here rather than run with c = 0.
+        type(t_dyn),    intent(inout) :: dyn
+        type(t_mesh),   intent(in)    :: mesh
+        type(t_partit), intent(in)    :: partit
+        integer       :: e, nz
+        integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
+        real(kind=WP) :: H
+
+        if (trim(which_ALE) /= 'linfs') &
+            call se_die('split-explicit supports which_ALE = linfs only so far (zstar depth law: '// &
+                        'docs/plans/2026-10-17-split-explicit.md, Task 3.1)', partit)
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        do e = 1, nElemL
+            H = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                H = H + mesh%helem(nz, e)
+            end do
+            dyn%se_H(e) = H
+        end do
+    end subroutine se_elem_depth
+
+    !===========================================================================
+    subroutine se_bt_forcing(dyn, mesh, partit, dt, lfirst)
+        ! Once per baroclinic step, after the predictor (compute_vel_rhs, viscosity_filter,
+        ! impl_vert_visc_ale), when uv = u^{n-1/2}, UV_rhs = u** - u^{n-1/2}, helem = helem^n and
+        ! eta_n = eta^n. H^n (se_elem_depth), then on the OWNED elements the forcing F = Rbar - r
+        ! of the notes (subcycling.tex:55-58):
+        !     G   = sum_k helem^n*UV_rhs          = tau*Rbar, the depth-integrated predictor
+        !     s^n = sum_k helem^n*uv              the stored Coriolis transport (plan D4)
+        !     F   = G/tau + g H^n grad(eta^n) + f e_z x (a2 s^n + a1 s^{n-1})
+        ! The r-term removes what compute_vel_rhs put into UV_rhs and the substep operator
+        ! (se_tendency: -f e_z x U* - g H^A grad(eta^A)) adds back:
+        !   - pressure: compute_vel_rhs adds dt*Fx to every layer, Fx = gradient_sca . (-g*eta_n)
+        !     (oce_dyn_velrhs.F90:105-111). F subtracts H^n*Fx with Fx formed by the same
+        !     expression, so the two cancel to rounding; no second discretisation of grad(eta).
+        !   - Coriolis: compute_vel_rhs stores (v*ff, -u*ff) = -f e_z x u (times elem_area) in
+        !     uv_rhsAB and blends ab2*(this step) + ab1*(previous step), ab2 = 1.5+eps (1 on
+        !     lfirst), ab1 = -(0.5+eps). The same weights over the stored transports, a2 = ab2,
+        !     a1 = ab1, cancel it exactly under linfs (helem constant) and to second order under
+        !     zstar (uv_rhsAB weighs the previous layer velocities with helem^{n-1}). On lfirst
+        !     s^{n-1} = 0 (se_init), as compute_vel_rhs's cold uv_rhsAB.
+        ! Momentum advection (also in uv_rhsAB), viscosity, the baroclinic pressure and the
+        ! wind stress stay in F.
+        ! Then s^{n-1} <- s^n; U^n (ring level 0, owned + eDim) is copied to se_ubtn for the
+        ! viscosity V(U^m - U^n); and F is synced over the shared elements, one owner as uv in
+        ! update_vel (plan D2): the copies of G differ by roundoff (the viscosity filter's
+        ! order-dependent sums). A no-op at 1 rank.
+        type(t_dyn),    intent(inout) :: dyn
+        type(t_mesh),   intent(in)    :: mesh
+        type(t_partit), intent(in)    :: partit
+        real(kind=WP),  intent(in)    :: dt       ! tau, the baroclinic step
+        logical,        intent(in)    :: lfirst   ! first Euler step (compute_vel_rhs's ff = 1)
+        integer       :: e, nz, elnodes(MAX_NV)
+        integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
+        real(kind=WP) :: a1, a2, f, Fx, Fy, pre(MAX_NV), gb(2), sn(2), sc(2)   ! gb: G (g is gravity)
+
+        call se_elem_depth(dyn, mesh, partit)
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+
+        ! the AB2 weights of compute_vel_rhs (oce_dyn_velrhs.F90:97-100, :141-142)
+        a1 = -(0.5_WP + ab_epsilon)
+        a2 =  (1.5_WP + ab_epsilon)
+        if (lfirst) a2 = 1.0_WP
+
+        do e = 1, nElemO
+            gb = 0.0_WP
+            sn = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                gb(1) = gb(1) + mesh%helem(nz, e)*dyn%uv_rhs(1, nz, e)
+                gb(2) = gb(2) + mesh%helem(nz, e)*dyn%uv_rhs(2, nz, e)
+                sn(1) = sn(1) + mesh%helem(nz, e)*dyn%uv(1, nz, e)
+                sn(2) = sn(2) + mesh%helem(nz, e)*dyn%uv(2, nz, e)
+            end do
+            ! grad(eta^n) exactly as compute_vel_rhs: Fx = -g d(eta)/dx
+            elnodes = mesh%elem2D_nodes(:, e)
+            pre = -(g*dyn%eta_n(elnodes))
+            Fx  = sum(mesh%gradient_sca(1:4, e)*pre)
+            Fy  = sum(mesh%gradient_sca(5:8, e)*pre)
+            ! f e_z x sc = f*(-sc(2), sc(1))
+            sc(1) = a2*sn(1) + a1*dyn%se_sbar_old(1, e)
+            sc(2) = a2*sn(2) + a1*dyn%se_sbar_old(2, e)
+            f = mesh%coriolis(e)
+            dyn%se_force(1, e) = gb(1)/dt - dyn%se_H(e)*Fx - f*sc(2)
+            dyn%se_force(2, e) = gb(2)/dt - dyn%se_H(e)*Fy + f*sc(1)
+            dyn%se_sbar_old(:, e) = sn
+        end do
+
+        do e = 1, nElemL
+            dyn%se_ubtn(:, e) = dyn%se_ubt(:, e, 0)
+        end do
+
+        if (is_multirank(partit)) then
+            ! (nested ifs: Fortran does not short-circuit)
+            if (partit%sync_shared_elem) then
+                call timer_start(TMR_OCE_SHSYNC)
+                call exchange_elem_shared(dyn%se_force, partit)
+                call timer_stop(TMR_OCE_SHSYNC)
+            end if
+        end if
+    end subroutine se_bt_forcing
 
     !===========================================================================
     ! ---- helpers ----

@@ -22,6 +22,19 @@ program test_ssh_se
     !       == sum_k helem*uv on owned + eDim elements; s_old == 0) and se_ready. eta_n and uv
     !       are hashed from the global ids, so every copy of a node or element holds the same
     !       value.
+    !   C5  se_elem_depth and the PRESSURE part of the forcing (Task 1.1): H^n == sum_k helem on
+    !       owned + eDim elements (bitwise, positive); with uv = 0, pgf = 0, momentum advection off
+    !       and a non-trivial eta_n, the real compute_vel_rhs puts only -g grad(eta) into UV_rhs,
+    !       and se_bt_forcing's g H^n grad(eta^n) must remove it: max|F| <= 1e-12 * max|H^n Fx|.
+    !   C6  the CORIOLIS part of the forcing and the lfirst weight (Task 1.1): momentum advection
+    !       off, eta_n = 0, pgf = 0, helem constant. Step 1 (lfirst, cold uv_rhsAB, s_old = 0):
+    !       the real compute_vel_rhs on uv^{n-3/2}, then F = 0 to rounding; the same UV_rhs taken
+    !       as a non-lfirst step leaves exactly (0.5+eps) f e_z x s^n (the lfirst weight a2 = 1
+    !       matters). s_old == sum_k helem*uv^{n-3/2} afterwards (bitwise). Step 2 (not lfirst):
+    !       uv^{n-1/2}, compute_vel_rhs blends ab2*C(uv^{n-1/2}) + ab1*C(uv^{n-3/2}), and F = 0 to
+    !       rounding again. se_ubtn == ring level 0 (bitwise, owned + eDim).
+    !       Tolerances are relative to the largest Coriolis term max|f s|; the measured residuals
+    !       are printed.
     ! FESOM3_MESH_DIR (default pi), FESOM3_TEST_ROTATE=1 reads it rotated (setup_test_mesh).
     use mpi
     use mod_precision,    only: WP, MP, MPI_WP
@@ -31,10 +44,12 @@ program test_ssh_se
     use mod_partitioning, only: par_init
     use mod_dyn,          only: t_dyn
     use mod_part_bounds,  only: local_dims
+    use mod_config,       only: ab_epsilon
+    use oce_dyn_velrhs,   only: compute_vel_rhs
     use oce_ssh_se,       only: se_env_requested, se_parse_knob, se_init, se_sm_coeffs, &
                                 se_cfl_dtbt_limit, se_cfl_m_min, se_cfl_decision, &
-                                SE_CFL_OK, SE_CFL_FORCED, SE_CFL_DIE
-    use test_util,        only: setup_test_mesh, check, finish, sum_all, hval
+                                SE_CFL_OK, SE_CFL_FORCED, SE_CFL_DIE, se_bt_forcing
+    use test_util,        only: setup_test_mesh, check, finish, sum_all, max_all, hval
     implicit none
 
     character(len=*), parameter :: PI_DIR = '/home/a/a270088/port2/fesom2/tests/data/MESHES/pi'
@@ -50,6 +65,8 @@ program test_ssh_se
     call c2_parsing()
     call c3_cfl_guard()
     call c4_se_init()
+    call c5_forcing_pressure()
+    call c6_forcing_coriolis()
     call finish(partit, 'test_ssh_se')
 
 contains
@@ -240,5 +257,145 @@ contains
         call check(all(dyn%se_sbar_old == 0.0_WP), 'C4 s_old == 0', partit%mype)
         call check(maxval(abs(dyn%se_ubt(:, :, 0))) > 0.0_WP, 'C4 the U ring is non-trivial', partit%mype)
     end subroutine c4_se_init
+
+    subroutine new_dyn(dyn)
+        ! a zero dynamics state at the extents the drivers allocate (fesom_conserve), AB2,
+        ! momentum advection off (momadv_opt = 0: neither branch of compute_vel_rhs runs).
+        ! se_init comes after the caller has set uv and eta_n (the cold start reads them).
+        type(t_dyn), intent(inout) :: dyn
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, nl
+        nl = mesh%nl
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        if (.not. allocated(mesh%helem)) error stop 'test_ssh_se: helem is set up by C4'
+        allocate(dyn%uv(2, nl-1, nElemF), dyn%uv_rhs(2, nl-1, nElemF))
+        allocate(dyn%uv_rhsAB(1, 2, nl-1, nElemF), dyn%eta_n(nNodL))
+        allocate(dyn%work%pgf_x(nl-1, nElemF), dyn%work%pgf_y(nl-1, nElemF))
+        dyn%uv = 0.0_WP; dyn%uv_rhs = 0.0_WP; dyn%uv_rhsAB = 0.0_WP; dyn%eta_n = 0.0_WP
+        dyn%work%pgf_x = 0.0_WP; dyn%work%pgf_y = 0.0_WP
+        dyn%AB_order   = 2
+        dyn%momadv_opt = 0
+    end subroutine new_dyn
+
+    subroutine set_uv(dyn, seed)
+        ! uv on every held element and wet layer, hashed from the global element id
+        type(t_dyn), intent(inout) :: dyn
+        integer,     intent(in)    :: seed
+        integer :: e, nz, c
+        do e = 1, size(dyn%uv, 3)
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                do c = 1, 2
+                    dyn%uv(c, nz, e) = 0.2_WP*hval(partit%myList_elem2D(e), 10*nz + c + seed)
+                end do
+            end do
+        end do
+    end subroutine set_uv
+
+    subroutine c5_forcing_pressure()
+        type(t_dyn) :: dyn
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, n, e, nz, nbad
+        integer :: elnodes(MAX_NV)
+        real(kind=WP) :: H, pre(MAX_NV), Fx, Fy, res, scale
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        call new_dyn(dyn)
+        do n = 1, nNodL
+            dyn%eta_n(n) = 0.5_WP*hval(partit%myList_nod2D(n), 3)
+        end do
+        call se_init(dyn, mesh, partit, dt)
+        call compute_vel_rhs(dyn, mesh, dt, .false., partit)
+        call se_bt_forcing(dyn, mesh, partit, dt, .false.)
+
+        ! H^n on owned + eDim
+        nbad = 0
+        do e = 1, nElemL
+            H = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                H = H + mesh%helem(nz, e)
+            end do
+            if (dyn%se_H(e) /= H .or. .not. (H > 0.0_WP)) nbad = nbad + 1
+        end do
+        call sum_all(nbad, partit)
+        call check(nbad == 0, 'C5 se_H == sum_k helem > 0 (bitwise, owned + eDim)', partit%mype)
+
+        ! the pressure part cancels
+        res = 0.0_WP; scale = 0.0_WP
+        do e = 1, nElemO
+            elnodes = mesh%elem2D_nodes(:, e)
+            pre   = -(g*dyn%eta_n(elnodes))
+            Fx    = sum(mesh%gradient_sca(1:4, e)*pre)
+            Fy    = sum(mesh%gradient_sca(5:8, e)*pre)
+            scale = max(scale, dyn%se_H(e)*max(abs(Fx), abs(Fy)))
+            res   = max(res, maxval(abs(dyn%se_force(:, e))))
+        end do
+        call max_all(res, partit); call max_all(scale, partit)
+        call check(scale > 0.0_WP, 'C5 the pressure term is non-trivial', partit%mype)
+        call check(res <= 1.0e-12_WP*scale, 'C5 F = 0 with only -g grad(eta) in UV_rhs', partit%mype)
+        if (partit%mype == 0) write(*,'(a,es10.3,a,es10.3,a,es10.3)') &
+            'test_ssh_se: C5 pressure part: max|F| = ', res, ' m2/s2, max|g H grad eta| = ', scale, &
+            ', ratio ', res/scale
+    end subroutine c5_forcing_pressure
+
+    subroutine c6_forcing_coriolis()
+        type(t_dyn) :: dyn, dwrong
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, e, nz, nbad
+        real(kind=WP) :: sn(2), f, res1, resw, fw, res2, scale1, scale2, aw
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        call new_dyn(dyn)
+        call set_uv(dyn, 0)                              ! uv^{n-3/2}
+        call se_init(dyn, mesh, partit, dt)              ! s_old = 0
+        call check(all(dyn%se_sbar_old == 0.0_WP), 'C6 s_old == 0 after se_init', partit%mype)
+
+        ! ---- step 1, lfirst ----
+        call compute_vel_rhs(dyn, mesh, dt, .true., partit)
+        dwrong = dyn
+        call se_bt_forcing(dwrong, mesh, partit, dt, .false.)   ! a2 = 1.5+eps on an lfirst UV_rhs
+        call se_bt_forcing(dyn,    mesh, partit, dt, .true.)
+        aw = 0.5_WP + ab_epsilon                         ! (1.5+eps) - 1
+        res1 = 0.0_WP; resw = 0.0_WP; fw = 0.0_WP; scale1 = 0.0_WP; nbad = 0
+        do e = 1, nElemO
+            sn = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                sn(1) = sn(1) + mesh%helem(nz, e)*dyn%uv(1, nz, e)
+                sn(2) = sn(2) + mesh%helem(nz, e)*dyn%uv(2, nz, e)
+            end do
+            f = mesh%coriolis(e)
+            scale1 = max(scale1, abs(f)*maxval(abs(sn)))
+            res1 = max(res1, maxval(abs(dyn%se_force(:, e))))
+            ! the wrong weight leaves (a2 - 1) f e_z x s^n = aw*f*(-sn(2), sn(1))
+            resw = max(resw, abs(dwrong%se_force(1, e) + aw*f*sn(2)), &
+                             abs(dwrong%se_force(2, e) - aw*f*sn(1)))
+            fw   = max(fw, maxval(abs(dwrong%se_force(:, e))))
+            if (any(dyn%se_sbar_old(:, e) /= sn)) nbad = nbad + 1
+        end do
+        call max_all(res1, partit); call max_all(resw, partit); call max_all(fw, partit)
+        call max_all(scale1, partit); call sum_all(nbad, partit)
+        call check(scale1 > 0.0_WP, 'C6 the Coriolis term is non-trivial', partit%mype)
+        call check(res1 <= 1.0e-12_WP*scale1, 'C6 lfirst: F = 0 (a2 = 1)', partit%mype)
+        call check(resw <= 1.0e-12_WP*scale1 .and. fw >= 0.5_WP*aw*scale1, &
+                   'C6 lfirst UV_rhs with a2 = 1.5+eps: F = (0.5+eps) f e_z x s^n', partit%mype)
+        call check(nbad == 0, 'C6 s_old == sum_k helem*uv after the step (bitwise)', partit%mype)
+
+        ! ---- step 2 ----
+        call set_uv(dyn, 5)                              ! uv^{n-1/2}
+        call compute_vel_rhs(dyn, mesh, dt, .false., partit)
+        call se_bt_forcing(dyn, mesh, partit, dt, .false.)
+        res2 = 0.0_WP; scale2 = 0.0_WP
+        do e = 1, nElemO
+            sn = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                sn(1) = sn(1) + mesh%helem(nz, e)*dyn%uv(1, nz, e)
+                sn(2) = sn(2) + mesh%helem(nz, e)*dyn%uv(2, nz, e)
+            end do
+            scale2 = max(scale2, abs(mesh%coriolis(e))*maxval(abs(sn)))
+            res2 = max(res2, maxval(abs(dyn%se_force(:, e))))
+        end do
+        call max_all(res2, partit); call max_all(scale2, partit)
+        call check(res2 <= 1.0e-12_WP*max(scale1, scale2), 'C6 step 2 (AB2 blend): F = 0', partit%mype)
+        nbad = count(dyn%se_ubtn(:, 1:nElemL) /= dyn%se_ubt(:, 1:nElemL, 0))
+        call sum_all(nbad, partit)
+        call check(nbad == 0, 'C6 se_ubtn == U ring level 0 (bitwise, owned + eDim)', partit%mype)
+        if (partit%mype == 0) write(*,'(a,es10.3,a,es10.3,a,es10.3,a,es10.3)') &
+            'test_ssh_se: C6 Coriolis part: lfirst max|F| = ', res1, ', AB2 step max|F| = ', res2, &
+            ' m2/s2, max|f s| = ', max(scale1, scale2), '; wrong-weight residual ', resw
+    end subroutine c6_forcing_coriolis
 
 end program test_ssh_se
