@@ -108,6 +108,7 @@ program fesom_lifecycle_native_mr
     ! Restart Stage 5: checkpoint registry + register/write/read hooks (the lifecycle wiring of mod_io_restart).
     use mod_io_restart,     only: t_restart, restart_init, restart_register_state, restart_write, &
                                   restart_read, restart_finalize, restart_resolve_latest
+    use oce_ale,            only: update_thickness_ale   ! zstar restart: rebuild the derived thicknesses
     implicit none
 
     ! Model timestep, from step_per_day (env FESOM3_STEP_PER_DAY; default 48 => dt = 1800 s = 30 min,
@@ -931,6 +932,15 @@ program fesom_lifecycle_native_mr
         if (r_restart) then
             call restart_read(rst, trim(RestartInPath), mesh, partit, &
                               clock_year=yearnew, clock_day=daynew, clock_time_sec=real(timenew, real64))
+            ! zstar: the checkpoint holds hnode only. At the top of a straight-run step hnode_new == hnode
+            ! and zbar_3d_n / Z_3d_n / helem are what update_thickness_ale built from them (bottom-up from
+            ! the fixed anchor; helem over owned elements + exchange_elem), so rerun it with
+            ! hnode_new = hnode: the same loops give the same bits (hnode is rewritten with itself).
+            ! linfs keeps its cold, never-changing thicknesses.
+            if (trim(which_ALE) == 'zstar') then
+                mesh%hnode_new(:, 1:nNodL) = mesh%hnode(:, 1:nNodL)
+                call update_thickness_ale(mesh, partit)
+            end if
             if (partit%mype == 0) write(*,'(a,f9.1,a,i0,a,i0)') &
                 'restart: state restored (resumed run) at clock time=', timenew, ' day=', daynew, &
                 ' year=', yearnew

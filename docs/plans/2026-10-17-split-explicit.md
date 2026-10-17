@@ -545,18 +545,41 @@ scripts and logs in its `jobs/`)
 
 ### Stage 4 — Restart
 
-#### Task 4.1: zstar derived thickness after a restart
+#### Task 4.1: zstar derived thickness after a restart ✅
 
 **Files:**
 - Modify: `src/drivers/fesom_lifecycle_native_mr.F90`
 
-- [ ] after `restart_read` (:923), when `which_ALE == 'zstar'`: set hnode_new = hnode on nNodL, then call
+- [x] after `restart_read` (:923), when `which_ALE == 'zstar'`: set hnode_new = hnode on nNodL, then call
   `update_thickness_ale(mesh, partit)`. This rebuilds zbar_3d_n and Z_3d_n bottom-up from the fixed bottom anchor,
   and helem (owned plus `exchange_elem`), with the same loops as the straight run, so the result is bitwise. linfs is
-  untouched (G0)
-- [ ] verify: `run_restart_gate_core2.sh` with `FESOM3_WHICH_ALE=zstar` and **SI** shows whether the remaining
+  untouched (G0). Done as written (9 lines + one `use oce_ale` line). No side effect: the routine only rewrites hnode
+  with its own values and rebuilds zbar_3d_n / Z_3d_n / helem; it reads hnode_new, the cold bottom anchor
+  zbar_3d_n(nlevels_nod2D-1) and elem_w, all valid after restart_read. hbar_old is reset from hbar in
+  compute_hbar_ale before any use; nothing else in the step is derived incrementally from the thicknesses
+- [x] verify: `run_restart_gate_core2.sh` with `FESOM3_WHICH_ALE=zstar` and **SI** shows whether the remaining
   SI-zstar gaps (dhe, stiffness) still break SI; record the result, do not fix it (D6). The split-explicit zstar
-  restart is gated in Task 4.3
+  restart is gated in Task 4.3. Results (CORE2, mid and month-boundary splits, np 1 and 2; plus the diagnostic
+  N = 3, K = 2, whose final step is the first resumed step, so `dump_diff.py` names the first diverging substep):
+  - **before** (se-t41 HEAD d23361c, job 28216193, 3.7 min): FAIL, 26 of the checkpoint variables differ at N4 K2
+    (np 1 mid: eta_n 8.0e-4, hnode 4.0e-4, temp 2.9e-2, salt 5.8e-3, u 3.7e-4, v 5.4e-4, w 1.5e-6, sigma11 3.9e2,
+    hice 1.7e-4, urhs_AB 3.0e1; np 2 the same to 2-3 digits). The first resumed step departs at substep 1
+    PRESSURE_BV (density 2.2e-3): pressure_bv reads the cold Z_3d_n
+  - **after** (job 28216287, 4.0 min): still FAIL (26 variables, eta_n 1.4e-3, temp 1.0e-4, salt 3.8e-5, u 1.1e-4
+    at N4 K2), but the first resumed step is now bitwise through substep 8 (pressure, mixing, ssh_rhs) and first
+    departs at substep 9 SSH_SOLVE (d_eta 5.5e-4, np 1 and 2): the SI stiffness. `update_stiff_mat_ale` adds
+    −dhe of the previous step to `ssh_stiff%values` every step and these increments accumulate from the cold start;
+    the checkpoint has neither dhe (cold 0 on resume) nor the accumulated values. The Jacobi preconditioner is
+    built once at each process's first solve (`oce_ssh_solve.F90:80-83`, `lfirst` save) from the then-current
+    matrix, the cold one in both legs today (dhe = 0 at the first step); restoring dhe or the values would change that
+  - **probe** (job 28216587, 4.7 min; source copy `fesom3_se_t02_jobs/t41_probe_src` = this fix plus the
+    `update_stiff_mat_ale` call commented out, never committed): **GREEN** at np 1 and np 2, N4 K2 and N3 K2, mid
+    and boundary, checkpoint and live dump max|Δ| = 0. So with the fix the only remaining zstar restart gap is
+    the SI stiffness (dhe + accumulated values), out of scope under D6; nothing else needs rebuilding for SE
+  - no regression (job 28216588, 6.4 min): ctest Intel 167/167, GNU 161/167 (the same 6 known failures);
+    `run_g0_se.sh` G0 GREEN (linfs, zstar, conserve); linfs restart gate GREEN np 1 (217 s) and np 2 (151 s).
+    Jobs, scripts and logs: `/work/ab0995/a270088/fesom3_se_t02_jobs/t41_*`; run dirs
+    `/scratch/a/a270088/fesom3_se_rgate/t41_*`, G0 `/scratch/a/a270088/g0_se/t41_28216588`. 0.23 node-h in total
 
 #### Task 4.2: SE fields in the checkpoint
 
