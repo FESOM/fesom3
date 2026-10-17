@@ -201,20 +201,51 @@ Not in scope: NEMO SE runs, the zstar 1-year twin, wide halo, JAX dump stages, t
 ### Stage 0 — Baseline references, infrastructure, module skeleton, knobs
 *Everything SE needs to exist and be switched off byte-identically before any physics goes in.*
 
-#### Task 0.1: Baseline build and frozen G0 references
+#### Task 0.1: Baseline build and frozen G0 references ✅
 
-**Files:** none in the repo (build dirs; references under `/work/ab0995/a270088/fesom3_se_ref/`)
+**Files:** Create: `tools/run_g0_se.sh` (build dirs; references under `/work/ab0995/a270088/fesom3_se_ref/`; job
+scripts and logs in its `jobs/`)
 
-- [ ] build Intel and GNU at HEAD (code = main 814e5d0 plus docs only) inside an allocation; ctest Intel + GNU,
-  record the count (expect 167/167)
-- [ ] freeze the Intel binaries (copy plus `SHA256`) and write the references:
-  - CORE2 `prod_env` np 2, 20 steps, with a checkpoint at the end and `FESOM_DUMP_ALL` dumps;
-  - the same with `FESOM3_WHICH_ALE=zstar`;
-  - the `run_conserve_pi.sh` log
-- [ ] write `tools/run_g0_se.sh`: rerun those cases with a new build (SE off) and compare against the references
+- [x] build Intel and GNU at HEAD (code = main 814e5d0 plus docs only) inside an allocation; ctest Intel + GNU,
+  record the count (expect 167/167). 2026-10-18, job 28214504 (shared, 32 cores; no `--clean`, fresh build dirs):
+  **Intel 167/167** (ctest 27 s). **GNU 156/167**: 11 failures that already exist on main, all deterministic
+  (a serial `ctest -j 1` rerun, job 28215528, fails the same way):
+  - ⚠️ `test/test_coupling_mixed.F90:193` does not compile with gfortran 11.2 (`allocate(tracers%data(2),
+    tracers%data(2)%values(nl-1, nn))`: "Allocate-object at (1) is subobject of object at (2)"). The 5
+    `test_coupling_mixed_*` tests have no executable; every other GNU target builds.
+  - ⚠️ `test_wimpl_tra_np1/np2`: 4 × "FAIL: C6 (i) the limiter leaves the antidiffusive flux unchanged" /
+    "every limiting factor applied to a nonzero face == 1", w > 0 cases only (GNU prints fct_minus = -0.000).
+  - ⚠️ `meshdiag_mixed/quad/pi_w`: "FAIL M1 face_nodes / face_edges / face_links / gradient_sca_x / gradient_sca_y
+    dims ['n4', 'el']" at np 1 and 2.
+  - ⚠️ `test_shared_elem_np1`: SIGSEGV after "S2: exchange and probes done" (the np 2/8 variants pass).
+
+  Until main fixes these, GNU G0 on this branch means "the same 11 failures and no new one".
+- [x] freeze the Intel binaries (copy plus `SHA256`) and write the references:
+  `/work/ab0995/a270088/fesom3_se_ref/bin_main_6cd6449/` (read-only; `SHA256SUMS`; `PROVENANCE`: src/test/CMake
+  identical to 814e5d0), `fesom_lifecycle_native_mr` sha256 `2b6d1ab1c3fa4303…`, `fesom_conserve` `15eb8fd05d93d1cf…`.
+  The references are in `…/fesom3_se_ref/g0/`, written by `MAKE_REF=1 tools/run_g0_se.sh` with the frozen binaries
+  (job 28214520), so the reference runs and the gate runs share one case definition:
+  - CORE2 with the full production physics `prod_env 1e-5` (JRA55-do from 1958-01-01, linfs, EVP, TKE, GM + Redi,
+    splines, vector-invariant momentum with rvo_upwind 1, w split, SW penetration, step diagnostics; SSH soltol 1e-5
+    = production), np 2, 20 steps (dt 1800). It has an end-of-run checkpoint `fesom.1958.001.36000` (28 stores, 99
+    variables) and `FESOM_DUMP_ALL` node dumps of **step 20 only** (1 649 154 records; all 20 steps would be ~6 GB
+    per case). 83 s; 1.3 GB.
+  - the same with `FESOM3_WHICH_ALE=zstar`: 85 s, 1.3 GB.
+  - the `run_conserve_pi.sh` log: 26 configs, GATE OK, 50 s. A frozen copy of the script sits next to the log, so
+    the SE blocks that later tasks add to `run_conserve_pi.sh` do not change the G0 case set.
+- [x] write `tools/run_g0_se.sh`: rerun those cases with a new build (SE off) and compare against the references
   (`zarr_diff.py` max|Δ| = 0, `dump_diff.py --rel-floor 0`, conserve log diff without timing lines). It passes on
-  the frozen binary itself
-- [ ] `F3=<worktree> tools/run_restart_gate_core2.sh` (np 1/2) green; record the wall times
+  the frozen binary itself. The script also compares the case environment (catches drift of the case definitions),
+  the checkpoint store list and `checkpoint.json` (without `fesom_git`), and the 20 `FESOM3_STEP_DIAG` lines.
+  It never deletes: each run goes into a fresh dir (default `/scratch/a/a270088/g0_se/<stamp>`). The conserve log
+  has no timing lines today (the filter drops 0 of 249 lines). Self-tests (job 28214520):
+  - frozen bin: **G0 GREEN**, 276 s;
+  - `build_intel_dp/bin`: **G0 GREEN**, 271 s;
+  - negative control, the GNU build: **FAIL** in all three cases, as it should (83 resp. 84 of 99 checkpoint
+    variables differ, dumps and step lines differ, 222 conserve log lines differ), 619 s.
+- [x] `F3=<worktree> tools/run_restart_gate_core2.sh` (np 1/2) green; record the wall times. Both GREEN, max|Δ| = 0
+  (checkpoint and live dump, mid-run and month-boundary splits): **np 1 306 s** (job 28214521), **np 2 144 s**
+  (job 28214522). Run dirs: `/scratch/a/a270088/fesom3_se_rgate/np{1,2}_<jobid>`.
 
 #### Task 0.2: Shared-element exchange for real (2, elem) arrays
 
