@@ -295,7 +295,8 @@ scripts and logs in its `jobs/`)
   - allocates the state and computes the SM coefficients;
   - cold start: η ring ← eta_n, Ū ring ← Σhelem·uv (nElemL), š_old ← 0;
   - CFL guard as in port_kokkos: owned surface nodes, `mesh_resolution`, depth from the vertex column, 0.5 safety;
-    **allreduce MIN** of the limit before deciding; print M_min on rank 0; die if M < M_min unless FORCE;
+    **allreduce MIN** of the limit before deciding; print M_min on rank 0; die if M < M_min unless FORCE
+    (➕ replaced by the operator-based guard of Task 0.4: the res-based bound admitted unstable M);
   - sets `se_ready`
 
   The guard is factored into `se_cfl_dtbt_limit` (limit, MIN-reduced), `se_cfl_m_min` and the pure
@@ -326,6 +327,78 @@ scripts and logs in its `jobs/`)
   conserve byte-identical to the frozen main references; 281 s). **Restart gate GREEN, max|Δ| = 0: np 1 203 s,
   np 2 149 s.** New `fesom_lifecycle_native_mr` sha256 `103151b26b8445df…`. Job scripts and logs:
   `/work/ab0995/a270088/fesom3_se_ref/jobs/t03_*` (verbose test output: job 28216531)
+
+#### ➕ Task 0.4: operator-based CFL guard ✅
+
+*A guard defect found by the Task 5.1 diagnosis: the res-based guard gave M_min = 35 on CORE2 at Δt 1800 s, and
+M = 35 blows up at step 5 at χ = 0.1. The defaults (χ 0.1, M 50, `se_visc_ah` 0.01) are unchanged (Stage 5).*
+
+**Files:**
+- Modify: `src/oce/oce_ssh_se.F90` (the CFL GUARD block, the `se_cfl_*` routines, the guard part of `se_init`)
+- Modify: `test/test_ssh_se.F90` (C3)
+
+- [x] the guard follows the substeps' own linear operator instead of a resolution estimate:
+  - `se_cfl_apply_a`: A η = −I(H(−g∇η))/areasvol, the gradient of `se_tendency` (gradient_sca) and the inflow
+    `se_inflow`; H = Hⁿ = Σ_k helem over the element's layers (the loop of `se_elem_depth`, computed locally so that
+    the guard does not depend on the zstar weights; under zstar the current thickness at `se_init`, before a
+    restart read). A is self-adjoint in the areasvol inner product and ≥ 0, so its eigenvalues are ω² ≥ 0;
+  - `se_cfl_omega_max`: ω_max by **100 power iterations** on the owned nodes, start vector a Weyl sequence in the
+    global node id (Knuth's multiplicative hash mod 2³², integer arithmetic), ‖·‖_W normalisation with one
+    allreduce sum and one `exchange_nod` per iteration; λ_k = ‖A v_k‖_W lies between the Rayleigh quotient of v_k
+    and λ_max (a lower bound, like any power iteration). The rank-0 line reports the change of the last iteration;
+  - `se_cfl_stable(a, χ, r)`: all roots of the characteristic polynomial of the AB3–AM4 substeps for one gravity
+    mode, z⁴(z−1)² + a²(w₀z² + w₁z + w₂)(δz³ + d₀z² + γz + ζ), in |z| < r, decided by the Schur–Cohn recursion on
+    p(rz) (no root finder; the weights of `se_sm_coeffs`, formed as in `se_subcycle`); `se_cfl_rho` = the spectral
+    radius by bisection on r; `se_cfl_acrit(χ)` = the first a with a root on |z| = 1 (scan from a = 0.5 in steps of
+    0.005, then 60 bisections): **1.8530680 / 1.5788384 / 1.3290986 at χ = 0 / 0.1 / 0.25** (numpy root finder of
+    the Task 5.1 note: 1.853 / 1.579 / 1.329);
+  - `se_init`: **M_min = ⌈τ/dtbt_max⌉, dtbt_max = s·a_crit(χ)/ω_max, s = `SE_CFL_SAFETY` = 0.9**; `se_cfl_m_min`
+    and `se_cfl_decision` (OK / FORCED / DIE, `FESOM3_SE_M_FORCE`) unchanged; `se_cfl_dtbt_limit` removed. One
+    rank-0 line, e.g. CORE2: `oce_ssh_se:   CFL guard: omega_max = 3.1518E-02 1/s (100 power iterations, last
+    change  0.0E+00), a_crit(chi) = 1.5788, s = 0.90 -> dtbt <= 45.084 s -> M_min = 40 (0.057 s)`; the stop names
+    ω_max·dtbt and s·a_crit
+  - **s = 0.9**, why: s has to cover what the scalar test leaves out. (i) The power-iteration value is a lower bound;
+    on CORE2 and pi the iteration reaches a fixed point (last change 0), and even without a spectral gap 100
+    iterations from a generic start on N nodes miss ω_max by about ln(N)/400 (< 5 % up to N = 10⁸). (ii) Coriolis
+    (f ≤ 1.5e-4 s⁻¹ against ω_max = 3.2e-2 s⁻¹ on CORE2), the BT viscosity (ν·dtbt/l² ≈ 4e-3) and, under zstar, H(η)
+    (|η|/H ≈ 1e-3 in the trenches where the fastest mode lives) move the limit by well under 1 %. No damping has to
+    be bought: at 0.9 a_crit the fastest mode decays (spectral radius 0.885 / 0.678 / 0.571 per substep at χ = 0 /
+    0.1 / 0.25), and the scheme turns unstable abruptly above a_crit (2.19 / 1.88 / 1.70 at 1.1 a_crit). The upper
+    end: s ≥ 0.854 keeps the default M = 50 admissible at χ = 0.25 on CORE2 (the setting gated in Task 2.2). s = 0.9
+    is the value proposed in the Task 5.1 diagnosis
+- [x] tests (`test_ssh_se` C3, rotated pi, np 1/2/8, Intel and GNU; C3 now runs after C4, the operator reads
+  helem):
+  - a) a_crit to 1e-3 of 1.853 / 1.579 / 1.329; `se_cfl_stable` flips between 0.999 and 1.001 a_crit; the radius at
+    1.1 a_crit equals numpy's 2.186123 / 1.879877 / 1.700745 to 1e-5 (measured: equal to 6 digits); < 1 at 0.9 a_crit;
+  - b) A self-adjoint: |(u, Aw)_W − (Au, w)_W| ≤ 6.5e-16 of ‖u‖_W‖Aw‖_W (np 1/2/8), (u, Au)_W > 0;
+  - c) **pi ω_max = 5.9801241e-3 s⁻¹, last change 0; np 2 and np 8 equal to np 1 bitwise (relative difference 0),
+    M_min 8 on all** (reference file next to the P4 one, `FESOM3_TEST_SE_P4REF.c3`); ω_max² ≥ the Rayleigh quotients
+    of two hashed vectors;
+  - d) M_min = ⌈τω_max/(s·a_crit)⌉ = **8 on pi at χ = 0.1** (the old guard: also 8), the decision at M = 1,
+    M_min − 1, M_min, 40, 50;
+  - e) **empirical, the real `se_subcycle`** (F = 0, U = 0, η = the power-iteration vector, viscosity on, one call
+    per baroclinic step): at M = M_min (pi: 7 / 8 / 9 at χ = 0 / 0.1 / 0.25, ω_max·dtbt = 0.83 / 0.85 / 0.90 a_crit)
+    ‖η‖_W falls to 6.3e-4 of the start over 300 steps; at ω_max·dtbt = 0.97 a_crit to 6.5-6.9e-4 over 3000
+    substeps; at 1.03 a_crit it grows by > 10¹² (1.45 / 1.28 / 1.21 per substep) and at 1.1 a_crit by > 10¹² at
+    **2.181 / 1.876 / 1.698 per substep against `se_cfl_rho` 2.186 / 1.880 / 1.701** (within 0.3 %; checked to 10 %).
+    So the real loop's limit is a_crit to ±3 % on pi as on CORE2 (Task 5.1 note: to the substep)
+- [x] CORE2 `prod_env`, Δt 1800 s (job 28218958, Intel build of this tree): **ω_max = 3.1518e-2 s⁻¹** (the
+  diagnosis: 3.152e-2), last change 0; **M_min = 40 at χ = 0.1 and 48 at χ = 0.25** (np 8, 5 SE steps each with
+  SE_CHECK, M = 50: etacomp ≤ 5.1e-15 m, trim ≤ 1.1e-13 m²/s, spreads 0); **`FESOM3_SE_M=35` now stops in
+  `se_init`** (`M = 35 is below the CFL-guard minimum M_min = 40 (dtbt = 51.429 s > 45.084 s: omega_max*dtbt = 1.621
+  > s*a_crit(chi) = 1.421)`), where before it blew up at step 5. **Guard wall time: 0.565 s at np 1, 0.057 s at
+  np 8** (CORE2, 126 858 nodes); pi 0.002-0.04 s
+- [x] GATE (job 28219005, 8.2 min): incremental builds; **ctest Intel 175/175; GNU 169/175, exactly the 6 known
+  failures** (`test_wimpl_tra_np1/np2`, `meshdiag_mixed/quad/pi_w`, `test_shared_elem_np1`; the serial rerun fails
+  the same 6); the driver stops `fesom_conserve_se_{badswitch,badm,cfl}_np1` pass unchanged (the cfl one now reads
+  `M = 1 is below the CFL-guard minimum M_min = 8 (dtbt = 1800.000 s > 237.613 s: omega_max*dtbt = 10.764 >
+  s*a_crit(chi) = 1.421)`, which the existing regex matches). **G0 GREEN** (linfs, zstar: 99 checkpoint variables
+  and 1 649 154 dump records max|Δ| = 0, 20 step lines equal; conserve 249 lines, 26 configs; 361 s): SE off is
+  untouched. Intel `fesom_lifecycle_native_mr` sha256 `bbbd552160a2bd5e…`. Jobs 28218952 (a compile error in the
+  test, 34 s), 28218958 (builds, SE ctests verbose, CORE2), 28219005; 0.13 node-h. Scripts and logs
+  `/work/ab0995/a270088/fesom3_se_ref/jobs/t04_*`, run dirs `/scratch/a/a270088/se_t04/`
+- Task 5.1 screen (b) "M = M_min" now means the M_min of this guard (40 at χ = 0.1, 48 at χ = 0.25 on CORE2 at
+  Δt 1800 s)
 
 ### Stage 1 — linfs, one rank
 *The whole scheme on the simplest decomposition, with every invariant visible.*
@@ -824,7 +897,8 @@ sbatch at a time or in a short chain; each wait is a background `sacct` watcher.
 
 - [ ] SI baseline and SE screens, 3000 steps each, CORE2 `prod_env`:
   - (a) χ = 0.1, M = 50;
-  - (b) M = M_min from the guard;
+  - (b) M = M_min from the guard (➕ the operator-based guard of Task 0.4: 40 at χ = 0.1, 48 at χ = 0.25 on CORE2
+    at Δt 1800 s);
   - (c) `se_visc_ah = 0`;
   - (d) zstar headline
 - [ ] per screen, record: max|η| over time, cold-start peak, max CFL_z, max|uv|, divsum, SE_CHECK, NaN. Decide
@@ -890,12 +964,13 @@ sbatch at a time or in a short chain; each wait is a background `sacct` watcher.
     diagnostic patch `dbg_src_dbg1.diff`, all in `/work/ab0995/a270088/fesom3_se_ref/jobs/`) gives the observed pattern: χ = 0.1, M = 50: +0.9 %/step at ωτ = 2.2 (observed 2.1); `se_visc_ah`
     = 0: +1.4 %; M = 100: +1.5 %; χ = 0.25: +0.07 %; `se_visc_ah` = 0.1: −0.02 %. port_kokkos M12 recorded the same
     Antarctic-shelf death at χ = 0.05 with zstar and the flow-dependent Zenodo viscosity.
-  - **Remedies for Nikolay to choose (none applied):**
+  - **Remedies for Nikolay to choose (none applied; (A) since done as a guard fix, ➕ Task 0.4):**
     - (A) guard: compute ω_max in se_init by power iteration (≤ 50 iterations of the 2-D operator on CORE2) and set
       M_min = ⌈τ·ω_max/(s·a_crit(χ))⌉ with a_crit from the polynomial above and a safety s < 1 (s = 0.9 gives
       M_min = 40 / 48 at χ = 0.1 / 0.25); or keep the res-based bound with a smaller factor: on CORE2 the true limit
       is 0.48 (χ = 0.1) / 0.40 (χ = 0.25) / 0.56 (χ = 0) instead of 0.5, but the ratio is mesh-dependent. Screen
-      (b) "M = M_min from the guard" needs the corrected M_min.
+      (b) "M = M_min from the guard" needs the corrected M_min. ✅ Done as ➕ Task 0.4 (100 power iterations,
+      Schur–Cohn a_crit, s = 0.9: M_min 40 / 48 on CORE2; M = 35 now stops in se_init).
     - (B1) χ = 0.25: measured stable (480 steps np 8 and np 128, noise decays); lowers the substep limit (M ≥ 43 at
       Δt 1800 s; M = 50 has a 15 % margin) and damps the resolved fast waves more (max|η| 4.70 vs 4.74 m at step
       67 in R1).
@@ -993,7 +1068,8 @@ I is the inflow scatter (positive = convergence), the sign of `ssh_rhs_old`.
 
 ### 3. Communication per step
 2M small exchanges (η node, Ū element; the latter only with viscosity), one shared sync of F, and the existing sync
-and halo exchange of uv. No global reductions outside SE_CHECK and the one-off CFL guard.
+and halo exchange of uv. No global reductions outside SE_CHECK and the one-off CFL guard (➕ Task 0.4: in `se_init`,
+100 power iterations with one allreduce sum and one `exchange_nod` each).
 
 ### 4. Knobs (env only)
 

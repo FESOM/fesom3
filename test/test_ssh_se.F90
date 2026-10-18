@@ -11,11 +11,27 @@ program test_ssh_se
     !   C2  knob parsing (se_parse_knob): every bad value is rejected (ok = .false., the t_dyn
     !       field unchanged, the message starts with the knob name); se_read_env and
     !       se_env_requested stop on exactly these. Good values land in t_dyn.
-    !   C3  the CFL guard: the substep limit is finite, equals the MIN over the ranks of an
-    !       independent per-rank recomputation, and limit and M_min are identical on every rank
-    !       (MIN == MAX over the ranks); tau/M_min <= limit < tau/(M_min - 1); pi has M_min > 1,
-    !       so the decision for M = 1 is a real test: SE_CFL_DIE, SE_CFL_FORCED with
-    !       FESOM3_SE_M_FORCE, SE_CFL_OK for M_min, SE_CFL_DIE for M_min - 1.
+    !   C3  the CFL guard (plan Task 0.4; runs after C4, the operator reads helem):
+    !       a) a_crit(chi) = 1.853 / 1.579 / 1.329 at chi = 0 / 0.1 / 0.25 to 1e-3 (the numpy root
+    !          finder of plan Task 5.1); se_cfl_stable flips between 0.999 and 1.001 a_crit; the
+    !          spectral radius at 1.1 a_crit equals numpy's 2.186123 / 1.879877 / 1.700745 to
+    !          1e-5, at 0.9 a_crit it is < 1;
+    !       b) A (se_cfl_apply_a) is self-adjoint in the areasvol inner product, (u, A w)_W =
+    !          (A u, w)_W to 1e-12 of ||u||_W ||A w||_W, and (u, A u)_W > 0 for hashed u, w (so
+    !          the power-iteration value is a lower bound of omega_max);
+    !       c) omega_max (se_cfl_omega_max): finite, > 0, converged (last change < 1e-6), >= the
+    !          Rayleigh quotient sqrt of the hashed vectors, identical on every rank (MIN == MAX)
+    !          like M_min; np > 1 against the np 1 value (file FESOM3_TEST_SE_P4REF//'.c3', written
+    !          by np 1): omega_max to 1e-12 relative, M_min equal;
+    !       d) M_min = ceiling(tau*omega_max/(s*a_crit)): tau/M_min <= s*a_crit/omega_max <
+    !          tau/(M_min - 1), M_min > 1 on pi, and the decision: SE_CFL_DIE for M = 1 and
+    !          M_min - 1, SE_CFL_FORCED with FESOM3_SE_M_FORCE, SE_CFL_OK for M_min, 40 and 50;
+    !       e) EMPIRICAL, the real se_subcycle (F = 0, U = 0, eta = the power-iteration vector,
+    !          viscosity on, one call per baroclinic step) for chi = 0 / 0.1 / 0.25: at M = M_min
+    !          for 300 baroclinic steps and at omega_max*dtbt = 0.97 a_crit for 3000 substeps the
+    !          norm ||eta||_W does not grow (max over the last 10 calls <= the initial); at
+    !          omega_max*dtbt = 1.03 a_crit and 1.1 a_crit it grows by > 1e6, at 1.1 a_crit with a
+    !          rate per substep within 10 % of se_cfl_rho.
     !   C4  se_init under the ctest environment FESOM3_SSH_SE=1 FESOM3_SE_M=40: the knobs from
     !       the environment (M = 40; chi, visc_ah, check, force at their defaults), the
     !       coefficients in t_dyn, the state at the extents of the plan's Technical Details §1,
@@ -98,7 +114,8 @@ program test_ssh_se
     use oce_dyn_velrhs,   only: compute_vel_rhs
     use oce_dyn_visc,     only: viscosity_filter
     use oce_ssh_se,       only: se_env_requested, se_parse_knob, se_init, se_sm_coeffs, &
-                                se_cfl_dtbt_limit, se_cfl_m_min, se_cfl_decision, &
+                                se_cfl_m_min, se_cfl_decision, se_cfl_stable, se_cfl_rho, &
+                                se_cfl_acrit, se_cfl_apply_a, se_cfl_omega_max, SE_CFL_SAFETY, &
                                 SE_CFL_OK, SE_CFL_FORCED, SE_CFL_DIE, se_bt_forcing, &
                                 se_elem_depth, se_subcycle, se_inflow, se_visc, se_tendency, &
                                 se_trim_finish, se_check_values, se_check_line, SE_NCHK, &
@@ -118,8 +135,8 @@ program test_ssh_se
 
     call c1_coefficients()
     call c2_parsing()
-    call c3_cfl_guard()
     call c4_se_init()
+    call c3_cfl_guard()           ! after C4: the operator reads helem
     call c5_forcing_pressure()
     call c6_forcing_coriolis()
     call c7_consistency()
@@ -212,43 +229,217 @@ contains
     end subroutine good
 
     subroutine c3_cfl_guard()
-        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, n, ierr, mm(2)
-        real(kind=WP) :: lim, mine, H, ll(2)
-        lim   = se_cfl_dtbt_limit(mesh, partit)
-        M_min = se_cfl_m_min(dt, lim)
-        call check(lim > 0.0_WP .and. lim < huge(1.0_WP), 'C3 the substep limit is finite', partit%mype)
-        ! independent recomputation on this rank's owned surface nodes, then MIN over the ranks
+        type(t_dyn) :: dbase
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, n, ic, ierr, mm(2), Mc, u_, ios
+        integer :: hdr(2), hdr_ref(2), mref
+        real(kind=WP), parameter :: CHIS(3)  = [0.0_WP, 0.1_WP, 0.25_WP]
+        real(kind=WP), parameter :: ACREF(3) = [1.853_WP, 1.579_WP, 1.329_WP]       ! plan Task 5.1
+        real(kind=WP), parameter :: RHO11(3) = [2.186123_WP, 1.879877_WP, 1.700745_WP] ! numpy roots
+        real(kind=WP) :: ac(3), rho, omega, relchg, acd, lim, ll(2), sm(7), vmax, oref
+        real(kind=WP) :: rl(4), re(4), rate(4)
+        real(kind=WP), allocatable :: v(:), u(:), w(:), Au(:), Aw(:), Uw(:,:), infl(:)
+        character(len=8)   :: cs
+        character(len=512) :: path
         call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
-        mine = huge(1.0_WP)
-        do n = 1, nNodO
-            if (mesh%nlevels_nod2D(n) < 2) cycle
-            H = -mesh%zbar(mesh%nlevels_nod2D(n))            ! pi: no cavity, zbar(1) = 0
-            mine = min(mine, real(0.5_WP*mesh%mesh_resolution(n)/sqrt(g*H), WP))
+
+        ! ---- a) a_crit and the spectral radius of the scalar recurrence ----
+        do ic = 1, 3
+            write(cs, '(f4.2)') CHIS(ic)
+            ac(ic) = se_cfl_acrit(CHIS(ic))
+            call check(abs(ac(ic) - ACREF(ic)) <= 1.0e-3_WP, 'C3a chi = '//trim(cs)//': a_crit to 1e-3', partit%mype)
+            call check(se_cfl_stable(0.999_WP*ac(ic), CHIS(ic), 1.0_WP) .and. &
+                       .not. se_cfl_stable(1.001_WP*ac(ic), CHIS(ic), 1.0_WP), &
+                       'C3a chi = '//trim(cs)//': stable at 0.999 a_crit, not at 1.001 a_crit', partit%mype)
+            rho = se_cfl_rho(1.1_WP*ac(ic), CHIS(ic))
+            call check(abs(rho - RHO11(ic)) <= 1.0e-5_WP, 'C3a chi = '//trim(cs)//': radius at 1.1 a_crit = numpy', &
+                       partit%mype)
+            call check(se_cfl_rho(0.9_WP*ac(ic), CHIS(ic)) < 1.0_WP, 'C3a chi = '//trim(cs)//': radius at 0.9 a_crit < 1', &
+                       partit%mype)
+            if (partit%mype == 0) write(*,'(a,a,a,f10.7,a,f9.6,a,f9.6)') 'test_ssh_se: C3a chi = ', trim(cs), &
+                ': a_crit = ', ac(ic), ', radius at 0.9 a_crit ', se_cfl_rho(0.9_WP*ac(ic), CHIS(ic)), &
+                ', at 1.1 a_crit ', rho
         end do
-        call MPI_Allreduce(MPI_IN_PLACE, mine, 1, MPI_WP, MPI_MIN, partit%MPI_COMM_FESOM, ierr)
-        call check(mine == lim, 'C3 limit == MIN over the ranks of 0.5*res/sqrt(g*H)', partit%mype)
-        ! the same on every rank
-        ll = [lim, -lim]
+
+        ! ---- b) A is W-self-adjoint and >= 0 ----
+        call new_dyn(dbase)
+        call se_init(dbase, mesh, partit, dt)
+        call se_elem_depth(dbase, mesh, partit)
+        allocate(v(nNodL), u(nNodL), w(nNodL), Au(nNodL), Aw(nNodL), Uw(2, nElemL), infl(nNodL))
+        v = 0.0_WP; Au = 0.0_WP; Aw = 0.0_WP; Uw = 0.0_WP; infl = 0.0_WP
+        do n = 1, nNodL
+            u(n) = hval(partit%myList_nod2D(n), 41)
+            w(n) = hval(partit%myList_nod2D(n), 42)
+        end do
+        call se_cfl_apply_a(mesh, partit, dbase%se_H, u, Uw, infl, Au)
+        call se_cfl_apply_a(mesh, partit, dbase%se_H, w, Uw, infl, Aw)
+        sm = 0.0_WP
+        do n = 1, nNodO
+            sm(1) = sm(1) + mesh%areasvol(n)*u(n)*Aw(n)
+            sm(2) = sm(2) + mesh%areasvol(n)*Au(n)*w(n)
+            sm(3) = sm(3) + mesh%areasvol(n)*u(n)*Au(n)
+            sm(4) = sm(4) + mesh%areasvol(n)*w(n)*Aw(n)
+            sm(5) = sm(5) + mesh%areasvol(n)*u(n)*u(n)
+            sm(6) = sm(6) + mesh%areasvol(n)*w(n)*w(n)
+            sm(7) = sm(7) + mesh%areasvol(n)*Aw(n)*Aw(n)
+        end do
+        call sum_all(sm, partit)
+        call check(abs(sm(1) - sm(2)) <= 1.0e-12_WP*sqrt(sm(5)*sm(7)), &
+                   'C3b (u, A w)_W = (A u, w)_W (A self-adjoint)', partit%mype)
+        call check(sm(3) > 0.0_WP .and. sm(4) > 0.0_WP, 'C3b (u, A u)_W > 0', partit%mype)
+        if (partit%mype == 0) write(*,'(a,es10.3,a)') 'test_ssh_se: C3b |(u,Aw) - (Au,w)| = ', &
+            abs(sm(1) - sm(2))/sqrt(sm(5)*sm(7)), ' of ||u|| ||Aw||'
+
+        ! ---- c) omega_max ----
+        call se_cfl_omega_max(mesh, partit, omega, relchg, v)
+        call check(omega > 0.0_WP .and. omega < huge(1.0_WP), 'C3c omega_max finite and > 0', partit%mype)
+        call check(relchg < 1.0e-6_WP, 'C3c power iteration converged (last change < 1e-6)', partit%mype)
+        call check(omega**2 >= max(sm(3)/sm(5), sm(4)/sm(6)), 'C3c omega_max^2 >= Rayleigh quotients', partit%mype)
+        ll = [omega, -omega]
         call MPI_Allreduce(MPI_IN_PLACE, ll, 2, MPI_WP, MPI_MAX, partit%MPI_COMM_FESOM, ierr)
-        call check(ll(1) == lim .and. -ll(2) == lim, 'C3 limit identical on every rank', partit%mype)
+        call check(ll(1) == omega .and. -ll(2) == omega, 'C3c omega_max identical on every rank', partit%mype)
+
+        ! ---- d) M_min and the decision (chi = 0.1, the se_init default) ----
+        call check(dbase%se_chi == 0.1_WP, 'C3d chi = 0.1 (the default)', partit%mype)
+        acd   = se_cfl_acrit(dbase%se_chi)
+        lim   = SE_CFL_SAFETY*acd/omega
+        M_min = se_cfl_m_min(dt, lim)
         mm = [M_min, -M_min]
         call MPI_Allreduce(MPI_IN_PLACE, mm, 2, MPI_INTEGER, MPI_MAX, partit%MPI_COMM_FESOM, ierr)
-        call check(mm(1) == M_min .and. -mm(2) == M_min, 'C3 M_min identical on every rank', partit%mype)
-        ! M_min is the fewest admissible substeps
-        call check(dt/real(M_min, WP) <= lim, 'C3 tau/M_min <= limit', partit%mype)
-        call check(M_min > 1, 'C3 pi M_min > 1 (M = 1 is below the guard)', partit%mype)
-        if (M_min > 1) call check(dt/real(M_min - 1, WP) > lim, 'C3 tau/(M_min-1) > limit', partit%mype)
-        ! the decision
-        call check(se_cfl_decision(1, M_min, .false.) == SE_CFL_DIE,    'C3 M = 1: the guard fires', partit%mype)
-        call check(se_cfl_decision(1, M_min, .true.)  == SE_CFL_FORCED, 'C3 M = 1 + FORCE: warn and run', partit%mype)
-        call check(se_cfl_decision(M_min - 1, M_min, .false.) == SE_CFL_DIE, 'C3 M = M_min-1 fires', partit%mype)
-        call check(se_cfl_decision(M_min, M_min, .false.) == SE_CFL_OK,  'C3 M = M_min passes', partit%mype)
+        call check(mm(1) == M_min .and. -mm(2) == M_min, 'C3d M_min identical on every rank', partit%mype)
+        call check(M_min == ceiling(dt*omega/(SE_CFL_SAFETY*acd)) .or. &
+                   abs(dt*omega/(SE_CFL_SAFETY*acd) - nint(dt*omega/(SE_CFL_SAFETY*acd))) < 1.0e-9_WP, &
+                   'C3d M_min = ceiling(tau*omega_max/(s*a_crit))', partit%mype)
+        call check(dt/real(M_min, WP) <= lim, 'C3d tau/M_min <= s*a_crit/omega_max', partit%mype)
+        call check(M_min > 1, 'C3d pi M_min > 1 (M = 1 is below the guard)', partit%mype)
+        if (M_min > 1) call check(dt/real(M_min - 1, WP) > lim, 'C3d tau/(M_min-1) > s*a_crit/omega_max', &
+                                  partit%mype)
+        call check(se_cfl_decision(1, M_min, .false.) == SE_CFL_DIE,    'C3d M = 1: the guard fires', partit%mype)
+        call check(se_cfl_decision(1, M_min, .true.)  == SE_CFL_FORCED, 'C3d M = 1 + FORCE: warn and run', partit%mype)
+        call check(se_cfl_decision(M_min - 1, M_min, .false.) == SE_CFL_DIE, 'C3d M = M_min-1 fires', partit%mype)
+        call check(se_cfl_decision(M_min, M_min, .false.) == SE_CFL_OK,  'C3d M = M_min passes', partit%mype)
+        call check(se_cfl_decision(40, M_min, .false.) == SE_CFL_OK, &
+                   'C3d M = 40 (the ctest environment) passes on pi', partit%mype)
         call check(se_cfl_decision(50, M_min, .false.) == SE_CFL_OK, &
-                   'C3 M = 50 (the default) passes on pi', partit%mype)
-        call check(se_cfl_m_min(dt, huge(1.0_WP)) == 1, 'C3 no limit: M_min = 1', partit%mype)
-        if (partit%mype == 0) write(*,'(a,f0.1,a,f0.3,a,i0)') 'test_ssh_se: pi, tau = ', dt, &
-            ' s: substep limit = ', lim, ' s, M_min = ', M_min
+                   'C3d M = 50 (the default) passes on pi', partit%mype)
+        call check(se_cfl_m_min(dt, huge(1.0_WP)) == 1, 'C3d no limit: M_min = 1', partit%mype)
+        if (partit%mype == 0) write(*,'(a,f0.1,a,es14.7,a,es8.1,a,f6.4,a,f4.2,a,f0.3,a,i0)') &
+            'test_ssh_se: C3 pi, tau = ', dt, ' s: omega_max = ', omega, ' 1/s (last change ', relchg, &
+            '), a_crit(0.1) = ', acd, ', s = ', SE_CFL_SAFETY, ' -> dtbt <= ', lim, ' s, M_min = ', M_min
+
+        ! ---- c) np > 1 against np 1 (the file next to the P4 reference) ----
+        path = ''
+        call get_environment_variable('FESOM3_TEST_SE_P4REF', path, status=ios)
+        if (ios /= 0 .or. len_trim(path) == 0) then
+            if (partit%mype == 0) write(*,'(a)') 'test_ssh_se: C3c np 1 reference skipped (FESOM3_TEST_SE_P4REF unset)'
+        else if (partit%mype == 0) then
+            path = trim(path)//'.c3'
+            hdr  = [mesh%nod2D, mesh%elem2D]
+            if (partit%npes == 1) then
+                open(newunit=u_, file=trim(path), access='stream', form='unformatted', status='replace', &
+                     action='write', iostat=ios)
+                if (ios == 0) write(u_, iostat=ios) hdr, omega, M_min
+                if (ios == 0) close(u_)
+                call check(ios == 0, 'C3c np 1 writes the reference '//trim(path), partit%mype)
+            else
+                hdr_ref = -1; oref = -1.0_WP; mref = -1
+                open(newunit=u_, file=trim(path), access='stream', form='unformatted', status='old', &
+                     action='read', iostat=ios)
+                if (ios == 0) read(u_, iostat=ios) hdr_ref, oref, mref
+                if (ios == 0) close(u_)
+                call check(ios == 0 .and. all(hdr_ref == hdr), 'C3c the np 1 reference '//trim(path)// &
+                           ' exists and matches', partit%mype)
+                call check(abs(omega - oref) <= 1.0e-12_WP*oref, 'C3c omega_max == np 1 to 1e-12', partit%mype)
+                call check(M_min == mref, 'C3c M_min == np 1', partit%mype)
+                write(*,'(a,i0,a,es10.3,a,i0,a,i0)') 'test_ssh_se: C3c np ', partit%npes, &
+                    ' vs np 1: omega_max relative difference ', abs(omega - oref)/oref, ', M_min ', M_min, &
+                    ' vs ', mref
+            end if
+        end if
+
+        ! ---- e) the real substeps from the power-iteration vector ----
+        vmax = maxval(abs(v(1:nNodO)))
+        call max_all(vmax, partit)
+        v = v/vmax
+        do ic = 1, 3
+            write(cs, '(f4.2)') CHIS(ic)
+            Mc = se_cfl_m_min(dt, SE_CFL_SAFETY*ac(ic)/omega)
+            call c3_run(dbase, v, dt/real(Mc, WP), Mc, 300*Mc, CHIS(ic), rl(1), re(1), rate(1))
+            call c3_run(dbase, v, 0.97_WP*ac(ic)/omega, 10, 3000, CHIS(ic), rl(2), re(2), rate(2))
+            call c3_run(dbase, v, 1.03_WP*ac(ic)/omega, 4, 3000, CHIS(ic), rl(3), re(3), rate(3))
+            call c3_run(dbase, v, 1.1_WP*ac(ic)/omega, 4, 3000, CHIS(ic), rl(4), re(4), rate(4))
+            rho = se_cfl_rho(1.1_WP*ac(ic), CHIS(ic))
+            call check(rl(1) <= 1.0_WP, 'C3e chi = '//trim(cs)//': M = M_min does not grow (300 steps)', partit%mype)
+            call check(rl(2) <= 1.0_WP, 'C3e chi = '//trim(cs)//': 0.97 a_crit does not grow', partit%mype)
+            call check(re(3) > 1.0e6_WP, 'C3e chi = '//trim(cs)//': 1.03 a_crit grows', partit%mype)
+            call check(re(4) > 1.0e6_WP, 'C3e chi = '//trim(cs)//': 1.1 a_crit grows', partit%mype)
+            call check(abs(rate(4)/rho - 1.0_WP) <= 0.1_WP, &
+                       'C3e chi = '//trim(cs)//': growth at 1.1 a_crit = se_cfl_rho within 10 %', partit%mype)
+            if (partit%mype == 0) then
+                write(*,'(a,a,a,i0,a,f6.4,a,es9.2,a,es9.2,a,f7.4)') 'test_ssh_se: C3e chi = ', trim(cs), &
+                    ': M_min = ', Mc, ' (omega*dtbt/a_crit = ', omega*dt/real(Mc, WP)/ac(ic), &
+                    '): ||eta|| last/0 = ', rl(1), '; 0.97 a_crit: ', rl(2), ', rate ', rate(2)
+                write(*,'(a,a,a,es9.2,a,f7.4,a,es9.2,a,f7.4,a,f7.4)') 'test_ssh_se: C3e chi = ', trim(cs), &
+                    ': 1.03 a_crit: end/0 = ', re(3), ', rate ', rate(3), '; 1.1 a_crit: end/0 = ', re(4), &
+                    ', rate ', rate(4), ' (se_cfl_rho ', rho
+            end if
+        end do
+        deallocate(v, u, w, Au, Aw, Uw, infl)
     end subroutine c3_cfl_guard
+
+    subroutine c3_run(dbase, v, dtbt, ch, nsub, chi, rlast, rend, rate)
+        ! C3e: the real se_subcycle from eta = v (all three ring levels), U = 0, F = 0, chi, at the
+        ! substep dtbt, ch substeps per call; between the calls eta_n <- eta^M and U^n <- U^M, as a
+        ! baroclinic step leaves them. At most nsub substeps, or until ||eta||_W exceeds 1e12 of
+        ! the start. rlast = max ||eta||_W over the last 10 calls / the start, rend = the last /
+        ! the start, rate = the growth per substep over the last 3 calls.
+        type(t_dyn),   intent(in)  :: dbase
+        real(kind=WP), intent(in)  :: v(:), dtbt, chi
+        integer,       intent(in)  :: ch, nsub
+        real(kind=WP), intent(out) :: rlast, rend, rate
+        type(t_dyn) :: d
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, n, k, kmax, j
+        real(kind=WP), allocatable :: hist(:)
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        d = dbase
+        d%se_chi = chi
+        call se_sm_coeffs(chi, d%se_beta, d%se_zeta, d%se_gamma, d%se_delta)
+        d%se_force = 0.0_WP; d%se_ubt = 0.0_WP; d%se_ubtn = 0.0_WP
+        do n = 1, nNodL
+            d%eta_n(n) = v(n); d%se_eta(n, 1) = v(n); d%se_eta(n, 2) = v(n)
+        end do
+        d%se_M = ch
+        kmax = max(1, nsub/ch)
+        allocate(hist(0:kmax))
+        hist = 0.0_WP
+        hist(0) = c3_wnorm(d%eta_n)
+        do k = 1, kmax
+            call se_subcycle(d, mesh, partit, real(ch, WP)*dtbt)
+            d%eta_n(1:nNodL) = d%se_etam(1:nNodL)
+            d%se_ubtn = d%se_ubt(:, :, 0)
+            hist(k) = c3_wnorm(d%se_etam)
+            if (.not. (hist(k) <= 1.0e12_WP*hist(0))) exit
+        end do
+        k = min(k, kmax)
+        rlast = maxval(hist(max(1, k-9):k))/hist(0)
+        rend  = hist(k)/hist(0)
+        j     = min(3, k)
+        rate  = (hist(k)/hist(k-j))**(1.0_WP/real(ch*j, WP))
+        deallocate(hist)
+    end subroutine c3_run
+
+    real(kind=WP) function c3_wnorm(x)
+        ! ||x||_W = sqrt(sum areasvol*x^2) over the owned nodes, reduced
+        real(kind=WP), intent(in) :: x(:)
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, i
+        real(kind=WP) :: s
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        s = 0.0_WP
+        do i = 1, nNodO
+            s = s + mesh%areasvol(i)*x(i)*x(i)
+        end do
+        call sum_all(s, partit)
+        c3_wnorm = sqrt(s)
+    end function c3_wnorm
 
     subroutine c4_se_init()
         type(t_dyn) :: dyn

@@ -46,18 +46,34 @@ module oce_ssh_se
     ! are read only when FESOM3_SSH_SE=1. SE is SILENT when off: run_conserve_pi.sh and
     ! run_tri_regression.sh parse fixed output lines.
     !
-    ! CFL GUARD (port_kokkos src/fesom_ssh_se.cpp:255-296): the substep must resolve the fastest
-    ! external gravity wave, dtbt <= 0.5*mesh_resolution/sqrt(g*H) at every owned surface node,
-    ! H the resting depth of the vertex column. The limit is MIN-reduced over the ranks, so
-    ! M_min = ceiling(tau/limit) is the same on every rank. 0.5 is a conservative safety factor
-    ! for the stability bound, not a calibrated number (port_kokkos, CORE2 dt 1800 s: M_min 35).
+    ! CFL GUARD (plan Task 0.4), from the substeps' own operator. Every gravity mode psi of the
+    ! linear 2-D system, A psi = omega^2 psi with A eta = -I(H^n (-g grad eta))/areasvol
+    ! (se_cfl_apply_a: the inflow and the gradient of se_subcycle / se_tendency), is a scalar
+    ! oscillator that the AB3-AM4 substeps advance stably iff a = omega*dtbt < a_crit(chi), the
+    ! limit of the weights of se_sm_coeffs (se_cfl_stable, se_cfl_acrit: 1.853 / 1.579 / 1.329
+    ! at chi = 0 / 0.1 / 0.25). se_init takes omega_max from SE_CFL_NIT power iterations of A
+    ! (se_cfl_omega_max; allreduce sums, so it is the same on every rank) and sets
+    !     M_min = ceiling(tau/dtbt_max),  dtbt_max = s*a_crit(chi)/omega_max,  s = SE_CFL_SAFETY
+    ! s = 0.9 covers what the scalar test does not see: the power-iteration value is a LOWER
+    ! bound of omega_max (on CORE2 and pi it reaches a fixed point, last change 0; without any
+    ! spectral gap, 100 iterations from a generic start on N nodes still miss omega_max by only
+    ! about ln(N)/400, < 5 % for N up to 1e8), and Coriolis (f << omega_max), the BT viscosity
+    ! and, under zstar, H(eta) shift the limit by well under 1 %. The margin need not buy
+    ! damping: at 0.9 a_crit the fastest mode still decays (spectral radius 0.88 / 0.68 / 0.57
+    ! per substep at chi = 0 / 0.1 / 0.25), and the scheme turns unstable abruptly just above
+    ! a_crit (1.88 per substep at 1.1 a_crit, chi = 0.1). s >= 0.854 keeps the default M = 50
+    ! admissible at chi = 0.25 on CORE2. CORE2, dt 1800 s: omega_max = 3.1518e-2 1/s, M_min =
+    ! 40 at chi = 0.1, 48 at chi = 0.25. The earlier res-based bound of port_kokkos
+    ! (fesom_ssh_se.cpp:255-296), dtbt <= 0.5*res/sqrt(g*H), is not a stability limit:
+    ! omega_max*res/c is mesh-dependent (3.29 at the CORE2 trenches), and its M_min = 35 blew up
+    ! at step 5 at chi = 0.1 (plan Task 5.1 note).
     !
     ! The parsers (se_parse_knob) and the guard decision (se_cfl_decision) return their verdict
     ! instead of stopping, so test/test_ssh_se.F90 checks every rejection; the driver-facing
     ! wrappers (se_env_requested, se_read_env, se_init, se_step_guard) stop through se_die
     ! (MPI_Abort, so no rank is left waiting in a collective).
     use mpi
-    use, intrinsic :: iso_fortran_env, only: output_unit
+    use, intrinsic :: iso_fortran_env, only: output_unit, int64
     use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
     use mod_precision,   only: WP, MPI_WP
     use mod_constants,   only: g, r_earth
@@ -77,7 +93,9 @@ module oce_ssh_se
     public :: se_elem_depth, se_bt_forcing, se_subcycle, se_trim_finish
     public :: se_check_core, se_check_values, se_check_line, se_check_tail
     public :: se_inflow, se_visc, se_tendency, se_depth_at, se_kappa_build
-    public :: se_sm_coeffs, se_cfl_dtbt_limit, se_cfl_m_min, se_cfl_decision
+    public :: se_sm_coeffs, se_cfl_m_min, se_cfl_decision
+    public :: se_cfl_stable, se_cfl_rho, se_cfl_acrit, se_cfl_apply_a, se_cfl_omega_max, &
+              SE_CFL_SAFETY, SE_CFL_NIT
     public :: SE_CFL_OK, SE_CFL_FORCED, SE_CFL_DIE
     public :: SE_NCHK, SE_CHK_ETACOMP, SE_CHK_TRIM, SE_CHK_MSL, SE_CHK_SPREADU, SE_CHK_SPREADUM, &
               SE_CHK_MAXETA, SE_CHK_MAXU, SE_CHK_NBAD
@@ -86,6 +104,9 @@ module oce_ssh_se
     integer, parameter :: SE_CFL_OK     = 0   ! M >= M_min
     integer, parameter :: SE_CFL_FORCED = 1   ! M <  M_min, FESOM3_SE_M_FORCE=1: warn and run
     integer, parameter :: SE_CFL_DIE    = 2   ! M <  M_min: stop
+    ! the CFL guard: safety factor s on a_crit/omega_max, power iterations for omega_max
+    real(kind=WP), parameter :: SE_CFL_SAFETY = 0.9_WP
+    integer,       parameter :: SE_CFL_NIT    = 100
 
     ! FESOM3_SE_CHECK: the entries of se_check_values' vals (meaning there)
     integer, parameter :: SE_NCHK = 8
@@ -207,33 +228,231 @@ contains
     end subroutine se_sm_coeffs
 
     !===========================================================================
-    function se_cfl_dtbt_limit(mesh, partit) result(lim)
-        ! The largest admissible substep: min over the OWNED surface nodes of
-        ! 0.5*mesh_resolution/sqrt(g*H), H = zbar(ulevels_nod2D) - zbar(nlevels_nod2D) the
-        ! resting depth of the vertex column (the vertex bottom is authoritative), MIN-reduced
-        ! over all ranks -- identical everywhere. huge() if no rank owns a wet surface node.
-        ! Collective at npes > 1.
-        type(t_mesh),   intent(in) :: mesh
-        type(t_partit), intent(in) :: partit
-        real(kind=WP) :: lim
-        integer       :: n, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, ierr
-        real(kind=WP) :: H
+    pure subroutine se_cfl_poly(a, chi, c)
+        ! The characteristic polynomial c(0) + c(1) z + ... + c(6) z^6 of the substeps for one
+        ! gravity mode, a = omega*dtbt (se_cfl_stable). The weights of se_sm_coeffs, formed as in
+        ! se_subcycle: AB3 (w0, w1, w2), AM4 (d3 on eta^{m+1}, d0, d1, d2 on eta^{m-2}).
+        real(kind=WP), intent(in)  :: a, chi
+        real(kind=WP), intent(out) :: c(0:6)
+        real(kind=WP) :: b, ze, ga, de, w0, w1, w2, d0, d1, d2, d3, a2
+        call se_sm_coeffs(chi, b, ze, ga, de)
+        w0 =  1.5_WP + b
+        w1 = -(0.5_WP + 2.0_WP*b)
+        w2 =  b
+        d3 =  de
+        d0 =  1.0_WP - de - ga - ze
+        d1 =  ga
+        d2 =  ze
+        a2 = a*a
+        ! z^4 (z-1)^2 + a^2 (w0 z^2 + w1 z + w2)(d3 z^3 + d0 z^2 + d1 z + d2)
+        c(0) = a2*(w2*d2)
+        c(1) = a2*(w1*d2 + w2*d1)
+        c(2) = a2*(w0*d2 + w1*d1 + w2*d0)
+        c(3) = a2*(w0*d1 + w1*d0 + w2*d3)
+        c(4) = a2*(w0*d0 + w1*d3) + 1.0_WP
+        c(5) = a2*(w0*d3) - 2.0_WP
+        c(6) = 1.0_WP
+    end subroutine se_cfl_poly
+
+    !===========================================================================
+    pure logical function se_cfl_stable(a, chi, r)
+        ! .true. when every root of the substeps' characteristic polynomial lies in |z| < r. The
+        ! scalar test: one gravity mode psi of the 2-D system (A psi = omega^2 psi, se_cfl_apply_a;
+        ! eta = alpha psi, U = beta H(-g grad psi)/omega) obeys alpha' = -omega beta, beta' =
+        ! omega alpha, and se_subcycle with F = 0, f = 0 and no viscosity advances it as
+        !     beta*     = w0 beta^m + w1 beta^{m-1} + w2 beta^{m-2}                       (AB3)
+        !     alpha^{m+1} = alpha^m - a beta*,                       a = omega*dtbt
+        !     alpha^A   = d3 alpha^{m+1} + d0 alpha^m + d1 alpha^{m-1} + d2 alpha^{m-2}     (AM4)
+        !     beta^{m+1} = beta^m + a alpha^A
+        ! so (alpha, beta) ~ z^m with p(z) = z^4 (z-1)^2 + a^2 (w0 z^2 + w1 z + w2)(d3 z^3 + d0 z^2
+        ! + d1 z + d2) = 0 (se_cfl_poly). The roots of p(r z) are those of p divided by r, and
+        ! p(r z) has all its roots in |z| < 1 iff the Schur-Cohn recursion passes: a real
+        ! c_0 + ... + c_n z^n with |c_0| < |c_n| has all roots inside iff q(z) = (c_n p(z) -
+        ! c_0 z^n p(1/z))/z, of degree n-1, has (Rouche on |z| = 1; q_k = c_n c_{k+1} -
+        ! c_0 c_{n-1-k}); |c_0| >= |c_n| means |product of the roots| >= 1. No root finder.
+        real(kind=WP), intent(in) :: a, chi, r
+        real(kind=WP) :: c(0:6), q(0:5), rk
+        integer       :: k, n
+        call se_cfl_poly(a, chi, c)
+        rk = 1.0_WP
+        do k = 0, 6
+            c(k) = c(k)*rk
+            rk   = rk*r
+        end do
+        se_cfl_stable = .false.
+        do n = 6, 1, -1
+            if (.not. (abs(c(0)) < abs(c(n)))) return
+            do k = 0, n - 1
+                q(k) = c(n)*c(k+1) - c(0)*c(n-1-k)
+            end do
+            c(0:n-1) = q(0:n-1)/q(n-1)            ! leading coefficient c_n^2 - c_0^2 > 0
+        end do
+        se_cfl_stable = .true.
+    end function se_cfl_stable
+
+    !===========================================================================
+    pure real(kind=WP) function se_cfl_rho(a, chi)
+        ! The spectral radius max|z| of the substep recurrence of se_cfl_stable, the growth factor
+        ! per substep of a gravity mode with a = omega*dtbt. Bisection on r with se_cfl_stable
+        ! between 0 and twice the Cauchy bound 1 + max_k |c_k| (c_6 = 1), 64 halvings.
+        real(kind=WP), intent(in) :: a, chi
+        real(kind=WP) :: c(0:6), lo, hi, mid
+        integer       :: it
+        call se_cfl_poly(a, chi, c)
+        lo = 0.0_WP
+        hi = 2.0_WP*(1.0_WP + maxval(abs(c(0:5))))
+        do it = 1, 64
+            mid = 0.5_WP*(lo + hi)
+            if (se_cfl_stable(a, chi, mid)) then
+                hi = mid
+            else
+                lo = mid
+            end if
+        end do
+        se_cfl_rho = hi
+    end function se_cfl_rho
+
+    !===========================================================================
+    pure real(kind=WP) function se_cfl_acrit(chi)
+        ! a_crit(chi): the substeps are stable for omega*dtbt < a_crit, i.e. the first a at which
+        ! a root reaches |z| = 1 (se_cfl_stable with r = 1). A scan in steps of 0.005 from a = 0.5,
+        ! then 60 bisections. Every chi in [0, 0.25] is stable on (0, 0.5] (radius 1 - O(a^2..a^4)
+        ! at small a, 0.95 / 0.90 / 0.87 at a = 0.5 for chi = 0 / 0.1 / 0.25), and the step is
+        ! far below the width of the stable range. 1.853 / 1.579 / 1.329 at chi = 0 / 0.1 / 0.25,
+        ! the values of the root finder in plan Task 5.1 (test_ssh_se C3). 4 if none below 4.
+        real(kind=WP), intent(in) :: chi
+        real(kind=WP), parameter :: A0 = 0.5_WP, DA = 0.005_WP, AMAX = 4.0_WP
+        real(kind=WP) :: lo, hi, mid
+        integer       :: k, it
+        hi = AMAX
+        do k = 1, nint((AMAX - A0)/DA)
+            if (.not. se_cfl_stable(A0 + real(k, WP)*DA, chi, 1.0_WP)) then
+                hi = A0 + real(k, WP)*DA
+                exit
+            end if
+        end do
+        lo = hi - DA
+        if (hi >= AMAX) lo = AMAX
+        do it = 1, 60
+            mid = 0.5_WP*(lo + hi)
+            if (se_cfl_stable(mid, chi, 1.0_WP)) then
+                lo = mid
+            else
+                hi = mid
+            end if
+        end do
+        se_cfl_acrit = lo
+    end function se_cfl_acrit
+
+    !===========================================================================
+    subroutine se_cfl_apply_a(mesh, partit, H, v, U, inflow, Av)
+        ! Av = A v = -I(H (-g grad v))/areasvol on the OWNED nodes: the linear gravity-wave
+        ! operator of the substeps, eta_tt = -A eta for eta_t = I(U)/areasvol, U_t = H (-g grad
+        ! eta) (se_subcycle without F, Coriolis and viscosity; grad through gradient_sca exactly
+        ! as se_tendency, I = se_inflow). I is minus the transpose of the element gradient (the
+        ! median-dual flux), so areasvol*A = g G^T H G: A is self-adjoint in the areasvol-weighted
+        ! inner product and >= 0 (test_ssh_se C3). v on owned + halo nodes, H on the owned
+        ! elements; U (2, >= nElemL) and inflow (>= nNodL) are work arrays.
+        type(t_mesh),   intent(in)    :: mesh
+        type(t_partit), intent(in)    :: partit
+        real(kind=WP),  intent(in)    :: H(:)          ! (>= nElemO)
+        real(kind=WP),  intent(in)    :: v(:)          ! (nNodL)
+        real(kind=WP),  intent(inout) :: U(:,:)        ! (2, >= nElemL) work
+        real(kind=WP),  intent(inout) :: inflow(:)     ! (>= nNodL) work
+        real(kind=WP),  intent(inout) :: Av(:)         ! (>= nNodO) out on the owned nodes
+        integer       :: e, n, elnodes(MAX_NV)
+        integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
+        real(kind=WP) :: pre(MAX_NV)
 
         call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
-        lim = huge(1.0_WP)
-        do n = 1, nNodO
-            if (mesh%ulevels_nod2D(n) /= 1 .or. mesh%nlevels_nod2D(n) < 2) cycle
-            H = mesh%zbar(mesh%ulevels_nod2D(n)) - mesh%zbar(mesh%nlevels_nod2D(n))
-            if (.not. (H > 0.0_WP)) cycle
-            lim = min(lim, real(0.5_WP*mesh%mesh_resolution(n)/sqrt(g*H), WP))
+        do e = 1, nElemO
+            elnodes = mesh%elem2D_nodes(:, e)
+            pre = -(g*v(elnodes))
+            U(1, e) = H(e)*sum(mesh%gradient_sca(1:4, e)*pre)
+            U(2, e) = H(e)*sum(mesh%gradient_sca(5:8, e)*pre)
         end do
-        if (partit%npes > 1) call MPI_Allreduce(MPI_IN_PLACE, lim, 1, MPI_WP, MPI_MIN, &
-                                                partit%MPI_COMM_FESOM, ierr)
-    end function se_cfl_dtbt_limit
+        call se_inflow(mesh, partit, U, inflow)
+        do n = 1, nNodO
+            Av(n) = -inflow(n)/mesh%areasvol(n)
+        end do
+    end subroutine se_cfl_apply_a
+
+    !===========================================================================
+    subroutine se_cfl_omega_max(mesh, partit, omega, relchg, vec)
+        ! omega_max = sqrt(lambda_max(A)), the frequency of the fastest discrete gravity mode of
+        ! the substeps (se_cfl_apply_a), by SE_CFL_NIT power iterations on the owned nodes:
+        !     v_0 = hash(global node id),  lambda_k = ||A v_k||_W,  v_{k+1} = A v_k/lambda_k
+        ! ||x||_W^2 = sum areasvol*x^2 over the owned nodes (allreduce), ||v_k||_W = 1, and
+        ! exchange_nod after every iterate (A reads v at the halo vertices of owned elements).
+        ! H = H^n = sum_k helem over the element's layers, the depth of the substeps (se_elem_depth's
+        ! loop; under zstar the current thickness). For the W-self-adjoint A >= 0, lambda_k lies
+        ! between the Rayleigh quotient (v_k, A v_k)_W and lambda_max: a LOWER bound, covered by
+        ! the guard's safety factor. The start vector depends on the global id only, so the result
+        ! depends on the partition only through the order of the sums (test_ssh_se C3: np 1 vs np
+        ! 2). relchg = |lambda_N - lambda_{N-1}|/lambda_N, the change in the last iteration (0 if
+        ! lambda = 0). vec (optional, >= nNodL): the last iterate v_N, halo-valid, ||v_N||_W = 1.
+        ! Collective at npes > 1.
+        type(t_mesh),   intent(in)            :: mesh
+        type(t_partit), intent(in)            :: partit
+        real(kind=WP),  intent(out)           :: omega
+        real(kind=WP),  intent(out)           :: relchg
+        real(kind=WP),  intent(out), optional :: vec(:)
+        integer          :: n, e, nz, it
+        integer          :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
+        integer(int64)   :: hsh
+        real(kind=WP)    :: nrm, lam, lam_old
+        real(kind=WP), allocatable :: H(:), v(:), Av(:), U(:,:), inflow(:)
+
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        allocate(H(nElemL), v(nNodL), Av(nNodL), U(2, nElemL), inflow(nNodL))
+        H = 0.0_WP; Av = 0.0_WP; U = 0.0_WP; inflow = 0.0_WP
+        do e = 1, nElemO
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                H(e) = H(e) + mesh%helem(nz, e)
+            end do
+        end do
+        ! a Weyl sequence in the global id (Knuth's multiplicative hash, mod 2^32): integer
+        ! arithmetic only, the same value at every copy of a node and on every compiler
+        do n = 1, nNodL
+            hsh  = mod(int(partit%myList_nod2D(n), int64)*2654435761_int64, 4294967296_int64)
+            v(n) = real(hsh, WP)/4294967296.0_WP - 0.5_WP
+        end do
+        nrm = 0.0_WP
+        do n = 1, nNodO
+            nrm = nrm + mesh%areasvol(n)*v(n)*v(n)
+        end do
+        if (is_multirank(partit)) call allreduce_sum(nrm, partit)
+        nrm = sqrt(nrm)
+        do n = 1, nNodL
+            v(n) = v(n)/nrm
+        end do
+        lam = 0.0_WP; lam_old = 0.0_WP
+        do it = 1, SE_CFL_NIT
+            call se_cfl_apply_a(mesh, partit, H, v, U, inflow, Av)
+            nrm = 0.0_WP
+            do n = 1, nNodO
+                nrm = nrm + mesh%areasvol(n)*Av(n)*Av(n)
+            end do
+            if (is_multirank(partit)) call allreduce_sum(nrm, partit)
+            lam_old = lam
+            lam     = sqrt(nrm)
+            if (.not. (lam > 0.0_WP)) exit
+            do n = 1, nNodO
+                v(n) = Av(n)/lam
+            end do
+            if (is_multirank(partit)) call exchange_nod(v, partit)
+        end do
+        omega  = sqrt(max(lam, 0.0_WP))
+        relchg = 0.0_WP
+        if (lam > 0.0_WP) relchg = abs(lam - lam_old)/lam
+        if (present(vec)) vec(1:nNodL) = v(1:nNodL)
+        deallocate(H, v, Av, U, inflow)
+    end subroutine se_cfl_omega_max
 
     !===========================================================================
     pure integer function se_cfl_m_min(tau, lim)
-        ! The fewest substeps with tau/M <= lim (se_cfl_dtbt_limit); 1 without a limit.
+        ! The fewest substeps with tau/M <= lim, the admissible substep s*a_crit/omega_max of
+        ! se_init; 1 without a limit (lim = huge).
         real(kind=WP), intent(in) :: tau, lim
         if (lim >= huge(lim)) then
             se_cfl_m_min = 1
@@ -274,8 +493,10 @@ contains
         real(kind=WP),  intent(in)    :: dt
         integer       :: n, e, nz, M_min
         integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
-        real(kind=WP) :: lim, ub(2)
+        real(kind=WP) :: lim, ub(2), omega, relchg, acrit
+        double precision :: twall
         character(len=320) :: msg
+        character(len=16)  :: tw
 
         if (.not. se_env_requested(partit)) return
         if (dyn%se_ready) call se_die('se_init called twice', partit)
@@ -322,9 +543,14 @@ contains
         ! ---- BT viscosity coefficients (geometry, once) ----
         call se_kappa_build(dyn, mesh, partit)
 
-        ! ---- CFL guard ----
-        lim   = se_cfl_dtbt_limit(mesh, partit)
+        ! ---- CFL guard (block CFL GUARD at the top) ----
+        twall = MPI_Wtime()
+        call se_cfl_omega_max(mesh, partit, omega, relchg)
+        acrit = se_cfl_acrit(dyn%se_chi)
+        lim   = huge(1.0_WP)
+        if (omega > 0.0_WP) lim = SE_CFL_SAFETY*acrit/omega
         M_min = se_cfl_m_min(dt, lim)
+        twall = MPI_Wtime() - twall
         if (partit%mype == 0) then
             write(*,'(a)') 'oce_ssh_se: split-explicit barotropic solver ON (Shchepetkin-McWilliams AB3-AM4)'
             write(*,'(a,i0,a,f0.3,a,f6.4,a,es9.2,a,l1)') 'oce_ssh_se:   M = ', dyn%se_M, &
@@ -332,8 +558,12 @@ contains
                 ', visc_ah = ', dyn%se_visc_ah, ' m/s, check = ', dyn%se_check
             write(*,'(a,4(a,f12.9))') 'oce_ssh_se:  ', ' beta = ', dyn%se_beta, ', zeta = ', &
                 dyn%se_zeta, ', gamma = ', dyn%se_gamma, ', delta = ', dyn%se_delta
-            write(*,'(a,f0.3,a,i0)') 'oce_ssh_se:   CFL guard: dtbt <= ', lim, &
-                ' s (0.5*res/sqrt(g*H), min over the mesh) -> M_min = ', M_min
+            write(tw, '(f12.3)') twall
+            write(*,'(a,es10.4,a,i0,a,es8.1,a,f6.4,a,f4.2,a,f0.3,a,i0,a,a,a)') &
+                'oce_ssh_se:   CFL guard: omega_max = ', omega, ' 1/s (', SE_CFL_NIT, &
+                ' power iterations, last change ', relchg, '), a_crit(chi) = ', acrit, ', s = ', &
+                SE_CFL_SAFETY, ' -> dtbt <= ', lim, ' s -> M_min = ', M_min, ' (', &
+                trim(adjustl(tw)), ' s)'
         end if
         select case (se_cfl_decision(dyn%se_M, M_min, dyn%se_m_force))
         case (SE_CFL_FORCED)
@@ -341,10 +571,11 @@ contains
                 dyn%se_M, ' is below the CFL-guard minimum M_min = ', M_min, &
                 '; FESOM3_SE_M_FORCE=1, running anyway'
         case (SE_CFL_DIE)
-            write(msg,'(a,i0,a,i0,a,f0.3,a,f0.3,a,i0,a)') 'M = ', dyn%se_M, &
+            write(msg,'(a,i0,a,i0,a,f0.3,a,f0.3,a,f0.3,a,f0.3,a,i0,a)') 'M = ', dyn%se_M, &
                 ' is below the CFL-guard minimum M_min = ', M_min, ' (dtbt = ', &
-                dt/real(dyn%se_M, WP), ' s > ', lim, ' s): set FESOM3_SE_M >= ', M_min, &
-                ', or FESOM3_SE_M_FORCE=1 to run anyway'
+                dt/real(dyn%se_M, WP), ' s > ', lim, ' s: omega_max*dtbt = ', &
+                omega*dt/real(dyn%se_M, WP), ' > s*a_crit(chi) = ', SE_CFL_SAFETY*acrit, &
+                '): set FESOM3_SE_M >= ', M_min, ', or FESOM3_SE_M_FORCE=1 to run anyway'
             call se_die(trim(msg), partit)
         end select
 
