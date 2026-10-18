@@ -69,7 +69,7 @@ module mod_step_oce
     use oce_ale,            only: compute_vel_nodes, update_vel, compute_hbar_ale, &
                                   update_eta_n, vert_vel_ale, update_thickness_ale
     use oce_ale_tracer,     only: solve_tracers_ale
-    use oce_ssh_se,         only: se_step_guard
+    use oce_ssh_se,         only: se_step_guard, se_bt_forcing, se_subcycle, se_trim_finish
     use mod_timer,          only: timer_start, timer_stop, &
                                   TMR_OCE_MIXPRES, TMR_OCE_DYN, TMR_OCE_SSH, &
                                   TMR_OCE_SOLVE, TMR_OCE_GMREDI, TMR_OCE_TRACER
@@ -234,22 +234,38 @@ contains
         ! tracks the moving surface: update it by the (lagged) dhe from the previous step's
         ! compute_hbar_ale BEFORE assembling/solving (FESOM2 oce_ale.F90:3921; step-1 dhe=0).
         ! TMR_OCE_SOLVE (the CG solve) is nested inside TMR_OCE_SSH, mirroring FESOM2's "solve ssh".
+        ! With FESOM3_SSH_SE=1 the split-explicit step replaces the whole block (its substeps are
+        ! timed by TMR_OCE_SE_BT, also nested inside TMR_OCE_SSH).
         call timer_start(TMR_OCE_SSH)
-        if (trim(which_ALE)/='linfs') call update_stiff_mat_ale(mesh, dt, partit)
-        call compute_ssh_rhs_ale(dynamics, mesh, partit, water_flux=water_flux)
-        call dump_node_2d(DUMP_SUBSTEP_SSH_RHS, n, 'ssh_rhs', dynamics%ssh_rhs)
-        call timer_start(TMR_OCE_SOLVE)
-        call solve_ssh_ale(dynamics, mesh, partit=partit)
-        call timer_stop(TMR_OCE_SOLVE)
-        call dump_node_2d(DUMP_SUBSTEP_SSH_SOLVE, n, 'd_eta', dynamics%d_eta)
+        if (dynamics%use_ssh_se) then
+            ! split-explicit (FESOM3_SSH_SE=1, src/oce/oce_ssh_se.F90, plan Technical Details §2):
+            ! the barotropic forcing F from the predictor, the M barotropic substeps, then the trim
+            ! of uv to the mean transport and the commit of the elevation. They leave uv (synced
+            ! and halo-exchanged), hbar/hbar_old, eta_n and ssh_rhs_old as the block below does, so
+            ! the tail is unchanged. partit is present here (se_step_guard). The hbar and eta_n
+            ! dumps keep their substep ids; there is no ssh_rhs / d_eta in SE.
+            call se_bt_forcing(dynamics, mesh, partit, dt, lfirst)
+            call se_subcycle(dynamics, mesh, partit, dt)
+            call se_trim_finish(dynamics, mesh, partit, dt, n, water_flux)
+            call dump_node_2d(DUMP_SUBSTEP_HBAR, n, 'hbar', mesh%hbar)
+            call dump_node_2d(DUMP_SUBSTEP_ETA_N, n, 'eta_n', dynamics%eta_n)
+        else
+            if (trim(which_ALE)/='linfs') call update_stiff_mat_ale(mesh, dt, partit)
+            call compute_ssh_rhs_ale(dynamics, mesh, partit, water_flux=water_flux)
+            call dump_node_2d(DUMP_SUBSTEP_SSH_RHS, n, 'ssh_rhs', dynamics%ssh_rhs)
+            call timer_start(TMR_OCE_SOLVE)
+            call solve_ssh_ale(dynamics, mesh, partit=partit)
+            call timer_stop(TMR_OCE_SOLVE)
+            call dump_node_2d(DUMP_SUBSTEP_SSH_SOLVE, n, 'd_eta', dynamics%d_eta)
 
-        !_______________________________________________________________________
-        ! velocity update + elevation
-        call update_vel(dynamics, mesh, dt, partit)
-        call compute_hbar_ale(dynamics, mesh, dt, partit, water_flux=water_flux)
-        call dump_node_2d(DUMP_SUBSTEP_HBAR, n, 'hbar', mesh%hbar)
-        call update_eta_n(dynamics, mesh, partit)
-        call dump_node_2d(DUMP_SUBSTEP_ETA_N, n, 'eta_n', dynamics%eta_n)
+            !_______________________________________________________________________
+            ! velocity update + elevation
+            call update_vel(dynamics, mesh, dt, partit)
+            call compute_hbar_ale(dynamics, mesh, dt, partit, water_flux=water_flux)
+            call dump_node_2d(DUMP_SUBSTEP_HBAR, n, 'hbar', mesh%hbar)
+            call update_eta_n(dynamics, mesh, partit)
+            call dump_node_2d(DUMP_SUBSTEP_ETA_N, n, 'eta_n', dynamics%eta_n)
+        end if
         call timer_stop(TMR_OCE_SSH)
 
         !_______________________________________________________________________

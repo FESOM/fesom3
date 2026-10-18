@@ -20,7 +20,10 @@ module oce_ssh_se
     ! the step_oce guard (Task 0.3); the element depth H^n and the barotropic forcing F
     ! (se_elem_depth, se_bt_forcing; Task 1.1); the substeps (se_subcycle) with their operators
     ! (se_inflow, se_visc, se_tendency, se_depth_at) and the viscosity coefficients (se_kappa_build,
-    ! from se_init; Task 1.2). Still to come: the trim (se_trim_finish, Task 1.3).
+    ! from se_init; Task 1.2); the trim and the commit of the elevation (se_trim_finish, Task 1.3).
+    ! step_oce calls se_bt_forcing -> se_subcycle -> se_trim_finish in place of the CG solve block.
+    ! Still to come: the invariant suite FESOM3_SE_CHECK (Task 1.4), the zstar depth law and
+    ! freshwater (Task 3.1), the SE fields in the checkpoint (Task 4.2).
     !
     ! DETERMINISM (plan D2): every per-element operator of the substeps is a GATHER over the
     ! element's own vertex / neighbour slots in fixed slot order, never a scatter into elements.
@@ -68,7 +71,7 @@ module oce_ssh_se
     implicit none
     private
     public :: se_env_requested, se_read_env, se_parse_knob, se_init, se_step_guard
-    public :: se_elem_depth, se_bt_forcing, se_subcycle
+    public :: se_elem_depth, se_bt_forcing, se_subcycle, se_trim_finish
     public :: se_inflow, se_visc, se_tendency, se_depth_at, se_kappa_build
     public :: se_sm_coeffs, se_cfl_dtbt_limit, se_cfl_m_min, se_cfl_decision
     public :: SE_CFL_OK, SE_CFL_FORCED, SE_CFL_DIE
@@ -341,15 +344,15 @@ contains
     subroutine se_step_guard(dyn, partit)
         ! step_oce's first-call check. FESOM3_SSH_SE=1 needs a driver that ran se_init
         ! (fesom_lifecycle_native_mr, fesom_conserve): any other driver would silently run the
-        ! CG solve. Until step_oce has its SE branch (plan Task 1.3) an initialised SE run stops
-        ! here as well, for the same reason.
+        ! CG solve. The SE routines take the partition as a required argument, so such a driver
+        ! must also pass partit to step_oce.
         type(t_dyn),    intent(in)           :: dyn
         type(t_partit), intent(in), optional :: partit
         if (.not. se_env_requested(partit)) return
         if (.not. dyn%se_ready) &
             call se_die('FESOM3_SSH_SE=1 but this driver does not initialise split-explicit', partit)
-        call se_die('FESOM3_SSH_SE=1: step_oce has no split-explicit step yet '// &
-                    '(docs/plans/2026-10-17-split-explicit.md, Task 1.3)', partit)
+        if (.not. present(partit)) &
+            call se_die('FESOM3_SSH_SE=1 but step_oce got no partit (split-explicit needs it)', partit)
     end subroutine se_step_guard
 
     !===========================================================================
@@ -768,6 +771,84 @@ contains
         deallocate(ustar, unew, tend, dU, etaA, inflow, HA)
         call timer_stop(TMR_OCE_SE_BT)
     end subroutine se_subcycle
+
+    !===========================================================================
+    subroutine se_trim_finish(dyn, mesh, partit, dt, step, water_flux)
+        ! After se_subcycle (plan Technical Details §2): the velocity, elevation and divergence
+        ! that the ALE tail consumes, in place of update_vel + compute_hbar_ale + update_eta_n.
+        !  1. u** = uv + UV_rhs (update_vel without the SI pressure correction), then the trim on
+        !     the OWNED elements
+        !         uv_k = u**_k - (sum_j helem^n_j u**_j - <<U>>)/H^n
+        !     (the notes' corrector, subcycling.tex:116-117, with h^n): a depth-uniform velocity
+        !     correction after which sum_k helem^n uv_k = <<U>>, so the layer divergences of the
+        !     tail add up to the elevation change. H^n = se_H sums the same layers in the same
+        !     order. Then the shared-element sync and the halo exchange of uv exactly as in
+        !     update_vel: the copies of u** differ by roundoff (UV_rhs), <<U>> does not (plan D2).
+        !  2. ssh_rhs_old = I(<<U>>), compute_hbar_ale's edge scatter of the mean transport
+        !     (complete on owned nodes, partial on halo nodes, as there); when which_ALE /= linfs
+        !     minus water_flux*areasvol on the open-surface owned nodes and exchange_nod, as
+        !     compute_hbar_ale :253-259.
+        !  3. on owned + halo nodes: hbar_old = hbar, hbar = eta^M, eta_n = eta^M (eta^M is
+        !     halo-valid; the ice reads hbar and compute_vel_rhs eta_n at halo vertices).
+        !     update_eta_n's alpha blend of hbar and hbar_old does not apply: eta^M is the
+        !     elevation at n+1.
+        ! U^M stays in ring level 0 for the next step. dhe (read only by the SI stiffness
+        ! update), d_eta and ssh_rhs (SI only) are not touched.
+        type(t_dyn),    intent(inout) :: dyn
+        type(t_mesh),   intent(inout) :: mesh
+        type(t_partit), intent(in)    :: partit
+        real(kind=WP),  intent(in)    :: dt              ! tau, the baroclinic step
+        integer,        intent(in)    :: step            ! step number (SE_CHECK line and stop)
+        real(kind=WP),  intent(in)    :: water_flux(:)   ! (>= nNodO) freshwater, + out of the ocean (non-linfs)
+        integer       :: e, n, nz
+        integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
+        real(kind=WP) :: s(2), c(2)
+
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+
+        ! ---- 1. u** and the trim to <<U>> ----
+        do e = 1, nElemO
+            s = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                dyn%uv(1, nz, e) = dyn%uv(1, nz, e) + dyn%uv_rhs(1, nz, e)
+                dyn%uv(2, nz, e) = dyn%uv(2, nz, e) + dyn%uv_rhs(2, nz, e)
+                s(1) = s(1) + mesh%helem(nz, e)*dyn%uv(1, nz, e)
+                s(2) = s(2) + mesh%helem(nz, e)*dyn%uv(2, nz, e)
+            end do
+            c(1) = (s(1) - dyn%se_umean(1, e))/dyn%se_H(e)
+            c(2) = (s(2) - dyn%se_umean(2, e))/dyn%se_H(e)
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                dyn%uv(1, nz, e) = dyn%uv(1, nz, e) - c(1)
+                dyn%uv(2, nz, e) = dyn%uv(2, nz, e) - c(2)
+            end do
+        end do
+        if (is_multirank(partit)) then
+            ! (nested ifs: Fortran does not short-circuit)
+            if (partit%sync_shared_elem) then
+                call timer_start(TMR_OCE_SHSYNC)
+                call exchange_elem_shared(dyn%uv, partit)
+                call timer_stop(TMR_OCE_SHSYNC)
+            end if
+            call exchange_elem(dyn%uv, partit)
+        end if
+
+        ! ---- 2. the divergence the tail and the diagnostics read ----
+        call se_inflow(mesh, partit, dyn%se_umean, dyn%ssh_rhs_old)
+        if (trim(which_ALE) /= 'linfs') then
+            do n = 1, nNodO
+                if (mesh%ulevels_nod2D(n) > 1) cycle
+                dyn%ssh_rhs_old(n) = dyn%ssh_rhs_old(n) - water_flux(n)*mesh%areasvol(n)
+            end do
+            if (is_multirank(partit)) call exchange_nod(dyn%ssh_rhs_old, partit)
+        end if
+
+        ! ---- 3. commit the elevation ----
+        do n = 1, nNodL
+            mesh%hbar_old(n) = mesh%hbar(n)
+            mesh%hbar(n)     = dyn%se_etam(n)
+            dyn%eta_n(n)     = dyn%se_etam(n)
+        end do
+    end subroutine se_trim_finish
 
     !===========================================================================
     ! ---- helpers ----

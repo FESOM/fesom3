@@ -1,6 +1,7 @@
 program test_ssh_se
-    ! Split-explicit barotropic solver (docs/plans/2026-10-17-split-explicit.md), Task 0.3: the
-    ! knobs, the CFL guard and se_init of src/oce/oce_ssh_se.F90 on the rotated pi mesh.
+    ! Split-explicit barotropic solver (docs/plans/2026-10-17-split-explicit.md), Tasks 0.3-1.3: the
+    ! knobs, the CFL guard, se_init, the barotropic forcing, the substeps and the trim of
+    ! src/oce/oce_ssh_se.F90 on the rotated pi mesh.
     !
     !   C1  the SM coefficients at chi = 0.1 equal the literal numbers worked out by hand from
     !       the notes (beta = 0.281105, zeta = -0.003689497, gamma = 0.0320866, delta =
@@ -64,6 +65,12 @@ program test_ssh_se
     !          against an M = 128 reference: the observed orders log2(e(M)/e(2M)) of max|eta|
     !          and max|U| are >= 2 (a swapped ring level or a misplaced weight drops it to 1).
     !       Residuals and orders are printed.
+    !   C10 se_trim_finish (Task 1.3) on a hashed predictor state (uv, UV_rhs) with a hashed <<U>>
+    !       and eta^M: sum_k helem^n uv = <<U>> to 1e-13 of sum_k helem|u**|; the correction is
+    !       depth-uniform, uv_k - u**_k = -(sum_j helem u**_j - <<U>>)/H^n for every layer (to 1e-13
+    !       of max|u**|); the layers below nlevels untouched; hbar_old = old hbar, hbar = eta_n =
+    !       eta^M on owned + halo nodes and ssh_rhs_old = I(<<U>>) on owned nodes (bitwise); the
+    !       U ring untouched; at npes > 1 uv is synced over the shared elements and halo-valid.
     ! FESOM3_MESH_DIR (default pi), FESOM3_TEST_ROTATE=1 reads it rotated (setup_test_mesh).
     use mpi
     use mod_precision,    only: WP, MP, MPI_WP
@@ -75,14 +82,15 @@ program test_ssh_se
     use mod_part_bounds,  only: local_dims
     use mod_config,       only: ab_epsilon
     use mod_constants,    only: r_earth
-    use mod_halo,         only: stale_halo_max_nod, stale_halo_max_elem
+    use mod_halo,         only: stale_halo_max_nod, stale_halo_max_elem, shared_copy_max_elem
     use mod_mesh_areas,   only: elem_center
     use mod_mesh_rotate,  only: trim_cyclic
     use oce_dyn_velrhs,   only: compute_vel_rhs
     use oce_ssh_se,       only: se_env_requested, se_parse_knob, se_init, se_sm_coeffs, &
                                 se_cfl_dtbt_limit, se_cfl_m_min, se_cfl_decision, &
                                 SE_CFL_OK, SE_CFL_FORCED, SE_CFL_DIE, se_bt_forcing, &
-                                se_elem_depth, se_subcycle, se_inflow, se_visc, se_tendency
+                                se_elem_depth, se_subcycle, se_inflow, se_visc, se_tendency, &
+                                se_trim_finish
     use test_util,        only: setup_test_mesh, check, finish, sum_all, max_all, hval
     implicit none
 
@@ -104,6 +112,7 @@ program test_ssh_se
     call c7_consistency()
     call c8_visc()
     call c9_subcycle()
+    call c10_trim_finish()
     call finish(partit, 'test_ssh_se')
 
 contains
@@ -305,9 +314,10 @@ contains
         call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
         if (.not. allocated(mesh%helem)) error stop 'test_ssh_se: helem is set up by C4'
         allocate(dyn%uv(2, nl-1, nElemF), dyn%uv_rhs(2, nl-1, nElemF))
-        allocate(dyn%uv_rhsAB(1, 2, nl-1, nElemF), dyn%eta_n(nNodL))
+        allocate(dyn%uv_rhsAB(1, 2, nl-1, nElemF), dyn%eta_n(nNodL), dyn%ssh_rhs_old(nNodL))
         allocate(dyn%work%pgf_x(nl-1, nElemF), dyn%work%pgf_y(nl-1, nElemF))
         dyn%uv = 0.0_WP; dyn%uv_rhs = 0.0_WP; dyn%uv_rhsAB = 0.0_WP; dyn%eta_n = 0.0_WP
+        dyn%ssh_rhs_old = 0.0_WP
         dyn%work%pgf_x = 0.0_WP; dyn%work%pgf_y = 0.0_WP
         dyn%AB_order   = 2
         dyn%momadv_opt = 0
@@ -751,5 +761,132 @@ contains
         end if
         deallocate(etaM, uM)
     end subroutine c9_subcycle
+
+    subroutine hashed_step_state(d0)
+        ! a hashed SE state at the end of a predictor: uv = u^{n-1/2} and UV_rhs on every held
+        ! element (wet layers), eta^n, H^n, the eta and U rings, F and U^n; hbar = eta^n. Every
+        ! copy of a node or element holds the same value (hashed from the global id).
+        type(t_dyn), intent(inout) :: d0
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, n, e, nz, c
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        call new_dyn(d0)
+        call set_uv(d0, 0)
+        do e = 1, nElemF
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                do c = 1, 2
+                    d0%uv_rhs(c, nz, e) = 0.01_WP*hval(partit%myList_elem2D(e), 10*nz + c + 50)
+                end do
+            end do
+        end do
+        do n = 1, nNodL
+            d0%eta_n(n) = 0.1_WP*hval(partit%myList_nod2D(n), 11)
+        end do
+        call se_init(d0, mesh, partit, dt)
+        call se_elem_depth(d0, mesh, partit)
+        do n = 1, nNodL
+            d0%se_eta(n, 1) = 0.1_WP*hval(partit%myList_nod2D(n), 12)
+            d0%se_eta(n, 2) = 0.1_WP*hval(partit%myList_nod2D(n), 13)
+        end do
+        do e = 1, nElemL
+            do c = 1, 2
+                d0%se_ubt(c, e, 0) = d0%se_H(e)*0.01_WP*hval(partit%myList_elem2D(e), 20 + c)
+                d0%se_ubt(c, e, 1) = d0%se_H(e)*0.01_WP*hval(partit%myList_elem2D(e), 22 + c)
+                d0%se_ubt(c, e, 2) = d0%se_H(e)*0.01_WP*hval(partit%myList_elem2D(e), 24 + c)
+                d0%se_force(c, e)  = 1.0e-3_WP*hval(partit%myList_elem2D(e), 26 + c)
+            end do
+            d0%se_ubtn(:, e) = d0%se_ubt(:, e, 0)
+        end do
+        if (.not. allocated(mesh%hbar)) allocate(mesh%hbar(nNodL), mesh%hbar_old(nNodL))
+        mesh%hbar(1:nNodL)     = d0%eta_n(1:nNodL)
+        mesh%hbar_old(1:nNodL) = 0.0_WP
+    end subroutine hashed_step_state
+
+    subroutine c10_trim_finish()
+        ! Task 1.3: se_trim_finish on the hashed state with a hashed <<U>> and eta^M (no substeps:
+        ! the trim and the commit only), FESOM3_SE_CHECK off.
+        type(t_dyn) :: d0, d
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, n, e, nz, c, nbad
+        real(kind=WP), allocatable :: wf(:), infl(:), hbar0(:), tmp(:)
+        real(kind=WP) :: s(2), sa(2), ustar2(2), cexp(2), res, scale, resu, scaleu, cmax, stale
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        call hashed_step_state(d0)
+        do e = 1, nElemL
+            do c = 1, 2
+                d0%se_umean(c, e) = d0%se_H(e)*0.05_WP*hval(partit%myList_elem2D(e), 33 + c)
+            end do
+        end do
+        do n = 1, nNodL
+            d0%se_etam(n)  = 0.2_WP*hval(partit%myList_nod2D(n), 36)
+            mesh%hbar(n)   = 0.3_WP*hval(partit%myList_nod2D(n), 37)      ! hbar /= eta_n on purpose
+        end do
+        hbar0 = mesh%hbar(1:nNodL)
+        allocate(wf(nNodL), infl(nNodL)); wf = 0.0_WP
+        call check(.not. d0%se_check, 'C10 FESOM3_SE_CHECK is off in the test environment', partit%mype)
+        d = d0
+        call se_trim_finish(d, mesh, partit, dt, 1, wf)
+
+        ! (a) the trim: sum_k helem^n uv = <<U>>; (b) the correction is depth-uniform and equals
+        ! (sum_k helem u** - <<U>>)/H^n; (c) the layers below nlevels are untouched
+        res = 0.0_WP; scale = 0.0_WP; resu = 0.0_WP; scaleu = 0.0_WP; cmax = 0.0_WP; nbad = 0
+        do e = 1, nElemO
+            s = 0.0_WP; sa = 0.0_WP; ustar2 = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                s  = s  + mesh%helem(nz, e)*d%uv(:, nz, e)
+                sa = sa + mesh%helem(nz, e)*abs(d0%uv(:, nz, e) + d0%uv_rhs(:, nz, e))
+                ustar2 = ustar2 + mesh%helem(nz, e)*(d0%uv(:, nz, e) + d0%uv_rhs(:, nz, e))
+            end do
+            res   = max(res, maxval(abs(s - d0%se_umean(:, e))))
+            scale = max(scale, maxval(sa), maxval(abs(d0%se_umean(:, e))))
+            cexp  = (ustar2 - d0%se_umean(:, e))/d0%se_H(e)
+            cmax  = max(cmax, maxval(abs(cexp)))
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                resu   = max(resu, maxval(abs((d%uv(:, nz, e) - (d0%uv(:, nz, e) + d0%uv_rhs(:, nz, e))) + cexp)))
+                scaleu = max(scaleu, maxval(abs(d0%uv(:, nz, e) + d0%uv_rhs(:, nz, e))))
+            end do
+            do nz = mesh%nlevels(e), mesh%nl - 1
+                if (any(d%uv(:, nz, e) /= d0%uv(:, nz, e))) nbad = nbad + 1
+            end do
+        end do
+        call max_all(res, partit); call max_all(scale, partit); call max_all(resu, partit)
+        call max_all(scaleu, partit); call max_all(cmax, partit); call sum_all(nbad, partit)
+        call check(res <= 1.0e-13_WP*scale, 'C10 trim: sum_k helem^n uv = <<U>>', partit%mype)
+        call check(cmax > 1.0e-2_WP*scaleu, 'C10 the trim correction is non-trivial', partit%mype)
+        call check(resu <= 1.0e-13_WP*(scaleu + cmax), &
+                   'C10 the correction is depth-uniform: uv_k = u**_k - (sum helem u** - <<U>>)/H', partit%mype)
+        call check(nbad == 0, 'C10 the layers below nlevels are untouched (bitwise)', partit%mype)
+        if (partit%mype == 0) write(*,'(a,es10.3,a,es10.3,a,es10.3,a,es10.3,a,es10.3)') &
+            'test_ssh_se: C10 trim: max|sum helem uv - <<U>>| = ', res, ' m2/s of ', scale, &
+            '; depth-uniform correction residual ', resu, ' m/s of ', scaleu, ', max|correction| ', cmax
+
+        ! (d) the commit on owned + halo nodes, (e) ssh_rhs_old = I(<<U>>) on owned nodes, (f) the
+        ! U ring and <<U>> untouched, nothing of SE_CHECK computed
+        nbad = count(mesh%hbar_old(1:nNodL) /= hbar0) + count(mesh%hbar(1:nNodL) /= d0%se_etam) &
+             + count(d%eta_n(1:nNodL) /= d0%se_etam)
+        call sum_all(nbad, partit)
+        call check(nbad == 0, 'C10 hbar_old = hbar, hbar = eta_n = eta^M on owned + halo (bitwise)', partit%mype)
+        call se_inflow(mesh, partit, d0%se_umean, infl)
+        nbad = count(d%ssh_rhs_old(1:nNodO) /= infl(1:nNodO))
+        call sum_all(nbad, partit)
+        call check(nbad == 0, 'C10 ssh_rhs_old = I(<<U>>) on owned nodes (bitwise)', partit%mype)
+        nbad = count(d%se_ubt(:, 1:nElemL, :) /= d0%se_ubt(:, 1:nElemL, :)) &
+             + count(d%se_umean(:, 1:nElemO) /= d0%se_umean(:, 1:nElemO))
+        call sum_all(nbad, partit)
+        call check(nbad == 0, 'C10 the U ring and <<U>> are untouched', partit%mype)
+
+        ! (g) npes > 1: uv synced over the shared elements and halo-valid, as after update_vel
+        if (partit%npes > 1) then
+            stale = shared_copy_max_elem(d%uv, partit)
+            allocate(tmp(nElemL))
+            do c = 1, 2
+                do nz = 1, 2
+                    tmp = d%uv(c, nz, 1:nElemL)
+                    stale = max(stale, stale_halo_max_elem(tmp, partit))
+                end do
+            end do
+            call max_all(stale, partit)
+            call check(stale == 0.0_WP, 'C10 uv: shared copies equal and halo valid after the trim', partit%mype)
+            deallocate(tmp)
+        end if
+    end subroutine c10_trim_finish
 
 end program test_ssh_se

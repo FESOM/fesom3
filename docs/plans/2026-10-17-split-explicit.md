@@ -432,14 +432,14 @@ scripts and logs in its `jobs/`)
   to the frozen main references; new `fesom_lifecycle_native_mr` sha256 `5ccb664fe4ed9d37…`. Scripts
   `/work/ab0995/a270088/fesom3_se_ref/jobs/t11_build_ctest.sbatch` (TAG=t12), `t12_g0.sbatch`
 
-#### Task 1.3: Trim, finish and the `step_oce` branch
+#### Task 1.3: Trim, finish and the `step_oce` branch ✅
 
 **Files:**
 - Modify: `src/oce/oce_ssh_se.F90`
 - Modify: `src/step/mod_step_oce.F90`
-- Modify: `test/test_ssh_se.F90`
+- Modify: `test/test_ssh_se.F90`, `test/CMakeLists.txt`
 
-- [ ] `se_trim_finish`:
+- [x] `se_trim_finish`:
   - u** = uv + UV_rhs;
   - uvₖ = u**ₖ − (Σⱼhelemⁿⱼu**ⱼ − ⟨⟨Ū⟩⟩)/Hⁿ_e on owned elements;
   - `exchange_elem_shared(uv)` (under `sync_shared_elem`, TMR_OCE_SHSYNC), then `exchange_elem(uv)`, exactly as in
@@ -447,11 +447,36 @@ scripts and logs in its `jobs/`)
   - on **nNodL**: hbar_old = hbar; hbar = η^M; eta_n = η^M (the ice and `compute_vel_rhs` read halo vertices);
   - ssh_rhs_old = I(⟨⟨Ū⟩⟩) − W·areasvol (non-linfs);
   - Ū^M stays in the ring
-- [ ] `step_oce`: `if (dynamics%use_ssh_se) then` call the three SE routines under TMR_OCE_SSH, `else` the existing
-  block **verbatim**. Add `dump_node_2d` for hbar/eta_n at the same substep ids
-- [ ] ➕ remove the temporary second stop in `se_step_guard` ("step_oce has no split-explicit step yet", Task 0.3)
-- [ ] test: Σₖhelemⁿ·uv = ⟨⟨Ū⟩⟩ to rounding after the trim; the correction is depth-uniform in velocity
-- [ ] ctest green; G0
+
+  Signature `se_trim_finish(dyn, mesh, partit, dt, step, water_flux)`. u** and Σhelemⁿu** in one pass over the wet
+  layers ulevels..nlevels−1 (update_vel's range), the correction c = (Σhelemⁿu** − ⟨⟨Ū⟩⟩)/se_H with se_H summed in
+  the same layer order. ssh_rhs_old = `se_inflow(⟨⟨Ū⟩⟩)`; for non-linfs minus water_flux·areasvol on the owned
+  open-surface nodes and `exchange_nod(ssh_rhs_old)`, as compute_hbar_ale :253-259 (unreachable until Task 3.1:
+  se_elem_depth still stops non-linfs). update_eta_n's alpha blend does not apply (η^M is the elevation at n+1).
+  Not touched: dhe (read only by the SI stiffness update), d_eta and ssh_rhs (SI only)
+- [x] `step_oce`: `if (dynamics%use_ssh_se) then` call the three SE routines under TMR_OCE_SSH, `else` the existing
+  block **verbatim**. Add `dump_node_2d` for hbar/eta_n at the same substep ids. The SI block is re-indented by four
+  blanks only: `git diff -w` shows nothing but the wrapping lines, and the de-indented block is byte-identical to the
+  original 15 lines (checked by script). SE dumps hbar at DUMP_SUBSTEP_HBAR and eta_n at DUMP_SUBSTEP_ETA_N; there is
+  no ssh_rhs / d_eta dump in SE
+- [x] ➕ remove the temporary second stop in `se_step_guard` ("step_oce has no split-explicit step yet", Task 0.3).
+  In its place the guard stops when `FESOM3_SSH_SE=1` and step_oce got no `partit` (the SE routines require it)
+- [x] test: Σₖhelemⁿ·uv = ⟨⟨Ū⟩⟩ to rounding after the trim; the correction is depth-uniform in velocity.
+  `test_ssh_se` C10 (np 1 and 2) on a hashed predictor state (uv, UV_rhs) with hashed ⟨⟨Ū⟩⟩ and η^M: **max|Σhelemⁿuv −
+  ⟨⟨Ū⟩⟩| = 1.1e-13 m²/s of Σhelem|u**| = 763 (1.5e-16)**; uvₖ − u**ₖ + c = **2.8e-17 m/s** for every layer (GNU
+  4.2e-17) of max|u**| = 0.21, max|c| = 0.083 (tolerance 1e-13); the layers below nlevels, the Ū ring and ⟨⟨Ū⟩⟩
+  untouched; hbar_old = old hbar, hbar = eta_n = η^M on owned + halo and ssh_rhs_old = I(⟨⟨Ū⟩⟩) on owned nodes
+  (bitwise); np 2: uv copy spread 0 and halo-valid. ➕ Two driver ctests: `fesom_conserve_se_linfs_np1` (pi, linfs,
+  20 SE steps through step_oce, the driver's linfs invariants) and `fesom_conserve_se_zstar_np1` (pins the
+  se_elem_depth stop until Task 3.1)
+- [x] ctest green; G0. Job 28217186 (shared, 7.7 min): **Intel 174/174** (172 + the 2 driver ctests). GNU: the 6
+  known failures plus 5 zstar `fesom_conserve` tests (redi, KPP, TKE, mixcut_REDI, wsplit) that ran to "CONSERVATION
+  OK" and then got "mpiexec has exited ... exiting improperly", all in the first batch of 8 started, all at ~11 s.
+  ⚠️ Transient, not the code: the same binaries rerun (job 28217290) give **GNU 168/174, exactly the 6 known
+  failures**, in two full `ctest -j 8` passes, and the 5 pass at `-j 1`. **G0 GREEN** (linfs, zstar: 99
+  checkpoint variables and 1 649 154 dump records max|Δ| = 0, 20 step lines equal; conserve: 249 log lines, 26
+  configs), new `fesom_lifecycle_native_mr` sha256 `9abe27997a2f07be…`. Scripts
+  `/work/ab0995/a270088/fesom3_se_ref/jobs/t13_gate.sbatch`, `t13_gnu_rerun.sbatch`
 
 #### Task 1.4: Invariant suite `FESOM3_SE_CHECK`
 

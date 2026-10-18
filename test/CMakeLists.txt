@@ -519,3 +519,20 @@ foreach(_case badswitch badm cfl)
         FAIL_REGULAR_EXPRESSION "fesom_conserve: step "
         SKIP_REGULAR_EXPRESSION "cannot open;No such file")
 endforeach()
+# The split-explicit step in fesom_conserve (step_oce's SE branch): pi, linfs, 20 steps; the
+# driver's linfs invariants (T10, helem, finiteness) stop the run on a violation. Until the zstar
+# depth law (plan Task 3.1) a zstar SE run stops in se_elem_depth (the second test pins that stop).
+add_test(NAME fesom_conserve_se_linfs_np1
+         COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np 1 $<TARGET_FILE:fesom_conserve>)
+set_tests_properties(fesom_conserve_se_linfs_np1 PROPERTIES
+    ENVIRONMENT "FESOM3_MESH_DIR=${_mesh_pi};FESOM3_IC_FILE=${_icf};FESOM3_NSTEPS=20;FESOM3_WHICH_ALE=linfs;FESOM3_SSH_SE=1"
+    PASS_REGULAR_EXPRESSION "fesom_conserve: done \\(20 steps, which_ALE=linfs\\)"
+    FAIL_REGULAR_EXPRESSION "VIOLATED;non-finite"
+    SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+add_test(NAME fesom_conserve_se_zstar_np1
+         COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np 1 $<TARGET_FILE:fesom_conserve>)
+set_tests_properties(fesom_conserve_se_zstar_np1 PROPERTIES
+    ENVIRONMENT "${_se_conserve};FESOM3_WHICH_ALE=zstar;FESOM3_SSH_SE=1"
+    PASS_REGULAR_EXPRESSION "split-explicit supports which_ALE = linfs only so far"
+    FAIL_REGULAR_EXPRESSION "fesom_conserve: step 1 "
+    SKIP_REGULAR_EXPRESSION "cannot open;No such file")
