@@ -1048,6 +1048,10 @@ sbatch at a time or in a short chain; each wait is a background `sacct` watcher.
 
 ➕ **Approved by Nikolay on 2026-10-18** (the whole stage 3–5 node-hours), together with the decision on the default
 below (Task 5.0).
+➕ Stage 5 cost so far: Tasks 5.0 + 5.1 0.97 node-h, Tasks 5.2 + 5.3 1.61 node-h (2.58 in all). ➕ Nikolay asked
+why port_kokkos runs χ = 0.1: its BT viscosity is the flow-dependent Zenodo closure (γ0 = 10, γ1 = 2750), ≈ 2× ours in
+calm flow and ≈ 10–15× on the noisy shelf. ⚠️ Open: a test of that closure at χ = 0.1 (branch `se-visc-zenodo` in the
+side worktree, report `/work/ab0995/a270088/fesom3_se_ref/jobs/s5_C_report.md`), then Nikolay's choice of default.
 
 #### ➕ Task 5.0: default χ = 0.25 ✅
 
@@ -1235,20 +1239,43 @@ is not re-run (it blows up near step 335, below).
     - Stage 3 (zstar): the same coupling and the same guard issue apply (port_kokkos died the same way with zstar);
       H_e(η) changes ω_max negligibly in the deep trenches where it peaks.
 
-#### Task 5.2: 1-year SE vs SI twin (linfs)
+#### Task 5.2: 1-year SE vs SI twin (linfs) ✅
 
 **Files:**
 - Modify: `tools/zarr_diff.py` (field-statistics mode) if it fits; otherwise create `tools/se_twin_diff.py`
 
-- [ ] two 1-year runs from the same cold start (SI, SE χ = 0.1 / M from 5.1; ➕ SE at the default χ = 0.25 of
-  Task 5.0), monthly means on
-- [ ] annual-mean SSH difference (rms, max; port_kokkos reference 0.2 mm / 2.9 mm), global-mean SSH and salt drift,
-  sea-ice area; record the numbers here
+- [x] two 1-year runs from the same cold start (SI; SE χ = 0.25, M = 50), monthly means on. CORE2
+  `prod_env 1e-5`, linfs, Δt 1800 s, 17520 steps (1958, gregorian), np 128 on one node each, SE_CHECK
+  off, frozen Intel `bin_s5_741ddc7` (= the Task 6.1 build, `FESOM3_SE_CHI=0.25` set explicitly; guard
+  M_min = 48). Jobs 28220554 (SI, 44.3 min) and 28220555 (SE, 45.8 min), script
+  `/work/ab0995/a270088/fesom3_se_ref/jobs/s5_B_twin.sbatch`, run dirs
+  `/scratch/a/a270088/se_s5/twin_{si_28220554,se_28220555}` (stores `out/*.fesom.1958.zarr`, `<f8`
+  monthly means of ssh sst sss a_ice m_ice m_snow temp salt + `fesom.mesh.diag.zarr`); both exit 0,
+  no NaN. Logs: max|η| SI 2.14 m (step 745), SE 4.69 m (step 67, the cold-start peak; 2.13 m after the
+  first 30 days, SI 2.11 m); max CFL_z 1.589 (step 300) / 1.603 (step 301), after day 30 0.856 / 0.858;
+  divsum ≤ 4.3e-15 / 2.6e-15, dUV = dAB = dsig = 0. Loop 143.90 / 148.09 ms/step (SE +2.9 %),
+  TMR_OCE_SSH 8.87 (CG 5.20) / 13.08 (SE_BT 10.64) ms/step
+- [x] annual-mean SSH difference SE − SI (`tools/se_twin_diff.py`, job 28220994, area weights nod_area):
+  **rms 0.110 mm, max 1.56 mm** (139.97°E 13.39°S, Gulf of Carpentaria, 70 m); port_kokkos 0.2 / 2.9 mm.
+  Monthly rms 0.50 mm (Jan, cold start) → 0.15 (Jun) → 0.40 mm (Dec, equatorial band 3–8°N); on the
+  Antarctic shelf (lat < 60°S, H ≤ 40 m) monthly max|Δ| falls from 5.3–8.0 mm (Jan–Feb) to ≤ 0.9 mm
+  from June (no shelf-mode growth at χ = 0.25). Global-mean SSH round-off in both (|mean| ≤ 8.3e-17 m).
+  Global-mean salt (volume-weighted, nod_area · linfs Δz): drift Dec − Jan +2.40e-6 psu (SI),
+  +2.46e-6 psu (SE), SE − SI ≤ 8.3e-8 psu; temp SE − SI ≤ 4.1e-6 °C. Sea-ice area SE − SI: NH ≤ 0.006,
+  SH ≤ 0.011 × 10⁶ km² (Jan; ≤ 0.003 from May), extent within 0.01 × 10⁶ km²; SE has slightly less SH ice
+  volume (−0.18 % Jan, −0.05 % Dec). Largest annual-mean ice differences a_ice 0.041, m_ice 0.11 m at
+  73°W 73°S (the 30 m Bellingshausen shelf). Tables: `jobs/s5_B_report.md`, `jobs/s5_B_diff.28220994.{out,json}`
 
-#### Task 5.3: SSH phase cost, SI vs SE
+#### Task 5.3: SSH phase cost, SI vs SE ✅
 
-- [ ] one node, np 128, CORE2 `prod_env`, 300 steps, a same-day pair, min of 2: the TMR_OCE_SSH and TMR_OCE_SE_BT
-  phase times for SI and SE (M = 50 and M = M_min); record ms/step
+- [x] one node (l50354), np 128, CORE2 `prod_env 1e-5`, 300 steps cold start, no output / SE_CHECK, χ = 0.25,
+  si, se50, se48 interleaved twice in one job (28220592, 5.2 min, `jobs/s5_B_cost.sbatch`, run dir
+  `/scratch/a/a270088/se_s5/cost_28220592`), min of 2, ms/step: **SI TMR_OCE_SSH 9.21 (CG 5.55)**;
+  **SE M = 50: TMR_OCE_SSH 12.77, TMR_OCE_SE_BT 10.36**; **SE M = 48 (= M_min): 12.55, 10.14**. SE's SSH phase
+  costs +3.55 / +3.33 ms/step (+38 / +36 %); step_oce 111.14 / 114.50 / 114.43; loop total 145.20 /
+  145.99 / 145.74 (equal within 0.5 % here because the SI runs' ice/ocean2ice/forcing varied by 1.5–2.5
+  ms between its runs; the year-long twin gives SE +4.19 ms/step, +2.9 %, all of it in the SSH phase).
+  M 50 → 48 saves 0.22–0.31 ms of SE_BT (≈ 0.11–0.16 ms per substep)
 
 ### Stage 6 — Verify and document
 
@@ -1282,8 +1309,8 @@ sha256 `01e1d34f709fb0e0…`, `fesom_conserve` `1edbc30ba0f7ef18…`.
     equal the straight run's, without msl/fw); `run_restart_gate_multirank.sh` np 2 → 8: **SI (27 fields, 32 s) and
     SE linfs (37 fields, 30 s) GREEN, max|Δ| = 0**; `run_restartroundtrip.sh` np 1 2: **GATE GREEN** (AB2 28, AB3 32,
     SE 38 fields max|Δ| = 0; `FESOM3_RESTARTRT_SE=2` aborts with the message at np 1 and 2), 41 s
-  - [ ] G3 numbers recorded — **Stage 5 pending Nikolay's yes** (➕ approved 2026-10-18; Tasks 5.0 and 5.1 done,
-    5.2 and 5.3 open)
+  - [x] G3 numbers recorded (Stage 5 approved by Nikolay 2026-10-18): Task 5.1 screens, Task 5.2 twin (annual-mean
+    SSH SE − SI rms 0.110 mm, max 1.56 mm), Task 5.3 cost (SE SSH phase +3.55 ms/step at np 128, loop +2.9 %)
 - [x] full ctest Intel + GNU, `run_g0_se.sh`, conserve_pi, restart gates, `run_tri_regression.sh` (`NEW_BIN=` this
   build). **ctest Intel 176/176** (32 s); **GNU 170/176, exactly the 6 known failures** (`test_wimpl_tra_np1/np2`,
   `meshdiag_mixed/quad/pi_w`, `test_shared_elem_np1`; the serial rerun fails the same 6, no flake this time);
