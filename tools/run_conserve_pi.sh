@@ -56,6 +56,18 @@
 #   Every driver run prints one shared-element line after the drift block, so every tail
 #   below is one line longer than before.
 #
+#   linfs + split-explicit (SE), np 1 -> the split-explicit barotropic solver (FESOM3_SSH_SE=1,
+#       docs/plans/2026-10-17-split-explicit.md, Tasks 1.3-1.5) with FESOM3_SE_CHECK=1. The driver's
+#       linfs invariants as above (drift reported, not gated) plus the per-step SE_CHECK line of
+#       src/oce/oce_ssh_se.F90, whose run maxima are gated: eta-compatibility (etacomp, m), trim
+#       (m^2/s) and |mean-sea-level change| (msl, m) below SE_TOL_* = the Task 1.5 levels x 100,
+#       the copy spreads of U and <<U>> exactly 0, and one SE_CHECK line per step. Two configs: the
+#       default physics, and vector-invariant momentum with rvo_upwind 1 + sea ice (the SHARED
+#       configuration below). The np 2/8 SE configs come with Task 2.2. Measured 2026-10-18 (pi,
+#       1000 steps, np 1, M = 50; Task 1.5, job 28217370): max etacomp 5.0e-15 m, trim 5.7e-13 m^2/s,
+#       |msl| 3.5e-16 m (default; vinv+ice 4.8e-15, 4.5e-13, 2.9e-16), spreads 0. Heat/salt drift
+#       -3.68e-4/-1.59e-6 (SI linfs: -3.69e-4/-1.60e-6).
+#
 # Measured zstar baseline on pi, 20 steps, before any bottom change:
 #   np=1  heat -4.87e-15  salt -1.66e-14
 #   np=2  heat  0.00e+00  salt -7.80e-15
@@ -191,6 +203,36 @@ if env $SHARED_ENV FESOM3_MOMADV_OPT=1 FESOM3_RVO_UPWIND=1.0 FESOM3_SHARED_SYNC=
 else
     echo "run_conserve_pi: FAILED (linfs+ice+momadv-vinv-upw1 np=2 sync off)"; fail=1
 fi
+
+# SE: linfs + split-explicit with the SE_CHECK gate (header). Levels measured over 1000 steps on
+# pi (Task 1.5: 5.0e-15 m, 5.7e-13 m^2/s, 3.5e-16 m); the tolerances are those levels x 100.
+SE_TOL_ETACOMP="${SE_TOL_ETACOMP:-5e-13}"   # m
+SE_TOL_TRIM="${SE_TOL_TRIM:-6e-11}"         # m^2/s
+SE_TOL_MSL="${SE_TOL_MSL:-4e-14}"           # m
+SE_ENV="FESOM3_WHICH_ALE=linfs FESOM3_SSH_SE=1 FESOM3_SE_CHECK=1"
+while read -r -u 3 label np vars; do
+    [ -z "$label" ] && continue
+    echo "=== linfs + SE + $label, np=$np, $NSTEPS steps (SE_CHECK gate) ==="
+    rc=0
+    out=$(env $SE_ENV $vars mpirun $MPIFLAGS -n "$np" "$BIN" < /dev/null 2>&1) || rc=$?
+    { echo "$out" | grep -v '^SE_CHECK ' || true; } | tail -8
+    # run maxima of the SE_CHECK tokens (|value|); fails unless every step printed a line
+    echo "$out" | awk -v ns="$NSTEPS" -v te="$SE_TOL_ETACOMP" -v tt="$SE_TOL_TRIM" -v tm="$SE_TOL_MSL" '
+        /^SE_CHECK / { n++
+                       for (i = 3; i <= NF; i++) { split($i, kv, "="); v = kv[2] + 0; if (v < 0) v = -v
+                                                   if (v > mx[kv[1]]) mx[kv[1]] = v } }
+        END { printf "run_conserve_pi: SE_CHECK max over %d steps: etacomp=%.3e trim=%.3e |msl|=%.3e " \
+                     "spreadU=%.3e spreadUm=%.3e maxeta=%.3e maxU=%.3e (tol %s %s %s)\n", n, mx["etacomp"], \
+                     mx["trim"], mx["msl"], mx["spreadU"], mx["spreadUm"], mx["maxeta"], mx["maxU"], te, tt, tm
+              exit !(n == ns && mx["etacomp"] <= te + 0 && mx["trim"] <= tt + 0 && mx["msl"] <= tm + 0 &&
+                     mx["spreadU"] == 0 && mx["spreadUm"] == 0) }' || rc=1
+    if [ "$rc" -ne 0 ]; then
+        echo "run_conserve_pi: FAILED (linfs+SE+$label np=$np)"; fail=1
+    fi
+done 3<<CFG
+default 1
+momadv-vinv-upw1+ice 1 FESOM3_MOMADV_OPT=1 FESOM3_RVO_UPWIND=1.0 FESOM3_CONSERVE_ICE=1
+CFG
 
 if [ "$fail" -ne 0 ]; then
     echo "run_conserve_pi: GATE FAILED"

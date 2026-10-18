@@ -139,7 +139,7 @@ program fesom_lifecycle_native_mr
     character(len=4096) :: out_env, out_dir_o, nml_io_path
     ! M8a: model clock (cold start from FESOM3_START_CLOCK) + run-length driver
     integer            :: clk_d0, clk_y0, clk_unit, idx, ierr
-    real(kind=WP)      :: clk_t0, dstat(9)   ! dstat: M8c Step-3 global per-step physical diagnostics
+    real(kind=WP)      :: clk_t0, dstat(10)  ! dstat: M8c Step-3 global per-step physical diagnostics
     real(kind=WP)      :: dsum(2)            ! [sum ssh_rhs_old, sum|ssh_rhs_old|] over owned nodes
     logical            :: ftz_supported   ! M8c Step-3: flush-to-zero (denormal) underflow control (match FESOM2)
     logical            :: step_diag        ! perf: per-step global MPI_MAX stability diagnostic (env FESOM3_STEP_DIAG; default OFF — FESOM2 has no per-step collective)
@@ -1068,7 +1068,11 @@ program fesom_lifecycle_native_mr
         if (allocated(ice%work%sigma11)) dstat(9) = max(shared_copy_max_elem(ice%work%sigma11, partit), &
                                                         shared_copy_max_elem(ice%work%sigma12, partit), &
                                                         shared_copy_max_elem(ice%work%sigma22, partit))
-        call MPI_Allreduce(MPI_IN_PLACE, dstat, 9, MPI_WP, MPI_MAX, partit%MPI_COMM_FESOM, ierr)
+        ! max CFL_z of the step (vert_vel_ale's cfl_z, owned nodes): the vertical Courant number the
+        ! split-explicit screens compare with the semi-implicit runs. Its own line below, so that the
+        ! step line stays byte-identical (G0 and run_cutout_short.sh read its fields).
+        dstat(10) = maxval(dyn%cfl_z(:,1:nNodO))
+        call MPI_Allreduce(MPI_IN_PLACE, dstat, 10, MPI_WP, MPI_MAX, partit%MPI_COMM_FESOM, ierr)
         dsum = [sum(dyn%ssh_rhs_old(1:nNodO)), sum(abs(dyn%ssh_rhs_old(1:nNodO)))]
         call MPI_Allreduce(MPI_IN_PLACE, dsum, 2, MPI_WP, MPI_SUM, partit%MPI_COMM_FESOM, ierr)
         if (partit%mype == 0) &
@@ -1078,6 +1082,8 @@ program fesom_lifecycle_native_mr
                 '  Tmax=', dstat(5), '  Smax=', dstat(6), &
                 '  divsum=', abs(dsum(1))/max(dsum(2), tiny(1.0_WP)), &
                 '  dUV=', dstat(7), '  dAB=', dstat(8), '  dsig=', dstat(9)
+        if (partit%mype == 0) &
+            write(*,'(a,i0,a,es12.4)') 'fesom_lifecycle_native_mr: CFL_z step ', n, '  max CFL_z=', dstat(10)
     end do
     ! Restart Stage 5 (Task 5.3): end-of-run final checkpoint — a safety net for the case the last
     ! in-loop step was NOT cadence-due. restart_due already treats the last step as due, so this is

@@ -533,14 +533,70 @@ scripts and logs in its `jobs/`)
   20 steps): step 1 etacomp 1.7e-16 m, trim 2.8e-14 m²/s; step 20 etacomp 1.7e-15 m, trim 1.1e-13 m²/s, msl
   −1.8e-17 m, maxeta 1.80 m, maxU 426 m²/s (GNU: the same to 1-2 digits). Script `t13_gate.sbatch` (TAG=t14)
 
-#### Task 1.5: GATE Stage 1 — linfs np 1
+#### Task 1.5: GATE Stage 1 — linfs np 1 ✅
 
-- [ ] pi, `fesom_conserve`, `FESOM3_SSH_SE=1 FESOM3_SE_CHECK=1 FESOM3_WHICH_ALE=linfs`, 1000 steps: SE_CHECK
+**Files:**
+- Modify: `tools/run_conserve_pi.sh` (the SE blocks), `src/drivers/fesom_lifecycle_native_mr.F90` (➕ max CFL_z line)
+
+- [x] pi, `fesom_conserve`, `FESOM3_SSH_SE=1 FESOM3_SE_CHECK=1 FESOM3_WHICH_ALE=linfs`, 1000 steps: SE_CHECK
   invariants at rounding (record the levels); `fesom_conserve`'s linfs checks green (T10 no-leakage, helem
-  consistency, finiteness). Heat and salt drift reported only, as for SI linfs
-- [ ] CORE2 `prod_env`, np 1, 48 steps (~6–10 min) with SE and with SI: no NaN, invariants at rounding, max|η| and
-  max CFL_z comparable
-- [ ] record the measured levels here and set the gate thresholds (margin ×100)
+  consistency, finiteness). Heat and salt drift reported only, as for SI linfs. Job 28217370 (np 1, M = 50, launched
+  as the SE blocks of `run_conserve_pi.sh`), maxima over the run, 1000 SE_CHECK lines each:
+  - default physics: **etacomp 5.0e-15 m, trim 5.7e-13 m²/s, |msl| 3.5e-16 m, spreadU = spreadUm = 0**; max|η|
+    4.03 m, max|Ū| 913 m²/s;
+  - vector-invariant momentum, rvo_upwind 1, sea ice: **4.8e-15 m, 4.5e-13 m²/s, 2.9e-16 m, spreads 0**; 3.98 m;
+  - the linfs invariants hold for all 1000 steps (no T10 / helem / non-finite stop), divsum ≤ 2.3e-16 (SI 1.5e-15),
+    copy spreads 0. Drift (reported): heat −3.676e-4, salt −1.591e-6 (SI −3.692e-4, −1.604e-6); with ice −3.708e-4,
+    −1.566e-6 (SI −3.722e-4, −1.584e-6), ice masses ≤ 1.5e-15. Wall 90 s (SI 76 s), with ice 125 s (SI 100 s)
+- [x] CORE2 `prod_env`, np 1, 48 steps (~6–10 min) with SE and with SI: no NaN, invariants at rounding, max|η| and
+  max CFL_z comparable. Job 28217370 (`t15_gate.sbatch`; SE 422 s, SI 354 s):
+  - **M_min = 35** (limit 52.199 s; the default M = 50 passes), as port_kokkos;
+  - SE_CHECK over 48 steps: **etacomp ≤ 1.9e-14 m, trim ≤ 3.4e-13 m²/s, |msl| ≤ 4.4e-16 m, spreads 0**, no NaN;
+    divsum ≤ 1.1e-15 (SI 1.3e-15);
+  - max over the run: **max|η| SE 4.29 m (step 31) vs SI 1.66 m (step 13); max CFL_z SE 0.870 (step 24) vs SI
+    0.612 (step 19)**; max|uv| 1.90 vs 1.79 m/s. SE − SI at step 48 (node dumps): rms Δη 0.16 m of rms η_SI
+    0.51 m; rms Δw 3.8e-5 of 9.3e-5 m/s; rms ΔT 9.2e-3 °C, rms ΔS 3.6e-3
+  - ⚠️ **max|η| is 2.6 times SI's: investigated, physics, no code change.** The extremes are smooth, coherent
+    set-ups (not grid-scale noise) at the 20 m minimum depth of the resonant macrotidal gulfs, same sign as SI and
+    ~4.6 times larger at step 48: head of the Bay of Bengal (91.9°E 22.4°N) +4.25 m vs +0.92, Gulf of Khambhat
+    −4.08 vs −0.79, Gulf of California −3.91 vs −0.73. Decisive Δt experiment (job 28217549, one model day,
+    end-of-day η): **SE is Δt-independent** (Bay of Bengal head 4.25 / 4.31 m at Δt 1800 / 900 s, Khambhat −4.08 /
+    −4.10, California −3.91 / −3.95; max|η| over the day 4.29 / 4.41 m) **while SI converges to it as Δt shrinks**
+    (Bay of Bengal head 0.92 → 1.74 → 3.20 m at Δt 1800 / 900 / 300 s, Khambhat −0.79 → −1.81 → −3.05, California
+    −0.73 → −1.15 → −1.98; max|η| over the day 1.66 / 2.21 / 3.21 m; rms η 0.507 / 0.513 / 0.527 m vs SE 0.548).
+    SI's θ = 1 backward Euler damps the resonant external gravity waves of the cold-start adjustment (damping per
+    step grows with ωΔt); SE resolves them. port_kokkos M12 recorded the same ("hotter than SI in transients by
+    physics", cold-start peak 3 m vs 2 m). The larger CFL_z follows from the resolved waves. SE at Δt 900 s:
+    M_min 18, SE_CHECK etacomp 1.2e-14 m, trim 2.8e-13 m²/s, |msl| 6.0e-16 m. Stage 5 should watch these gulfs
+    in the cold-start peak
+  - ➕ max CFL_z: the STEP_DIAG step line has no CFL_z, so the lifecycle now prints a separate line
+    `fesom_lifecycle_native_mr: CFL_z step N  max CFL_z=…` (dstat(10), the same MPI_MAX). The step line stays
+    byte-identical (G0 diffs it; run_cutout_short.sh reads its fields)
+  - timers (np 1, mean ms/step, informational; job 28217684, SE without SE_CHECK, the two runs alone on the
+    allocation): **SE "dynamics ssh" 947.6, of which the barotropic substeps 853.3 (M = 50, 17 ms per
+    substep); SI 496.9, of which the CG solve 268.7**; step_oce 6558 vs 6089, loop 7509 vs 7036 (SE 368 s, SI
+    344 s). At np 1 the SE SSH phase costs 1.9 times SI's; Stage 5 measures the parallel case
+- [x] record the measured levels here and set the gate thresholds (margin ×100):
+
+  | invariant | pi, 1000 steps (max of 2 configs) | pi gate (`run_conserve_pi.sh` SE_TOL_*) | CORE2 np 1, 48 steps | CORE2 gate (Stage 2) |
+  |---|---|---|---|---|
+  | etacomp [m] | 5.0e-15 | 5e-13 | 1.9e-14 | 2e-12 |
+  | trim [m²/s] | 5.7e-13 | 6e-11 | 3.4e-13 | 3.5e-11 |
+  | \|msl\| [m] | 3.5e-16 | 4e-14 | 6.0e-16 (Δt 900 s) | 6e-14 |
+  | spreadU, spreadUm | 0 | 0 exactly | 0 | 0 exactly |
+
+  `tools/run_conserve_pi.sh` has the SE blocks (header and two configs, np 1: default, vinv + rvo_upwind 1 + ice;
+  `while read` list, so Task 2.2 adds np 2/8 as lines): the driver's linfs invariants plus the run maxima of the
+  SE_CHECK tokens against SE_TOL_ETACOMP / _TRIM / _MSL, spreads exactly 0, and one line per step. G0 runs the frozen
+  copy, so its case set is unchanged
+- [x] ➕ final gate on the Task 1.5 tree (job 28217684, shared, 24.8 min, 0.31 node-h): **ctest Intel 174/174, GNU
+  168/174 (the 6 known)**; `run_conserve_pi.sh` **GATE OK**, 28 configs, the SE blocks at 20 steps: etacomp
+  2.0e-15 / 1.6e-15 m, trim 1.1e-13 / 1.7e-13 m²/s, |msl| 1.0e-16 m, spreads 0; **G0 GREEN** (linfs, zstar, conserve
+  byte-identical to the frozen main references; 416 s); **restart gate linfs np 1 GREEN** (mid-run and month
+  boundary, checkpoint and live dump max|Δ| = 0; 198 s). Intel `fesom_lifecycle_native_mr` sha256
+  `b4661db7b23d4c5f…`. Scripts `/work/ab0995/a270088/fesom3_se_ref/jobs/t15_gate.sbatch`, `t15_where.sbatch`,
+  `t15_dtexp.sbatch`, `t15_final.sbatch`; run dirs `/scratch/a/a270088/se_t15/`. Stage 1 cost (Tasks 1.3-1.5):
+  0.78 node-h
 
 ### Stage 2 — linfs, many ranks
 *The risk port_kokkos never had: shared border elements under the vertex bottom.*
@@ -562,12 +618,13 @@ scripts and logs in its `jobs/`)
 #### Task 2.2: GATE Stage 2 — linfs np > 1
 
 - [ ] add an SE block to `tools/run_conserve_pi.sh` (linfs + ice, np 2 and 8, `FESOM3_SSH_SE=1`) next to the
-  SHARED block; the existing blocks stay unchanged
+  SHARED block; the existing blocks stay unchanged. (Task 1.5 put the SE block in place with np 1 configs: add
+  `<label> <np> <env>` lines to its `while read` list; re-measure the SE_TOL_* levels at np 2/8)
 - [ ] CORE2 `prod_env`, np 8 (480 steps) and np 128 on one node (480 steps), `FESOM3_STEP_DIAG=1 FESOM3_SE_CHECK=1`:
   - divsum ≤ 1e-13;
   - dUV = dAB = dsig = 0;
   - SE copy spreads = 0;
-  - invariants at the Stage 1 level
+  - invariants at the Stage 1 level (the CORE2 gate column of the Task 1.5 table)
 - [ ] determinism: the same binary at the same np, run twice, is bitwise identical (`dump_diff.py --rel-floor 0`);
   np 1 vs np 8 difference recorded
 - [ ] G0
