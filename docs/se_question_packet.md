@@ -139,3 +139,19 @@ elevation at the start of the step and frozen over it reproduces the pattern: χ
 8. **linfs or zstar** for production with SE? Both are gated; zstar adds the freshwater term to η.
 9. **Canonical scheme.** The notes' SM AB3–AM4 or the Zenodo forward-backward variant with
    semi-implicit Coriolis (still open from the port_kokkos packet)?
+
+## 6. Answers
+
+Sergey Danilov's answers of 2026-10-18 (relayed by Nikolay), summarised.
+
+**Question 1.** The damping coefficient is chosen by experiment; his setups are stable at 0.2. Damping is better
+than the averaging filter, which needs more than M substeps and costs performance. The barotropic stepping is best
+built on the SESM scheme, which is more stable and should work with less dissipation.
+
+- χ is tuned by experiment; his setups are stable at χ = 0.2. (FESOM_F default χ = 0.25; 0.2 not yet tested on
+  CORE2.)
+- Damping, not the SM2005 averaging filter: the filter needs more than M substeps and costs performance. This
+  agrees with the no-filter choice (D1); the filter option is dropped.
+- He recommends building the barotropic stepping on the "SESM" scheme (more stable, less dissipation needed).
+  ⚠️ Open: which scheme "SESM" is (not in the notes, the Zenodo code or the literature search); ask for a
+  reference.
