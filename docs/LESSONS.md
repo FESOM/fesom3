@@ -3017,3 +3017,37 @@ harmless for terms whose 3-D discretisation of the fast mode matches the 2-D one
 removal by an approximate one, ask whether the fast barotropic mode is in the 3-D fields (no filter: yes) and
 how the 3-D time scheme (here AB2 at ωτ ≈ 2) treats it. Screen with production physics for ≥ 480 steps at
 every χ of interest, and separate the changes with debug switches (one change per run) before deciding.
+
+## L76 — Keep Coriolis out of the barotropic forcing (or subtract a stable estimate of it), and pick χ per mesh as the smallest value that survives a full year in every vertical coordinate: 3000-step screens are not enough
+
+**Context.** Split-explicit plan, Tasks 5.5 and 5.6 (2026-10-18), after the Task 5.4 blow-ups (L75) and the scheme
+author's answers (question packet §6): the first-substep Coriolis is expected to be unstable without a filter;
+either subtract a stable AB2 estimate of the barotropic Coriolis or leave Coriolis out of R̄ as Banerjee et al.
+(2024) do; D4 + the barotropic drag is acceptable; use minimal dissipation, χ depends on the mesh.
+
+**What happened.**
+- D4 (the 3-D AB2 Coriolis rebuilt from stored transport sums and removed from F) is exactly "Coriolis out of R̄":
+  the substeps then carry the whole barotropic Coriolis. Restoring it (commit 55f717b) reproduced the Task 5.4
+  debug runs line for line (step, CFL_z, SE_CHECK, DBG_SHELF at χ 0.1 and 0.25, np 8) and, with the drag off, the
+  old scheme; an old checkpoint resumed by the new binary equalled the old binary's straight run.
+- With the drag, the shelf mode of L74 decayed at every χ screened (480 steps, np 8): χ 0.05 / 0.07 / 0.1 / 0.25 at
+  −0.12 / −0.27 / −0.34 / −0.30 %/step over steps 150–330. χ = 0.05 also ran 3000 steps clean under linfs and
+  zstar, with the late shelf noise identical to χ 0.1 and 0.25, and a linfs year as close to SI as χ = 0.25 (SSH
+  rms 0.110 mm).
+- The zstar year at χ = 0.05 blew up on day 229: from one step to the next max|η| began to alternate with a period
+  of two baroclinic steps and grew by ~15 % per step to an overflow 23 steps later. The monthly means point at the
+  equatorial Atlantic (26°W 5°N, 4400 m), where both χ = 0.05 years (linfs and zstar) had a July anomaly of
+  +30–40 mm SSH and +1.6 °C at 85 m against SI, which χ = 0.25 (6 mm) did not. Not located exactly (no diagnostics
+  in the production binary, no checkpoint near the event).
+
+**How to apply.**
+- Treat "approximate consistency" of F with the substeps term by term (L75): drag and viscosity anchored at Ūⁿ are
+  safe; Coriolis needs either the exact removal of the 3-D term (D4) or a stable estimate, never the first
+  substep's instantaneous value.
+- Choose χ per mesh, smallest first, but accept a value only after a full year (seasonal forcing, a cold start
+  transient long gone) in every vertical coordinate production will use; a 480-step screen orders the candidates,
+  3000 steps rules out the shelf mode, neither rules out a late, local event. Give such runs monthly checkpoints
+  and a location printout of max|η| so a blow-up can be replayed from the last month for a few node-minutes.
+- A two-step period in the step diagnostics points to a mode at ωτ ≈ π (for example the AB2 computational mode of
+  the 3-D step, or a barotropic mode that small χ damps too little), not to the three-step shelf mode of L74; this
+  is a hypothesis until the event is located.

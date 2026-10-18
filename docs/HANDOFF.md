@@ -10,9 +10,11 @@ Full pre-M2.12 milestone detail + the per-gate recipes live in [`HANDOFF-archive
   Sergey's notes (`FESOM3_SSH_SE=1`), linfs and zstar, any np, exact restarts; SE off byte-identical to main. At χ = 0.1
   a cold CORE2 run blows up at step ~335 (sea-ice feedback, no code defect); Nikolay approved Stage 5 on 2026-10-18 and
   chose χ = 0.25 as the default (Task 5.0 done, re-verified); the 3000-step screens run stably (Task 5.1); next the
-  1-year twin and perf → section "Split-explicit barotropic solver". ⚠️ Task 5.4 (2026-10-18, commit 6a76b29,
-  Sergey's answers Q3/Q5): barotropic bottom drag (stabilises χ = 0.1) + first-substep Coriolis consistency
-  (destabilises: the default χ 0.25 now blows up a cold CORE2 run at step 313); decision for Nikolay in the plan.
+  1-year twin and perf → section "Split-explicit barotropic solver". Task 5.4 (commit 6a76b29) added the barotropic
+  bottom drag (kept) and a first-substep Coriolis r-term (blew up at every χ); Task 5.5 (commit 55f717b) restored the
+  stored-sum Coriolis (D4) with the drag, gated GREEN. ⚠️ Smallest stable χ on CORE2 open: χ 0.05 passes the
+  480/3000-step screens and the linfs year, but the zstar year at 0.05 blew up on day 229 (Task 5.6); next a zstar
+  year at χ 0.1 (≈ 0.76 node-h, needs a yes). Default χ unchanged (0.25).
 - **Shared-element velocity sync ✅ DONE (2026-10-12, plan `plans/completed/20261012-shared-element-sync.md`,
   on `bottom-at-vertices`):** a border element is owned by every rank that owns one of its vertices;
   `update_vel` now gives every such element one owner for `uv` (the highest vertex-owner rank, whose copy
@@ -359,7 +361,9 @@ no filter, trim to ⟨⟨Ū⟩⟩; replaces `update_stiff_mat_ale … update_eta
 the SI block verbatim in the `else`). Depth law H_e(η) = Hⁿ + Σ elem_w·c·(η − ηⁿ) (linfs c ≡ 0, zstar c from
 `zbar_3d_n`); F synced once per step from the shared-element owner, gather-only element operators; linear BT
 viscosity on Ūᵐ − Ūⁿ; operator-based CFL guard (power iteration ω_max, Schur–Cohn a_crit(χ), s = 0.9; CORE2 M_min
-40 / 48 at χ 0.1 / 0.25); `FESOM3_SE_CHECK` invariant lines; 8 SE stores in the checkpoint (10 until Task 5.4).
+40 / 48 at χ 0.1 / 0.25, 38 at 0.05); `FESOM3_SE_CHECK` invariant lines; 10 SE stores in the checkpoint (8 in the
+interim Task 5.4 code, whose checkpoints do not resume). Coriolis r-term: the stored transport sums (D4, restored by
+Task 5.5); barotropic bottom drag in the substeps (Task 5.4).
 Knobs (env only): `FESOM3_SSH_SE`, `FESOM3_SE_M` (50), `FESOM3_SE_M_FORCE`, `FESOM3_SE_CHI` (0.25; 0.1 until
 2026-10-18), `FESOM3_SE_VISC_AH` (0.01), `FESOM3_SE_VISC_FLOW` (0), `FESOM3_SE_BOTTDRAG` (1, Task 5.4),
 `FESOM3_SE_CHECK`. Drivers: `fesom_lifecycle_native_mr`, `fesom_conserve`; every other driver stops with SE on.
@@ -402,12 +406,23 @@ node-h in total).**
    14.3 ms/step) — whether to keep `se_visc_ah` 0.01 is Nikolay's call. Frozen binaries `bin_s5a_fbbf777`.
    Open: Task 5.2 1-year SE-vs-SI twin (linfs), Task 5.3 SSH-phase timing on one node (np 128; seen so far: SE
    12.9 vs SI 9.1 ms/step in the SSH phase).
-3. Then Task 6.1's last box (G3 numbers), the plan to `completed/`, a tag, the memory update; send the packet once
-   the G3 numbers exist. Later: JAX port of SE (bitwise against this code), NEMO SE, storing M/χ in the checkpoint.
+3. ✅ Task 5.2 twin, ✅ Task 5.3 cost (see the plan). Task 5.4 (drag + first-substep Coriolis, 6a76b29): the drag
+   stabilises, the Coriolis form blows up at every χ. ✅ Task 5.5 (55f717b): D4 restored with the drag (bitwise the
+   Task 5.4 debug runs); gates GREEN (job 28227204, frozen `bin_s5f_28227204`); minimal-χ screens: χ 0.05/0.07/0.1/0.25
+   all decay over 480 steps, χ 0.05 clean for 3000 steps under linfs and zstar; linfs year at χ 0.05: SSH SE − SI rms
+   0.110 mm, max 2.45 mm (a July event at 26°W 5°N, 34 mm). ⚠️ Task 5.6: SI zstar year fine; SE zstar year at χ 0.05
+   blew up at step 10989 (2-step oscillation, ~15 %/step, likely the same equatorial-Atlantic spot). Open: SE zstar
+   year at χ 0.1 (then 0.07) — `cd /work/ab0995/a270088/fesom3_se_ref/jobs && sbatch -J s5_F_twin_se_zstar
+   s5_F_twin.sbatch se zstar /work/ab0995/a270088/fesom3_se_ref/bin_s5f_28227204 0.1`, then `sbatch s5_F_diff.sbatch
+   /scratch/a/a270088/se_s5f/twin_si_zstar_28227175 /scratch/a/a270088/se_s5f/twin_se_zstar_<jobid> SIz,SEz010
+   se_si_zstar_chi010`; then the default χ (Nikolay), Task 6.1's last box, the plan to `completed/`, a tag, the
+   memory update. Later: JAX port of SE (bitwise against this code), NEMO SE, storing M/χ in the checkpoint.
 
 **Gotchas.**
-- χ = 0.1 (the default until 2026-10-18) blows up a cold CORE2 production-physics run near step 335; the default
-  is now 0.25 (Task 5.0). Runs that set `FESOM3_SE_CHI` explicitly keep their value.
+- χ = 0.1 (the default until 2026-10-18) blows up a cold CORE2 production-physics run near step 335 without the
+  barotropic drag; with the drag (default since Task 5.4) it decays. The default is 0.25 (Task 5.0). χ = 0.05 with the
+  drag blew up a zstar year on day 229 although 3000-step screens were clean: screen χ with a full year under zstar.
+  Runs that set `FESOM3_SE_CHI` explicitly keep their value.
 - M and χ must stay fixed across a restart chain (not stored, not checked); SE → SI is not detected.
 - The restart gate scripts default to a stale `F3`: always pass `F3=` and `BUILD=`. They `rm -rf` their run dir:
   pass a fresh one.

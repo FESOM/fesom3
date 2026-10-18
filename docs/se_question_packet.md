@@ -250,3 +250,12 @@ mesh, so it is best a user parameter.
 - Question 3: use the smallest χ that is stable; it can depend on the mesh, so χ stays a user parameter
   (`FESOM3_SE_CHI`), set per mesh. The default should be the smallest χ that is stable on the reference mesh (CORE2),
   not a value chosen with a margin; the documentation should say it is mesh-dependent.
+
+**➕ Results (plan Tasks 5.5–5.6, 2026-10-18).** D4 is restored with the barotropic drag (commit 55f717b; it
+reproduces the screened D4 + drag runs line for line). With the drag the shelf noise decays at χ = 0.05 / 0.07 /
+0.1 / 0.25 (480 steps: −0.12 / −0.27 / −0.34 / −0.30 %/step over steps 150–330), and χ = 0.05 runs 3000 steps
+under linfs and zstar and a full linfs year (annual-mean SSH SE − SI rms 0.110 mm, max 2.45 mm; SI's own np 256 vs
+128 spread 0.72 mm, 39 mm). But the zstar year at χ = 0.05 blew up on day 229: a two-step oscillation of max|η|,
+growing ~15 % per step, probably at 26°W 5°N in the equatorial Atlantic, where both χ = 0.05 years had a July
+anomaly of 30–40 mm and 1.6 °C at 85 m that χ = 0.25 did not have. So on CORE2 the smallest χ stable for a year
+under zstar lies above 0.05; a zstar year at χ = 0.1 is the next test. The default χ is still 0.25.
