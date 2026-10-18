@@ -12,6 +12,13 @@ fesom.mesh.diag.zarr (FESOM3_MESHDIAG=1), and prints:
   - monthly sea-ice area (sum a_ice * area), extent (area where a_ice > 0.15) and volume
     (sum m_ice * area), NH (lat > 0) and SH (lat < 0), for both runs and SE - SI
   - annual-mean SST / SSS / a_ice differences (rms, max)
+  - 3-D temp and salt, SE - SI, per depth band (0-100 m, 100-1000 m, 1000 m-bottom, all) and per
+    level: volume-weighted rms and max |diff| (lon, lat, depth) of the annual mean, the first and the
+    last month; the band-mean drift (last - first month) of each run; and, as the scale of the
+    signal, the rms of the SI run's own change over the year (last - first month)
+
+The two runs need not be SI and SE: --labels names them (e.g. a noise baseline, SI np 256 vs SI np
+128, passed as --se / --si); the tables keep the SI / SE column names.
 
 Weights: area = nod_area(1, n) of fesom.mesh.diag.zarr (FESOM_F's depth-independent nodal area);
 volume of layer k at node n = nod_area(k, n) * (nz(k+1) - nz(k)), the cold linfs layer thickness
@@ -61,6 +68,13 @@ def _argmax_abs(x):
     return i, float(a[i])
 
 
+def _argmax_abs2(x):
+    a = np.where(np.isfinite(x), np.abs(x), -1.0)
+    j = int(np.argmax(a))
+    k, n = np.unravel_index(j, x.shape)
+    return int(k), int(n), float(a.flat[j])
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--si", required=True, help="FESOM3_OUTPUT dir of the semi-implicit run")
@@ -68,9 +82,12 @@ def main():
     ap.add_argument("--mesh", help="fesom.mesh.diag.zarr (default: <si>/fesom.mesh.diag.zarr)")
     ap.add_argument("--year", type=int, default=1958)
     ap.add_argument("--json", help="also write the numbers to this JSON file")
+    ap.add_argument("--labels", default="SI,SE", help="names of the --si and --se runs for the header")
     a = ap.parse_args()
     runs = {"SI": a.si, "SE": a.se}
     out = {"si": a.si, "se": a.se, "year": a.year}
+    out["labels"] = a.labels
+    print(f"runs: SI = {a.labels.split(',')[0]} ({a.si}); SE = {a.labels.split(',')[-1]} ({a.se})")
 
     # ------------------------------------------------------------------ mesh and weights
     mesh = _open(a.mesh or os.path.join(a.si, "fesom.mesh.diag.zarr"))
@@ -230,6 +247,62 @@ def main():
         iv, mv = _argmax_abs(dv)
         out["other_2d"][var] = {"rms": _wrms(dv, area), "max_abs": mv, "lon": float(lon[iv]), "lat": float(lat[iv])}
         print(f"  {var:6s} rms {_wrms(dv, area):.3e} {unit}, max {mv:.3e} {unit} ({lon[iv]:.2f}E {lat[iv]:.2f}N)")
+
+    # ------------------------------------------------------------------ 3-D temp and salt
+    zmid = 0.5 * (zlev[:-1] + zlev[1:])                       # layer mid-depths (nz1), positive down
+    bands = (("0-100 m", 0.0, 100.0), ("100-1000 m", 100.0, 1000.0), ("1000 m-bottom", 1000.0, 1.0e9),
+             ("all", 0.0, 1.0e9))
+    print("\n== 3-D temp and salt, SE - SI: volume-weighted rms, max |diff| (lon, lat, layer mid-depth)")
+    out["tracer_3d"] = {}
+    for var, unit in (("temp", "degC"), ("salt", "psu")):
+        f = {}
+        for r, dd in runs.items():
+            x = _open(_store(dd, var, a.year))[var]
+            f[r] = np.stack([x[m].values.astype(float) for m in range(nm)])   # (nm, nz1, nod2)
+        ann = {r: annual(f[r]) for r in runs}
+        cases = (("annual mean", ann["SE"] - ann["SI"]), (f"{mnames[0]}", f["SE"][0] - f["SI"][0]),
+                 (f"{mnames[nm - 1]}", f["SE"][nm - 1] - f["SI"][nm - 1]),
+                 (f"SI own change {mnames[nm - 1]} - {mnames[0]}", f["SI"][nm - 1] - f["SI"][0]))
+        r3 = {}
+        print(f"  {var} [{unit}]")
+        for cname, dd3 in cases:
+            r3[cname] = {}
+            for bname, z0, z1 in bands:
+                sel = ((zmid >= z0) & (zmid < z1))[:, None] & (vol > 0)
+                w = np.where(sel, vol, 0.0)
+                k, n, mv = _argmax_abs2(np.where(sel, dd3, np.nan))
+                rms = _wrms(dd3, w)
+                r3[cname][bname] = {"rms": rms, "max_abs": mv, "lon": float(lon[n]), "lat": float(lat[n]),
+                                    "depth_m": float(zmid[k])}
+                print(f"    {cname:28s} {bname:14s} rms {rms:.3e}  max {mv:.3e} "
+                      f"({lon[n]:7.2f}E {lat[n]:6.2f}N {zmid[k]:6.0f} m)")
+        # band means and their drift (last - first month)
+        r3["band_mean"] = {}
+        print(f"    band-mean {var}: {mnames[0]} / {mnames[nm - 1]} / drift for SI and SE, SE - SI of the drift")
+        for bname, z0, z1 in bands:
+            sel = ((zmid >= z0) & (zmid < z1))[:, None] & (vol > 0)
+            w = np.where(sel, vol, 0.0)
+            bm = {r: [_wmean(f[r][0], w), _wmean(f[r][nm - 1], w)] for r in runs}
+            dr = {r: bm[r][1] - bm[r][0] for r in runs}
+            r3["band_mean"][bname] = {"SI": bm["SI"], "SE": bm["SE"], "drift_SI": dr["SI"], "drift_SE": dr["SE"]}
+            print(f"      {bname:14s} SI {bm['SI'][0]:.7f} / {bm['SI'][1]:.7f} / {dr['SI']:+.3e}   "
+                  f"SE {bm['SE'][0]:.7f} / {bm['SE'][1]:.7f} / {dr['SE']:+.3e}   SE-SI {dr['SE'] - dr['SI']:+.3e}")
+        # per level, annual mean
+        d_ann = ann["SE"] - ann["SI"]
+        r3["levels"] = []
+        print(f"    per level, annual mean SE - SI: level  mid-depth  rms  max |diff| (lon, lat)")
+        for k in range(zmid.size):
+            w = np.where(vol[k] > 0, vol[k], 0.0)
+            if not np.any(w > 0):
+                continue
+            dk = np.where(w > 0, d_ann[k], np.nan)
+            n, mv = _argmax_abs(dk)
+            rms = _wrms(d_ann[k], w)
+            r3["levels"].append({"level": k + 1, "depth_m": float(zmid[k]), "rms": rms, "max_abs": mv,
+                                 "lon": float(lon[n]), "lat": float(lat[n])})
+            print(f"      {k + 1:3d} {zmid[k]:7.1f} m  {rms:.3e}  {mv:.3e} ({lon[n]:7.2f}E {lat[n]:6.2f}N)")
+        out["tracer_3d"][var] = r3
+        del f, ann
 
     if a.json:
         with open(a.json, "w") as f:
