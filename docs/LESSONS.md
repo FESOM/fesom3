@@ -2873,3 +2873,116 @@ once and send it, or test that the copies stay bitwise equal. At np>1, test the 
 `|sum ssh_rhs_old| / sum|ssh_rhs_old|` and the copy spreads (`FESOM3_STEP_DIAG`, `fesom_conserve`
 `FESOM3_DIVSUM_TOL`), not only conservation at np 1. When a gate needs a "harmless ULP floor" at
 np>1, find the duplicated state behind it before accepting it.
+
+
+## L71 — Under Intel `-no-prec-div` a division by a loop invariant rounds differently in the vectorised body and in the scalar remainder: per-element results then depend on the local index, and the copies of a shared element differ by 1 ULP
+
+**Context.** Split-explicit plan (`docs/plans/2026-10-17-split-explicit.md`), Task 2.1, and Task 3.1
+on a side branch (found twice, independently). The SE design keeps the copies of a shared border
+element bitwise equal without a per-substep sync: every per-element operator is a gather in fixed slot
+order from bitwise-equal inputs (IMPLEMENTATION §14).
+
+**What happened.**
+- `se_subcycle` accumulated the mean transport as `umean += ustar/rM`. U*, the three ring levels and
+  H^A were bitwise equal on all owners at every substep, yet the ⟨⟨Ū⟩⟩ copies differed by 1e-16 to
+  1.8e-15 m²/s (test_ssh_se P2, Intel np 2 and 8; GNU passed).
+- The Intel anchor flags (copied from FESOM2) include `-no-prec-div`. The element loop was vectorised
+  (vector length 2) with a scalar remainder loop (vectorisation report). The division by the
+  loop-invariant `rM` was evaluated one way in the vector body and another way in the remainder, so
+  the result depended on where the element sat in the loop. A shared element has a different local
+  index on each owner.
+- At scale with the old binary: CORE2 np 128, `spreadUm` > 0 in 298 of 340 steps, up to 1.1e-13 m²/s;
+  pi np 2/8 over 1000 steps, 2.8e-14. The `run_conserve_pi.sh` SE lines at np 2/8 would have failed.
+- Fix: `umean += ustar*rMinv` with `rMinv = 1/rM` computed once. A product is correctly rounded on
+  every code path; afterwards every copy spread is 0 at every substep.
+
+**How to apply.** This is L7's trap (`-no-prec-div` turns `x/y` into `x·recip(y)` with a
+1-ULP approximation for a runtime divisor) in a new form: the same source line gives two results in
+one loop. "Gather in fixed slot order" is necessary but not sufficient: the arithmetic of a
+per-element loop must not depend on the element's position in the loop. Multiply by a precomputed
+reciprocal instead of dividing by a loop invariant. Divisions are acceptable only where the result is
+synced afterwards (F's G/τ, the trimmed `uv`) or is a diagnostic. Test copy spreads bitwise at np > 1
+on the Intel anchor; GNU did not show the defect.
+
+
+## L72 — A resolution-based barotropic CFL estimate (0.5·res/√(gH)) underestimated the discrete operator's ω_max by 3.3× on CORE2: take the limit from the operator's spectrum and the scheme's stability polynomial
+
+**Context.** Split-explicit plan, Task 2.2 (M = 35 blew up at step 5), the Task 5.1 diagnosis and
+the guard fix in Task 0.4.
+
+**What happened.**
+- The guard taken from port_kokkos set dtbt ≤ 0.5·res/√(gH) (minimum over the nodes) and gave
+  M_min = 35 on CORE2 at Δt = 1800 s. M = 35 at χ = 0.1 blew up at step 5.
+- A power iteration of the substeps' linear operator A η = −I(H·(−g∇η))/areasvol gave ω_max =
+  3.152e-2 s⁻¹, with the eigenvector in the Kuril–Kamchatka trench. The guard's critical node was in
+  the Aleutian trench with c/res = 9.579e-3 s⁻¹. The ratio 3.29 means that at the guard's limit
+  ω_max·dtbt = 1.645, above the AB3–AM4 limit a_crit = 1.579 at χ = 0.1.
+- The real substep loop agreed with the scalar theory to the substep (unstable at M = 35 with
+  growth 1.24 per substep, theory 1.26; stable from M = 38). At χ = 0.25 the old guard admitted the
+  unstable M = 35–42.
+- The ratio is mesh-dependent: an ideal equilateral P1 mesh gives 2.57. A fixed "safety factor" on
+  res/c does not carry over from one mesh to another.
+
+**How to apply.** Compute the CFL limit of an explicit scheme from the discrete operator, not from a
+continuous estimate: ω_max by power iteration (100 iterations cost 0.06 s on CORE2 at np 8) and
+a_crit from the time scheme's characteristic polynomial (Schur–Cohn, no root finder), with a safety
+factor that covers only what the scalar test ignores (here s = 0.9). Check the guard with the real
+loop just below and just above the limit (0.97 and 1.03 a_crit).
+
+
+## L73 — A zstar restart was never exact: the derived thicknesses were not rebuilt after the read, and the restart gates had only run linfs. SI-zstar still carries one gap, the accumulated stiffness matrix
+
+**Context.** Split-explicit plan review and Task 4.1 (`restart_read` in
+`fesom_lifecycle_native_mr`).
+
+**What happened.**
+- A checkpoint restores `hnode`. `helem`, `zbar_3d_n`, `Z_3d_n` and `hnode_new` stayed at their cold
+  values after `restart_read`. Under linfs these never change, so the linfs-only restart gates could
+  not see it. With `FESOM3_WHICH_ALE=zstar` the gate failed with 26 checkpoint variables different
+  (eta_n 8e-4, temp 2.9e-2 at N4 K2); the first resumed step departed at PRESSURE_BV, which reads the
+  cold `Z_3d_n`.
+- Fix: for zstar, set `hnode_new = hnode` and call `update_thickness_ale` after the read. It rebuilds
+  the derived fields with the straight run's own loops, so the result is bitwise.
+- SI-zstar still fails, now first at SSH_SOLVE of the first resumed step (d_eta 5.5e-4).
+  `update_stiff_mat_ale` adds −dhe of the previous step to `ssh_stiff%values` every step, so the
+  values accumulate from the cold start, and the checkpoint holds neither dhe nor the values. A probe
+  build with that update switched off passed at np 1 and 2, so this is the only remaining gap.
+  (Restoring dhe would also change the Jacobi preconditioner, which is built once at the first
+  solve.) Split-explicit does not use the matrix, and SE-zstar restarts are exact.
+
+**How to apply.** Run the restart gate in every mode production can use, not only the default. For
+each mode, list the state derived incrementally across steps (accumulated matrix updates, solver
+initial guesses, carried diagnostics) and either store it, rebuild it from stored state, or document
+the gap. The diagnostic N = 3, K = 2 split (its final step is the first resumed step) names the
+first diverging substep.
+
+
+## L74 — Split-explicit exposed a shelf-wave/sea-ice feedback that SI's θ = 1 damping hides: the ice reads η once per step and hands its stress to the ocean frozen over the next step
+
+**Context.** Split-explicit plan, Tasks 2.2 and 3.2, and the Task 5.1 diagnosis. CORE2, production
+physics, cold start, χ = 0.1, M = 50: the run blew up at step 331–340 (day 7) at np 8 and np 128,
+under linfs and zstar, while every SE invariant stayed at rounding.
+
+**What happened.**
+- A grid-scale η pattern grew on the 20 m Antarctic shelf at 72–75°W, 71–73°S under compact sea ice
+  (a = 1), from about step 150 at +0.9 % per step, with a period of 3.0 baroclinic steps (ωτ ≈ 2.1).
+  SI's backward Euler damps such a mode to 1/√(1 + (ωτ)²) ≈ 0.43 in amplitude per step; the SM
+  substeps damp it only by about χ(ωτ)²/M ≈ 0.9 % per step. More substeps damp less: M = 100 blew up
+  earlier (step 192), and `se_visc_ah` = 0 at step 298.
+- On/off runs (480 steps) located the loop. Without the ice→ocean stress, or with the ice seeing
+  η = 0, the noise decayed (−0.45 % per step). Without bottom drag the growth was reduced. χ = 0.25 and
+  `se_visc_ah` = 0.1 also decayed.
+- The loop: before each ocean step the ice reads hbar = ηⁿ; the grid-scale tilt −m·g·∇ηⁿ drives the
+  compact ice; the ice→ocean stress enters the barotropic forcing F, frozen over [tⁿ, tⁿ⁺¹]. The
+  explicit bottom drag, also frozen in F from the previous step's velocity, adds to it. A one-mode
+  model of the substeps plus a force of relative size 0.03 taken from the step-start elevation
+  reproduced the growth rates of all runs (`/work/ab0995/a270088/fesom3_se_ref/jobs/dbg_toy_ice.py`).
+  port_kokkos had lost an Antarctic-shelf run the same way at χ = 0.05.
+
+**How to apply.** When a fast mode moves from an implicit, damping treatment to an explicit,
+resolving one, check every slow component that reads it once per step and feeds a force back frozen
+over the next step (sea ice, explicit drag). Screen with the coupled physics and real forcing for
+more than 300 steps; the consistency invariants will not warn. Watch grid-scale noise on shallow
+shelves, and find the loop with on/off runs of each link plus a one-mode model. Remedies to weigh
+(plan Task 5.1): more χ, more barotropic viscosity, a filtered η for the ice, the SM2005 averaging
+filter. More substeps is not one.

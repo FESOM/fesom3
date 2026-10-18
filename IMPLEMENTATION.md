@@ -46,6 +46,7 @@ configuration, and a distributed Zarr I/O stack.
 | Configuration | namelists spread across modules | write-once `mod_config` (today: drivers use `FESOM3_*` env vars) |
 | Output | gather to rank 0 → netCDF | distributed Zarr writers, no rank-0 gather, partition-independent |
 | Restart | rank-0 gather → netCDF | partition-independent Zarr checkpoints (same I/O stack) |
+| Free surface | semi-implicit, CG solve | the same CG solve (default) or split-explicit barotropic subcycling (`FESOM3_SSH_SE=1`, §14) |
 
 ### v1 scope
 
@@ -82,23 +83,23 @@ a portability check, not a second bit-identity anchor.
 
 ### 2. Source organization
 
-`src/` holds 99 Fortran files: **67 library modules across nine subsystems**, plus **32 driver
+`src/` holds 105 Fortran files: **72 library modules across nine subsystems**, plus **33 driver
 programs** (entry points and byte-gate harnesses).
 
 | Subsystem | Modules | Contents |
 |---|---:|---|
 | `params/` | 6 | precision, physical constants, write-once configuration, version |
 | `types/` | 5 | the core derived types: mesh, partition, dynamics, tracers, ice |
-| `infra/` | 9 | MPI halo layer, partitioning, loop bounds, clock, timers, dump I/O |
+| `infra/` | 10 | MPI halo layer, partitioning, loop bounds, clock, timers, dump I/O |
 | `mesh/` | 4 | mesh read, geometry/areas, rotation |
-| `oce/` | 24 | ocean physics kernels (advection, dynamics, pressure, mixing, ALE, GM/Redi) |
+| `oce/` | 28 | ocean physics kernels (advection, dynamics, pressure, mixing, ALE, GM/Redi, the SSH solvers) |
 | `ice/` | 6 | sea-ice dynamics (EVP), thermodynamics, FCT advection, ocean coupling |
 | `forcing/` | 3 | atmospheric forcing read, bulk fluxes, ancillary forcing |
 | `io/` | 8 | Zarr writer, I/O decomposition, mesh diagnostics, restart, POSIX shims, coords |
 | `step/` | 2 | timestep orchestration (`mod_step_oce`, `mod_model`) |
-| `drivers/` | 32 | program entry points + per-subsystem byte-gate / smoke drivers |
+| `drivers/` | 33 | program entry points + per-subsystem byte-gate / smoke drivers |
 
-The split between `oce/` (24 modules) and the rest mirrors FESOM2's own decomposition, which keeps
+The split between `oce/` (28 modules) and the rest mirrors FESOM2's own decomposition, which keeps
 the kernel transcription one-to-one. The new subsystems relative to FESOM2's flat layout are
 `types/` (the derived types that used to be global modules), a dedicated `io/` (the Zarr stack), and
 `infra/` (the parallel and diagnostic plumbing).
@@ -293,6 +294,9 @@ viscosity_filter → impl_vert_visc_ale → compute_ssh_rhs_ale → solve_ssh_al
 update_vel → compute_hbar_ale → update_eta_n → vert_vel_ale → solve_tracers_ale → update_thickness_ale
 ```
 
+With `FESOM3_SSH_SE=1` the block from `compute_ssh_rhs_ale` to `update_eta_n` is replaced by the
+split-explicit barotropic subcycling (§14); the rest of the step is unchanged.
+
 `step_oce` follows the dependency-injection rule (§3): inputs the core does not itself produce — the
 tracer diffusivity, the surface heat/freshwater/salt fluxes, the wind stress — are explicit
 arguments, sourced by the caller from forcing and mesh. It also carries the optional `partit` (§4),
@@ -364,8 +368,8 @@ ones:
 **Done (M0–M10, tagged `m0`, `m1`, `m2-mvp`, `m3` … `m10`):** dynamical core; sea-ice EVP/mEVP;
 GM/Redi; KPP and TKE mixing; the zstar vertical coordinate; multi-year forced runs (CORE2,
 JRA55-do); Zarr output; restart/checkpoint. All byte-exact against FESOM2 on 1 rank and up to 864
-ranks. After M10: bottom at vertices (§13) and triangle/quad/mixed meshes (§7). The next milestone is
-open.
+ranks. After M10: bottom at vertices (§13), triangle/quad/mixed meshes (§7) and a split-explicit
+barotropic solver (§14, its stability defaults still open). The next milestone is open.
 
 **Foundations in place but not yet exercised:**
 
@@ -462,3 +466,136 @@ double erosion with nothing to undo it (`-9.27 %` volume, 3966 dead bottom cells
 **Deferred.** Horizontal diffusion, the Redi adjustment, and the optional inflation of boundary
 scalar-cell areas. (The boundary self-duplication of `edge_tri` and the element self-neighbours are
 done — §7.)
+
+---
+
+### 14. Split-explicit barotropic solver
+
+An alternative to the semi-implicit CG free-surface solve, switched on with `FESOM3_SSH_SE=1`
+(module `src/oce/oce_ssh_se.F90`, plan `docs/plans/2026-10-17-split-explicit.md`). It needs no
+global reduction per step (two small halo exchanges per substep), which is the point for the later
+GPU port. With the switch unset the CG path runs and its results are byte-identical to the build
+before the SE work ([TESTING.md](TESTING.md) §6c). SE is not bitwise to CG; it is gated by
+invariants, determinism and restart exactness.
+
+**Scheme.** Sergey Danilov's notes (`~/port_kokkos/ssh_sergey/subcycling.tex`): the dissipative
+AB3–AM4 subcycling of Shchepetkin & McWilliams (2005), as in Banerjee et al. (2024, GMD 17, 7051).
+Per baroclinic step τ the 2-D system (η, Ū = Σₖ helem·u) takes M substeps of dtbt = τ/M:
+
+```
+U*      = (3/2+β) U^m − (1/2+2β) U^{m−1} + β U^{m−2}                          (AB3)
+η^{m+1} = η^m + dtbt·(I(U*) − W·areasvol)/areasvol                          (W: zstar only)
+η^A     = δ η^{m+1} + (1−δ−γ−ζ) η^m + γ η^{m−1} + ζ η^{m−2}                     (AM4)
+U^{m+1} = U^m + dtbt·(−f e_z×U* − g H^A ∇η^A + F + V(U^m − U^n))
+⟨⟨Ū⟩⟩    = Σ_m U*·(1/M)
+β = 0.281105, ζ = 0.00976186 − 0.13451357χ, γ = 0.083445 − 0.513584χ, δ = ½ + 2ζ + γ + 2χ
+```
+
+I is the inflow edge scatter of `compute_hbar_ale` (positive = convergence) and χ the dissipation
+parameter. There is no averaging filter: the new elevation is η^M. F is formed once per step from the
+predictor, F = G/τ + g·Hⁿ·∇ηⁿ + f e_z×(a₂šⁿ + a₁š^{n−1}) with G = Σₖ helemⁿ·UV_rhs and š = Σₖ helem·uv.
+It removes from the 3-D increment the pressure gradient and the Coriolis term that the substeps
+compute themselves. Coriolis uses the stored sums š because `compute_vel_rhs` keeps Coriolis and
+momentum advection in one AB2 array; this is exact under linfs and second order under zstar.
+
+**What it replaces.** In `step_oce`, `se_bt_forcing → se_subcycle → se_trim_finish` take the place of
+`update_stiff_mat_ale → compute_ssh_rhs_ale → solve_ssh_ale → update_vel → compute_hbar_ale →
+update_eta_n` (the old block is unchanged, in the `else` branch). The trim corrects the 3-D velocity
+depth-uniformly to the mean transport, uvₖ = u**ₖ − (Σⱼ helemⁿⱼ u**ⱼ − ⟨⟨Ū⟩⟩)/Hⁿ_e, followed by the
+shared-element sync and halo exchange of `uv` as in `update_vel`. It then sets hbar_old = hbar and
+hbar = eta_n = η^M on owned and halo nodes, and ssh_rhs_old = I(⟨⟨Ū⟩⟩) − W·areasvol. The predictor
+(`compute_vel_rhs`, `viscosity_filter`, `impl_vert_visc_ale`) and the tail (GM, `vert_vel_ale`,
+tracers, `update_thickness_ale`) are untouched. The tail reads the result through hbar, hbar_old and
+ssh_rhs_old. SE does not use d_eta, ssh_rhs, dhe or the stiffness matrix. It is wired into
+`fesom_lifecycle_native_mr` and `fesom_conserve`; any other driver stops with `FESOM3_SSH_SE=1`. It
+requires the AB2 predictor and no cavities.
+
+**Depth law under the vertex bottom.** One element depth function serves both modes:
+
+```
+H_e(η) = Hⁿ_e + Σ_v elem_w(v,e)·c_{e,v}·(η_v − ηⁿ_v),     Hⁿ_e = Σₖ helemⁿ(k,e)
+```
+
+Under linfs c ≡ 0, so H is the cold Σhelem. Under zstar c is the share of a vertex's Δη that
+`vert_vel_ale` puts into the layers inside the element's column (the stretch spans the vertex column
+except its bottom layer, §13):
+c_{e,v} = (zbar_3d_n(ulevels(e),v) − zbar_3d_n(K+1,v))/H̃_v with K = min(nlevels(e)−1,
+nlevels_nod2D(v)−2) and H̃_v = zbar_3d_n(1,v) − zbar_3d_n(nlevels_nod2D(v)−1,v). It is 1 at vertices
+whose column ends at most one level below the element's and below 1 at deeper vertices. c is
+recomputed once per step. Through the real zstar tail Σhelem^{n+1} = H_e(η^{n+1}) holds to 4.5e-12 m
+of 5650 m (test_ssh_se Z3); the law H0 + η (c ≡ 1) misses by 0.24–0.26 m. Freshwater W enters the
+η equation only when `which_ALE ≠ linfs`.
+
+**Shared elements.** A border element has two or three owned copies (§5). SE keeps them bitwise
+equal by construction:
+
+- F is synced once per step from the designated owner (`exchange_elem_shared`).
+- Every per-element operator of the substeps (gradient, Coriolis, viscosity, H^A) is a gather over
+  the element's own vertex and neighbour slots in fixed slot order, so equal inputs give equal
+  copies of Ū and ⟨⟨Ū⟩⟩ without a per-substep sync.
+- The one scatter, I into the nodes, writes owned nodes from owned edges.
+- The arithmetic of a per-element loop must not depend on the element's local index. Under Intel's
+  `-no-prec-div` a division by a loop invariant rounds differently in the vectorised body and in the
+  scalar remainder, so ⟨⟨Ū⟩⟩ accumulates U*·(1/M) with the reciprocal computed once (LESSONS L71).
+
+Per substep this costs `exchange_nod(η)` and `exchange_elem(Ū)`, the latter only with viscosity.
+The copy spreads of Ū and ⟨⟨Ū⟩⟩ are exactly 0 in every test and gate (with the syncs off they are not,
+test_ssh_se P3).
+
+**Barotropic viscosity.** The notes' linear harmonic flux form, V_e = Σₖ κ_{e,k}·H_edge·(ΔŪ_nb/Hⁿ_nb −
+ΔŪ_e/Hⁿ_e) with κ = A_h·l/(d·A_e), A_h = `se_visc_ah`·l (l the edge length, d the centroid distance),
+applied to ΔŪ = Ūᵐ − Ūⁿ. It damps only the change within the step and leaves the slow flow alone.
+There is no flow-dependent γ₀/γ₁ term and no barotropic bottom drag (bottom drag stays in the 3-D
+predictor and so in F).
+
+**CFL guard.** `se_init` estimates the fastest gravity mode of the substeps' own linear operator,
+A η = −I(Hⁿ·(−g∇η))/areasvol, by 100 power iterations (ω_max; one allreduce and one `exchange_nod` per
+iteration). It then sets M_min = ⌈τ·ω_max/(s·a_crit(χ))⌉, where a_crit is the AB3–AM4 stability
+limit for one oscillator (Schur–Cohn test of the characteristic polynomial: 1.853 / 1.579 / 1.329
+at χ = 0 / 0.1 / 0.25) and s = 0.9. CORE2 at Δt = 1800 s: ω_max = 3.15e-2 s⁻¹, M_min = 40 at χ = 0.1
+and 48 at χ = 0.25 (0.06 s at np 8). A smaller M stops the run unless `FESOM3_SE_M_FORCE=1`. The
+resolution estimate 0.5·res/√(gH) used before is not a stability limit (LESSONS L72).
+
+**Knobs** (environment only, value-checked; the `FESOM3_SE_*` knobs are read only with SE on, and SE
+prints nothing when off):
+
+| env | default | meaning |
+|---|---|---|
+| `FESOM3_SSH_SE` | 0 | 1 = split-explicit, 0 = CG; any other value stops |
+| `FESOM3_SE_M` | 50 | substeps per baroclinic step (≥ the CFL-guard minimum) |
+| `FESOM3_SE_M_FORCE` | 0 | 1 = run below the CFL-guard minimum (with a warning) |
+| `FESOM3_SE_CHI` | 0.1 | dissipation parameter χ, 0 ≤ χ ≤ 0.25 |
+| `FESOM3_SE_VISC_AH` | 0.01 | barotropic viscosity A_h = value·l [m/s]; 0 = off |
+| `FESOM3_SE_CHECK` | 0 | 1 = per-step invariant line `SE_CHECK` (η compatibility, trim, mean sea level, copy spreads; zstar adds `SE_CHECK_TAIL`: layer sum, w(1), depth law) |
+
+The barotropic substeps have their own timer, "(of which) SE barotropic" under "dynamics ssh". At
+CORE2 np 128 SE costs 12.9 ms/step in the SSH phase against SI's 9.1 (loop 146 vs 144 ms/step); the
+planned CPU and GPU measurements are open.
+
+**Restart.** With SE on, the checkpoint carries 10 more stores: `se_eta1`, `se_eta2` (η^{−1/M},
+η^{−2/M}; node), `se_ubt{0,1,2}_{u,v}` (Ūⁿ, Ū^{−1/M}, Ū^{−2/M}; element, halo ELEM) and
+`se_sbar_old_{u,v}` (š^{n−1}; element, halo NONE). The CORE2 lifecycle registers 37 instead of 27
+fields. A resumed SE run equals the straight run (`max|Δ| = 0`, linfs and zstar, np 1 and 2, np 2 → 8
+round trip). Limits:
+
+- An SE run that finds no SE state in the checkpoint stops with "checkpoint has no split-explicit
+  state: written with FESOM3_SSH_SE off; SI<->SE restarts are not supported".
+- The other direction is not detected: an SE checkpoint read with SE off silently ignores the `se_*`
+  stores. SE → SI is not supported.
+- M and χ are not stored. Keep them fixed across a restart chain: the rings hold levels dtbt = τ/M
+  apart.
+- zstar: after `restart_read` the driver now rebuilds the derived thicknesses (`hnode_new`,
+  `zbar_3d_n`, `Z_3d_n`, `helem` through `update_thickness_ale`). Every zstar restart needed this.
+  An SI-zstar restart is still not exact: the SSH stiffness matrix accumulates −dhe every step, and
+  neither dhe nor the accumulated values are in the checkpoint (the resumed run departs at its first
+  SSH solve). SE does not use the matrix, so SE-zstar is exact.
+
+**Open: stability at the default χ = 0.1 on CORE2.** With the defaults (χ 0.1, M 50, `se_visc_ah`
+0.01), a cold-started CORE2 run with production physics blows up at step 331–340 (day 7), at np 8 and
+np 128, under linfs and zstar. The cause is a grid-scale gravity mode with a period of 3 baroclinic
+steps on the 20 m Antarctic shelf near 74°W 72°S under compact sea ice; it grows by 0.9 % per step.
+The feedback runs through the sea ice: the ice reads ηⁿ, and its stress on the ocean enters F frozen
+over the step. Removing the ice–ocean stress or the ice's view of η removes the growth. SI's
+backward-Euler damping hides the same coupling. χ = 0.25 and `se_visc_ah` = 0.1 run the 480 screened
+steps stably; the default is not decided yet. Details: the plan's Task 5.1 note, LESSONS L74 and
+`docs/se_question_packet.md`. CORE2 gate runs longer than ~300 steps use `FESOM3_SE_CHI=0.25`.

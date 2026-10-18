@@ -25,8 +25,8 @@ module oce_ssh_se
     ! depth law c (se_elem_depth), the freshwater W in the eta equation (se_subcycle,
     ! se_trim_finish) and the zstar checks (mean sea level against the freshwater, the layer
     ! sum, w(1) and the depth law after the tail; Task 3.1). step_oce calls se_bt_forcing ->
-    ! se_subcycle -> se_trim_finish in place of the CG solve block. Still to come: the SE fields
-    ! in the checkpoint (Task 4.2).
+    ! se_subcycle -> se_trim_finish in place of the CG solve block. The carried rings are in the
+    ! checkpoint (mod_io_restart, restart_register_state; Task 4.2).
     !
     ! DETERMINISM (plan D2): every per-element operator of the substeps is a GATHER over the
     ! element's own vertex / neighbour slots in fixed slot order, never a scatter into elements.
