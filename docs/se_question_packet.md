@@ -242,3 +242,11 @@ at step n, or keep everything as in Banerjee et al.; his suggestion was meant as
   3-D AB2 Coriolis exactly (linfs; O(Δh·Δu) under zstar). Answer 5 was meant as a simplification, not a
   requirement; in FESOM_F (i) costs the same storage as D4 and removes less. This points to D4 + the barotropic
   drag (answer 3), the variant screened stable for 3000 steps at χ = 0.1 and 0.25 in Task 5.4 (Nikolay decides).
+
+**Follow-up questions 2 and 3.** Yes, acceptable, and the dissipation should be minimal; it can depend on the
+mesh, so it is best a user parameter.
+
+- Question 2: the barotropic drag in the substeps with the Coriolis term from the stored sums (D4) is acceptable.
+- Question 3: use the smallest χ that is stable; it can depend on the mesh, so χ stays a user parameter
+  (`FESOM3_SE_CHI`), set per mesh. The default should be the smallest χ that is stable on the reference mesh (CORE2),
+  not a value chosen with a margin; the documentation should say it is mesh-dependent.
