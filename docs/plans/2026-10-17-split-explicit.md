@@ -1050,8 +1050,17 @@ sbatch at a time or in a short chain; each wait is a background `sacct` watcher.
 below (Task 5.0).
 ➕ Stage 5 cost so far: Tasks 5.0 + 5.1 0.97 node-h, Tasks 5.2 + 5.3 1.61 node-h (2.58 in all). ➕ Nikolay asked
 why port_kokkos runs χ = 0.1: its BT viscosity is the flow-dependent Zenodo closure (γ0 = 10, γ1 = 2750), ≈ 2× ours in
-calm flow and ≈ 10–15× on the noisy shelf. ⚠️ Open: a test of that closure at χ = 0.1 (branch `se-visc-zenodo` in the
-side worktree, report `/work/ab0995/a270088/fesom3_se_ref/jobs/s5_C_report.md`), then Nikolay's choice of default.
+calm flow and ≈ 10–15× on the noisy shelf. ➕ Tested (lane C, 0.32 node-h, job 28220789, report
+`/work/ab0995/a270088/fesom3_se_ref/jobs/s5_C_report.md`): the closure as an opt-in knob, `FESOM3_SE_VISC_FLOW=1`
+(`FESOM3_SE_VISC_GAMMA0/GAMMA1`, defaults 10 / 2750), commit e534a4f on branch `se-visc-zenodo` (parent 741ddc7, not
+merged; ctest Intel 176/176, GNU the 6 known, G0 GREEN, copy spreads 0). CORE2 `prod_env 1e-5`, np 8, M 50, cold start,
+480 steps, shelf noise (DBG_SHELF, debug branch `se-visc-zenodo-dbg`) growth over steps 150–330 / 330–480:
+  - Z1 χ = 0.1 + closure: **runs**, −0.04 / −0.24 %/step (noise 0.21 → 0.12 → 0.08 m), cold-start peak 4.731 m;
+  - L1 χ = 0.1 linear (control): +0.91 %/step, floating overflow at step 340 (identical to the diagnosis run);
+  - Z3 χ = 0.25 + closure: −0.32 / −0.22 %/step (χ = 0.25 linear: −0.36 %/step).
+  So χ = 0.1 is stable with the closure, but with the thinnest margin of the stable setups; the closure barely touches
+  the resolved flow (4.731 vs 4.737 m). SE_BT +15–25 % at np 8 (≈ 1 % of the step). ⚠️ Open: Z2 (χ = 0.1 + closure,
+  3000 steps, np 128, ≈ 0.2 node-h, `jobs/s5_C_z2.sbatch`, not submitted) and Nikolay's choice of default.
 
 #### ➕ Task 5.0: default χ = 0.25 ✅
 
