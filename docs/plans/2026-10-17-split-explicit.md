@@ -181,7 +181,8 @@ Not in scope: NEMO SE runs, the zstar 1-year twin, wide halo, JAX dump stages, t
     - mean-sea-level change in metres, Σareasvol·(η − η_start)/Σareasvol (zstar: also against the integrated
       freshwater);
     - copy spreads of Ū and ⟨⟨Ū⟩⟩;
-  - in a second hook after the tail (zstar only): layer sum max|Σhnode − (H0 + η)| and max|w(1)|.
+  - in a second hook after the tail (zstar only): layer sum max|Σhnode − (H0 + η)| and max|w(1)|; ➕ and the depth
+    law max|Σhelem^{n+1} − H_e(η^{n+1})| (Task 3.1).
 - **Gates:** G0 (above), G1 invariants, G2 determinism and restart, G3 physics and perf (Stage 5).
 - No UI / e2e.
 
@@ -793,28 +794,79 @@ M = 35 blows up at step 5 at χ = 0.1. The defaults (χ 0.1, M 50, `se_visc_ah` 
 ### Stage 3 — zstar
 *Make "switch zstar on" a tested fact.*
 
-#### Task 3.1: zstar depth law and freshwater
+#### Task 3.1: zstar depth law and freshwater ✅
 
 **Files:**
 - Modify: `src/oce/oce_ssh_se.F90`
 - Modify: `test/test_ssh_se.F90`
+- ➕ Modify: `src/types/mod_dyn.F90` (`se_fwmsl`), `src/step/mod_step_oce.F90` (W to `se_subcycle`),
+  `test/CMakeLists.txt` (the zstar SE conserve tests)
 
-- [ ] `se_elem_depth` under zstar, from **zbar_3d_n differences** exactly as `vert_vel_ale` (:438-444) does:
+- [x] `se_elem_depth` under zstar, from **zbar_3d_n differences** exactly as `vert_vel_ale` (:438-444) does:
   - Htilde_v = zbar_3d_n(1,v) − zbar_3d_n(nlev_v−1,v);
   - c_{e,v} = (zbar_3d_n(ule(e),v) − zbar_3d_n(K_{e,v}+1,v))/Htilde_v, with K_{e,v} = min(nle(e)−1, nlev_v−2);
   - recomputed once per step;
   - the substep uses H^A = Hⁿ + Σ_v elem_w·c·(η^A − ηⁿ)
-- [ ] W in the η equation when `which_ALE /= 'linfs'` (mask `ulevels_nod2D == 1`, as `compute_hbar_ale` :253-259)
-- [ ] `se_check_tail`: layer sum max|Σhnode − (H0 + η)|, max|w(1)|; `se_check_core`: mean-sea-level change against
-  the integrated freshwater
-- [ ] tests:
-  - c = 1 at the element's shallowest vertex and 0 < c ≤ 1 elsewhere;
-  - H_e(ηⁿ) = Σhelemⁿ to rounding;
-  - **decisive:** apply a synthetic Δη through the real `vert_vel_ale` + `update_thickness_ale`; then
-    Σhelem^{n+1} = H_e(η^{n+1}) to rounding on every element;
-  - a uniform W with Ū = 0: η^M − η⁰ = −τW and ΔV = −τΣW·areasvol to rounding;
-  - under linfs c ≡ 0
-- [ ] ctest green
+
+  Checked against the code, the formula is right as written: `vert_vel_ale` stretches layers 1..nlev_v−2 of a
+  vertex by (zbar_3d_n(nz) − zbar_3d_n(nz+1))·Δη/Htilde_v (the deepest layer is the fixed anchor),
+  `update_thickness_ale` sets helem = Σ_v elem_w·hnode over the element's full range ule..nle−1, and the zbar
+  differences telescope to the c above. Since nlevels(e) = min_v nlevels_nod2D(v), c == 1 bitwise (numerator and
+  Htilde are the same expression) at every vertex with nlev_v ≤ nle + 1, not only the shallowest one; 0 < c < 1
+  at deeper vertices. c = 0 on a triangle's slot 4 (elem_w = 0) and at a vertex without an open surface. Owned
+  elements, a gather in slot order from halo-valid zbar_3d_n (copies of a shared element agree bitwise). The
+  `se_elem_depth` stop now fires only for an ALE mode other than linfs and zstar
+- [x] W in the η equation when `which_ALE /= 'linfs'` (mask `ulevels_nod2D == 1`, as `compute_hbar_ale` :253-259).
+  `se_subcycle(…, water_flux)` (optional; step_oce passes it) subtracts W·areasvol from I(U*) in every substep;
+  `se_trim_finish` already put the same term into ssh_rhs_old, so the η-compatibility check covers it. linfs
+  ignores W, bit for bit the old loop
+- [x] `se_check_tail`: layer sum max|Σhnode − (H0 + η)|, max|w(1)|; `se_check_core`: mean-sea-level change against
+  the integrated freshwater. Done:
+  - `se_check_tail_values` (exposed for the tests) and a second line `SE_CHECK_TAIL step=N laysum=… w1=…
+    hlaw=…` (`'^SE_CHECK '` does not match it); NaN → stop. laysum: H0_v = zbar(1) − zbar(nlev_v), owned nodes.
+    **w(1) = 0 to rounding, also with freshwater**: `vert_vel_ale` sets w(1) = I_h/area − (hbar − hbar_old)/τ − W,
+    the SE elevation change is τ(I(⟨⟨Ū⟩⟩) − W·areasvol)/areasvol, area == areasvol and the trim gives
+    Σhelemⁿuv = ⟨⟨Ū⟩⟩. ➕ hlaw = max|Σₖhelem^{n+1} − H_e(η^{n+1})| over owned elements, with H_e(η^{n+1}) = se_H +
+    Σ elem_w·c·(hbar − hbar_old): the depth law of the substeps against what the tail built, in every run;
+  - msl= is now net of the freshwater: msl = (mean η^{n+1} − mean η_start) − fw, with fw = −Σ_steps τ·ΣW·areasvol/
+    Σareasvol (`t_dyn%se_fwmsl`, accumulated by the one check per step that gets water_flux; reset with se_msl0).
+    Non-linfs lines end with a token `fw=` (linfs lines unchanged; fw ≡ 0 there)
+- [x] tests (`test_ssh_se`, block Z1–Z6 after C11, run last; np 1 and 2, Intel and GNU identical to the digits
+  shown unless noted):
+  - Z1: nlevels(e) == min over the vertices of nlevels_nod2D; c == 1 exactly at vertices with nlev_v ≤ nle + 1,
+    0 < c < 1 at deeper ones, 0 beyond elem2D_nnodes; cold and stretched states. pi: **3532 elements (np 1) have
+    a c < 1, min c = 0.0189**;
+  - Z2: H_e(ηⁿ) == se_H == Σhelemⁿ bitwise;
+  - **Z3 (decisive):** a hashed Δη (|Δη| ≤ 0.5 m, max|η| 0.90 m) through the real `vert_vel_ale` +
+    `update_thickness_ale`, twice (from the cold state, then from the stretched one with c recomputed):
+    **max|Σhelem^{n+1} − H_e(η^{n+1})| = 3.6e-12 / 4.5e-12 m of max H = 5650 m** (GNU 3.6e-12 / 5.5e-12; tol
+    1e-14·max H); the c = 1 law misses by 0.26 / 0.24 m and the linfs law by 0.49 m; layer sum 2.7e-12 / 3.6e-12 m;
+  - Z4: uniform W = 1e-6 m/s, Ū = 0, M = 40: **max|η^M − η⁰ + τW| = 1.7e-18 m of τW = 1.8e-3 m**, ΔV = −τΣW·areasvol
+    (−6.115e11 m³) to 1e-12; through `se_trim_finish`: ssh_rhs_old = I(⟨⟨Ū⟩⟩) − W·areasvol, fw = −1.800e-3 m, msl net
+    of it 5.9e-18 m, etacomp 2.2e-18 m, the line carries fw=; under linfs the same W leaves η exactly 0;
+  - Z5: one full zstar SE step with a hashed W (1e-6 m/s) from a hashed state whose thicknesses carry its η:
+    `se_subcycle(W)` → `se_trim_finish(W)` → `vert_vel_ale(W)` → `update_thickness_ale`. **etacomp 2.3e-16 m (GNU
+    3.5e-16) of 0.41 m, trim 8.5e-14 m²/s, msl net of fw (−9.5e-6 m) −2.4e-18 m, laysum 2.7e-12 m, hlaw 4.5e-12 m,
+    w(1) 7.1e-19 m/s (GNU 7.8e-19) of max|Δη/τ| + |W| = 2.3e-4 m/s**; np 2: copy spreads of c, helem^{n+1}, U^M and
+    ⟨⟨Ū⟩⟩ 0, and those of ⟨⟨Ū⟩⟩ and U^M 0 after the substeps for every M = 1..40;
+  - Z6: under linfs c ≡ 0 (bitwise)
+
+  ⚠️ **Found and fixed by Z5 (np 2): ⟨⟨Ū⟩⟩ copies of shared elements differed in the last bit.** A per-substep
+  probe (temporary instrumentation, not committed) showed U*, all three U ring levels and H^A bitwise equal at every
+  substep while ⟨⟨Ū⟩⟩ differed (1e-16 … 1.8e-15 m²/s), **also under linfs** (the C9/C11 calls), sometimes rounding
+  back to equal by m = M. Cause: `se_umean += U*/rM`: with Intel's `-no-prec-div` the division by the loop-invariant
+  M is evaluated differently in the vectorised body and in the scalar remainder of the element loop, and a shared
+  element sits at different loop positions on its owners. Fix: multiply by rMinv = 1/rM (one line; Stage 1 linfs
+  values change at rounding level only, e.g. `fesom_conserve_se_linfs_np1` step-20 etacomp 1.68e-15 → 1.47e-15 m,
+  Intel). After it, no copy differs at any
+  substep of any test call at np 2 and np 8. Lesson: a division by a loop-invariant scalar in a per-element loop
+  is not copy-safe under `-no-prec-div`; Stage 2 must not reintroduce it
+- [x] ctest green. Job 28218185 (shared, 32 cores): **Intel 175/175; GNU 169/175, exactly the 6 known failures**;
+  the new tests pass on both. The pinned stop `fesom_conserve_se_zstar_np1` is now a real test,
+  `fesom_conserve_se_zstar_np{1,2}` (pi, zstar, 20 SE steps, SE_CHECK, `FESOM3_CONSERVE_TOL=1e-12`): heat 1.7e-15
+  / 3.2e-15, salt −2.6e-14 / −1.5e-14, volume 1.4e-14 / −2.1e-14 (np 1 / np 2), step 20 laysum 3.6e-12 m, w1
+  7.0e-19 m/s, hlaw 5.5e-12 m, spreads 0. Script `/work/ab0995/a270088/fesom3_se_t02_jobs/t31_build_ctest.sbatch` (logs `t31b_*`); debug jobs
+  28218130, 28218139, 28218151, 28218161, 28218172/3
 
 #### Task 3.2: GATE Stage 3 — zstar np 1 and np > 1
 

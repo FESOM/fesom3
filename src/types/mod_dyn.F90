@@ -166,9 +166,11 @@ module mod_dyn
         real(kind=WP), allocatable, dimension(:,:)   :: se_c          ! (MAX_NV,nElemO): zstar depth-law weights c_{e,v}
         real(kind=WP), allocatable, dimension(:,:)   :: se_kappa      ! (MAX_NV,nElemO): BT viscosity A_h*l/(d*A_e)
         ! FESOM3_SE_CHECK: the area-mean elevation at the start of the run (set by the first
-        ! se_check_core of this process), the reference of the mean-sea-level change
+        ! se_check_core of this process), the reference of the mean-sea-level change, and the
+        ! part of that change the freshwater explains (non-linfs; accumulated per check)
         real(kind=WP) :: se_msl0     = 0.0_WP
         logical       :: se_msl0_set = .false.
+        real(kind=WP) :: se_fwmsl    = 0.0_WP
 
         ! ---- sub-objects ----
         type(t_solverinfo) :: solverinfo

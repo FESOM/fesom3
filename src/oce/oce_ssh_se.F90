@@ -21,9 +21,12 @@ module oce_ssh_se
     ! (se_elem_depth, se_bt_forcing; Task 1.1); the substeps (se_subcycle) with their operators
     ! (se_inflow, se_visc, se_tendency, se_depth_at) and the viscosity coefficients (se_kappa_build,
     ! from se_init; Task 1.2); the trim and the commit of the elevation (se_trim_finish, Task 1.3);
-    ! the invariant suite FESOM3_SE_CHECK (se_check_core, se_check_tail; Task 1.4). step_oce calls
-    ! se_bt_forcing -> se_subcycle -> se_trim_finish in place of the CG solve block. Still to come:
-    ! the zstar depth law and freshwater (Task 3.1), the SE fields in the checkpoint (Task 4.2).
+    ! the invariant suite FESOM3_SE_CHECK (se_check_core, se_check_tail; Task 1.4); zstar: the
+    ! depth law c (se_elem_depth), the freshwater W in the eta equation (se_subcycle,
+    ! se_trim_finish) and the zstar checks (mean sea level against the freshwater, the layer
+    ! sum, w(1) and the depth law after the tail; Task 3.1). step_oce calls se_bt_forcing ->
+    ! se_subcycle -> se_trim_finish in place of the CG solve block. Still to come: the SE fields
+    ! in the checkpoint (Task 4.2).
     !
     ! DETERMINISM (plan D2): every per-element operator of the substeps is a GATHER over the
     ! element's own vertex / neighbour slots in fixed slot order, never a scatter into elements.
@@ -41,6 +44,8 @@ module oce_ssh_se
     !   FESOM3_SE_CHECK    1 = per-step invariant suite (0/1)                         default 0
     !                      one rank-0 line per step, key=value tokens (se_check_line):
     !                      SE_CHECK step=<n> etacomp= trim= msl= spreadU= spreadUm= maxeta= maxU=
+    !                      (non-linfs: + fw=), and under zstar a second one after the ALE tail
+    !                      (se_check_tail_line): SE_CHECK_TAIL step=<n> laysum= w1= hlaw=
     ! Value-checked like FESOM3_SHARED_SYNC: anything outside the range stops the run, so a run
     ! never carries a setting other than the one its job file asked for. The FESOM3_SE_* knobs
     ! are read only when FESOM3_SSH_SE=1. SE is SILENT when off: run_conserve_pi.sh and
@@ -98,7 +103,9 @@ module oce_ssh_se
               SE_CFL_SAFETY, SE_CFL_NIT
     public :: SE_CFL_OK, SE_CFL_FORCED, SE_CFL_DIE
     public :: SE_NCHK, SE_CHK_ETACOMP, SE_CHK_TRIM, SE_CHK_MSL, SE_CHK_SPREADU, SE_CHK_SPREADUM, &
-              SE_CHK_MAXETA, SE_CHK_MAXU, SE_CHK_NBAD
+              SE_CHK_MAXETA, SE_CHK_MAXU, SE_CHK_NBAD, SE_CHK_FW
+    public :: se_check_tail_values, se_check_tail_line
+    public :: SE_NTAIL, SE_TAIL_LAYSUM, SE_TAIL_W1, SE_TAIL_HLAW, SE_TAIL_NBAD
 
     ! se_cfl_decision verdicts
     integer, parameter :: SE_CFL_OK     = 0   ! M >= M_min
@@ -109,9 +116,13 @@ module oce_ssh_se
     integer,       parameter :: SE_CFL_NIT    = 100
 
     ! FESOM3_SE_CHECK: the entries of se_check_values' vals (meaning there)
-    integer, parameter :: SE_NCHK = 8
+    integer, parameter :: SE_NCHK = 9
     integer, parameter :: SE_CHK_ETACOMP = 1, SE_CHK_TRIM = 2, SE_CHK_MSL = 3, SE_CHK_SPREADU = 4, &
-                          SE_CHK_SPREADUM = 5, SE_CHK_MAXETA = 6, SE_CHK_MAXU = 7, SE_CHK_NBAD = 8
+                          SE_CHK_SPREADUM = 5, SE_CHK_MAXETA = 6, SE_CHK_MAXU = 7, SE_CHK_NBAD = 8, &
+                          SE_CHK_FW = 9
+    ! ... and of se_check_tail_values' tvals (zstar, after the ALE tail)
+    integer, parameter :: SE_NTAIL = 4
+    integer, parameter :: SE_TAIL_LAYSUM = 1, SE_TAIL_W1 = 2, SE_TAIL_HLAW = 3, SE_TAIL_NBAD = 4
 
     ! the knobs se_read_env reads (FESOM3_SSH_SE itself: se_env_requested)
     character(len=17), parameter :: SE_KNOBS(5) = [character(len=17) :: &
@@ -602,19 +613,41 @@ contains
         ! H^n_e = sum_k helem^n over the layers ulevels(e)..nlevels(e)-1 (the loop of se_init's
         ! cold-start transport), on the OWNED + eDim elements: helem is halo-valid, and the
         ! viscosity gather reads H at eDim neighbours. The substeps use the depth law of plan D3,
-        ! H_e(eta) = H^n_e + sum_v elem_w(v,e)*c(v,e)*(eta_v - eta^n_v). Under linfs c == 0 (se_c
-        ! keeps the zero of se_init), so H_e(eta) = H^n_e. The zstar weights c come with Task
-        ! 3.1; until then a non-linfs run stops here rather than run with c = 0.
+        !     H_e(eta) = H^n_e + sum_v elem_w(v,e)*c(v,e)*(eta_v - eta^n_v)        (se_depth_at)
+        ! Under linfs c == 0 (se_c keeps the zero of se_init), so H_e(eta) = H^n_e.
+        ! Under zstar c is what the ALE tail will do to the element depth when eta^n -> eta
+        ! (plan Task 3.1), recomputed here once per step from zbar_3d_n^n (the tail of the
+        ! previous step built it; this step's tail changes it only after the substeps):
+        !   - vert_vel_ale (oce_ale.F90:433-452) stretches the layers nz = 1..nlev_v-2 of an
+        !     open-surface vertex v (nlev_v = nlevels_nod2D(v); the deepest layer nlev_v-1 is
+        !     not stretched, its top zbar_3d_n(nlev_v-1) is the fixed anchor) by
+        !         dh(nz,v) = (zbar_3d_n(nz,v) - zbar_3d_n(nz+1,v))*(eta_v - eta^n_v)/Htilde_v,
+        !         Htilde_v = zbar_3d_n(1,v) - zbar_3d_n(nlev_v-1,v);
+        !   - update_thickness_ale (:582-637) commits hnode += dh and sets helem(nz,e) =
+        !     sum_v elem_w(v,e)*hnode(nz,v) over the element's full range ule..nle-1 (ule =
+        !     ulevels(e) = 1, nle = nlevels(e)).
+        ! Summed over the element's layers the zbar differences telescope:
+        !     sum_nz helem^{n+1} = H^n_e + sum_v elem_w(v,e)*c(v,e)*(eta_v - eta^n_v),
+        !     c(v,e) = (zbar_3d_n(ule,v) - zbar_3d_n(K+1,v))/Htilde_v,   K = min(nle-1, nlev_v-2)
+        ! (test_ssh_se Z3 checks this through the real tail). nlevels(e) = min_v nlevels_nod2D(v)
+        ! (vertex bottom), so c == 1 (bitwise: numerator and Htilde are the same expression) at
+        ! every vertex with nlev_v <= nle+1, the element's shallowest vertex among them, and
+        ! 0 < c < 1 at the deeper vertices, whose layers below the element's bottom take part of
+        ! the stretch. A slot beyond elem2D_nnodes(e) (a triangle's slot 4: elem_w = 0) and a
+        ! vertex without an open surface (vert_vel_ale does not stretch it) get c = 0.
+        ! Owned elements (se_depth_at's range); a gather over the element's own vertices in slot
+        ! order from halo-valid zbar_3d_n, so the copies of a shared element agree bitwise
+        ! (plan D2). Other ALE modes stop: the tail stretches the layers under zstar only.
         type(t_dyn),    intent(inout) :: dyn
         type(t_mesh),   intent(in)    :: mesh
         type(t_partit), intent(in)    :: partit
-        integer       :: e, nz
+        integer       :: e, nz, k, v, ule, nle, nlv, kb
         integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
-        real(kind=WP) :: H
+        real(kind=WP) :: H, cv
 
-        if (trim(which_ALE) /= 'linfs') &
-            call se_die('split-explicit supports which_ALE = linfs only so far (zstar depth law: '// &
-                        'docs/plans/2026-10-17-split-explicit.md, Task 3.1)', partit)
+        if (trim(which_ALE) /= 'linfs' .and. trim(which_ALE) /= 'zstar') &
+            call se_die('split-explicit supports which_ALE = linfs and zstar, not '// &
+                        trim(which_ALE), partit)
         call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
         do e = 1, nElemL
             H = 0.0_WP
@@ -622,6 +655,25 @@ contains
                 H = H + mesh%helem(nz, e)
             end do
             dyn%se_H(e) = H
+        end do
+        if (trim(which_ALE) /= 'zstar') return
+
+        do e = 1, nElemO
+            ule = mesh%ulevels(e)
+            nle = mesh%nlevels(e)
+            do k = 1, MAX_NV
+                cv = 0.0_WP
+                if (k <= mesh%elem2D_nnodes(e)) then
+                    v = mesh%elem2D_nodes(k, e)
+                    if (mesh%ulevels_nod2D(v) == 1) then           ! vert_vel_ale's nzmin == 1
+                        nlv = mesh%nlevels_nod2D(v)
+                        kb  = min(nle - 1, nlv - 2)
+                        cv  = (mesh%zbar_3d_n(ule, v) - mesh%zbar_3d_n(kb+1, v)) &
+                            / (mesh%zbar_3d_n(1, v) - mesh%zbar_3d_n(nlv-1, v))
+                    end if
+                end if
+                dyn%se_c(k, e) = cv
+            end do
         end do
     end subroutine se_elem_depth
 
@@ -842,8 +894,9 @@ contains
     subroutine se_depth_at(dyn, mesh, partit, eta, HA)
         ! H_e(eta) = H^n_e + sum_v elem_w(v,e)*c(v,e)*(eta_v - eta^n_v) on the OWNED elements:
         ! the one depth function of the substeps (plan D3), no ALE branch in the loop. Under
-        ! linfs c == 0 and H_e(eta) = H^n_e exactly. eta and eta^n (eta_n) are read at the
-        ! element's vertices (owned + halo).
+        ! linfs c == 0 and H_e(eta) = H^n_e exactly; under zstar it is the element depth the
+        ! ALE tail builds for the elevation eta (se_elem_depth). eta and eta^n (eta_n) are read
+        ! at the element's vertices (owned + halo).
         type(t_dyn),    intent(in)  :: dyn
         type(t_mesh),   intent(in)  :: mesh
         type(t_partit), intent(in)  :: partit
@@ -901,12 +954,13 @@ contains
     end subroutine se_tendency
 
     !===========================================================================
-    subroutine se_subcycle(dyn, mesh, partit, dt)
+    subroutine se_subcycle(dyn, mesh, partit, dt, water_flux)
         ! The M barotropic substeps m = 0..M-1 of one baroclinic step tau = dt, after
         ! se_bt_forcing (plan Technical Details §2), dtbt = tau/M:
         !     U*        = (3/2+beta) U^m - (1/2+2 beta) U^{m-1} + beta U^{m-2}     owned elements
         !     <<U>>    += U*/M                                                   owned elements
-        !     eta^{m+1} = eta^m + I(U*)*dtbt/areasvol            owned nodes, then exchange_nod
+        !     eta^{m+1} = eta^m + (I(U*) - W*areasvol)*dtbt/areasvol
+        !                                                        owned nodes, then exchange_nod
         !     eta^A     = delta eta^{m+1} + (1-delta-gamma-zeta) eta^m + gamma eta^{m-1}
         !                 + zeta eta^{m-2}                                       owned + halo nodes
         !     H^A       = H_e(eta^A)                                             owned elements
@@ -920,15 +974,22 @@ contains
         ! On exit: eta^M in se_etam (eta^{M-1}, eta^{M-2} in se_eta(:,1), se_eta(:,2); all on
         ! owned + halo nodes), U^M in ring level 0 (U^{M-1}, U^{M-2} in levels 1, 2), <<U>> in
         ! se_umean (owned elements). eta_n and hbar are untouched: se_trim_finish commits them.
+        ! FRESHWATER: W = water_flux (+ out of the ocean) enters the eta equation when which_ALE
+        ! /= linfs and water_flux is present, on the open-surface owned nodes (ulevels_nod2D ==
+        ! 1), as -W*areasvol next to the inflow: the term compute_hbar_ale subtracts from
+        ! ssh_rhs_old (oce_ale.F90:253-259), and se_trim_finish puts the same term into
+        ! ssh_rhs_old, so eta^M - eta^0 = tau*(I(<<U>>) - W*areasvol)/areasvol = tau*ssh_rhs_old/
+        ! areasvol to rounding (SE_CHECK etacomp). linfs ignores W (virtual salt), bit for bit
+        ! the loop without it.
         type(t_dyn),    intent(inout) :: dyn
         type(t_mesh),   intent(in)    :: mesh
         type(t_partit), intent(in)    :: partit
         real(kind=WP),  intent(in)    :: dt       ! tau, the baroclinic step
+        real(kind=WP),  intent(in), optional :: water_flux(:)   ! (>= nNodO) + out of the ocean (non-linfs)
         integer       :: m, M_sub, n, e
         integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
-        real(kind=WP) :: rM, dtbt, w0, w1, w2, d0, d1, d2, d3
-        real(kind=WP) :: rMinv
-        logical       :: visc
+        real(kind=WP) :: rM, rMinv, dtbt, w0, w1, w2, d0, d1, d2, d3
+        logical       :: visc, fw
         real(kind=WP), allocatable :: ustar(:,:), unew(:,:), tend(:,:), dU(:,:)
         real(kind=WP), allocatable :: etaA(:), inflow(:), HA(:)
 
@@ -954,6 +1015,8 @@ contains
         d1 =  dyn%se_gamma
         d2 =  dyn%se_zeta
         visc = (dyn%se_visc_ah > 0.0_WP)
+        fw   = .false.
+        if (present(water_flux)) fw = (trim(which_ALE) /= 'linfs')
 
         allocate(ustar(2, nElemL), unew(2, nElemL), tend(2, nElemL), dU(2, nElemL))
         allocate(etaA(nNodL), inflow(nNodL), HA(nElemL))
@@ -966,7 +1029,8 @@ contains
         dyn%se_umean = 0.0_WP
 
         do m = 0, M_sub - 1
-            ! AB3 transport and the running mean
+            ! AB3 transport and the running mean (U*·rMinv, see above; also caught by
+            ! test_ssh_se Z5 at np 2)
             do e = 1, nElemO
                 ustar(1, e) = w0*dyn%se_ubt(1, e, 0) + w1*dyn%se_ubt(1, e, 1) + w2*dyn%se_ubt(1, e, 2)
                 ustar(2, e) = w0*dyn%se_ubt(2, e, 0) + w1*dyn%se_ubt(2, e, 1) + w2*dyn%se_ubt(2, e, 2)
@@ -974,8 +1038,14 @@ contains
                 dyn%se_umean(2, e) = dyn%se_umean(2, e) + ustar(2, e)*rMinv
             end do
 
-            ! elevation (closed basin, linfs: no freshwater term -- Task 3.1)
+            ! elevation; non-linfs: minus the freshwater W*areasvol (compute_hbar_ale's term)
             call se_inflow(mesh, partit, ustar, inflow)
+            if (fw) then
+                do n = 1, nNodO
+                    if (mesh%ulevels_nod2D(n) > 1) cycle
+                    inflow(n) = inflow(n) - water_flux(n)*mesh%areasvol(n)
+                end do
+            end if
             do n = 1, nNodO
                 dyn%se_etanew(n) = dyn%se_etam(n) + inflow(n)*dtbt/mesh%areasvol(n)
             end do
@@ -1043,7 +1113,9 @@ contains
         !     halo-valid; the ice reads hbar and compute_vel_rhs eta_n at halo vertices).
         !     update_eta_n's alpha blend of hbar and hbar_old does not apply: eta^M is the
         !     elevation at n+1.
-        !  4. FESOM3_SE_CHECK: se_check_core, while helem is still at n. Nothing when off.
+        !  4. FESOM3_SE_CHECK: se_check_core, while helem is still at n (with water_flux: the
+        !     mean-sea-level change is checked against the integrated freshwater). Nothing when
+        !     off.
         ! U^M stays in ring level 0 for the next step. dhe (read only by the SI stiffness
         ! update), d_eta and ssh_rhs (SI only) are not touched.
         type(t_dyn),    intent(inout) :: dyn
@@ -1108,13 +1180,13 @@ contains
 
         ! ---- 4. invariants ----
         if (dyn%se_check) then
-            call se_check_core(dyn, mesh, partit, dt, step, eta_old)
+            call se_check_core(dyn, mesh, partit, dt, step, eta_old, water_flux)
             deallocate(eta_old)
         end if
     end subroutine se_trim_finish
 
     !===========================================================================
-    subroutine se_check_values(dyn, mesh, partit, dt, eta_old, vals)
+    subroutine se_check_values(dyn, mesh, partit, dt, eta_old, vals, water_flux)
         ! The FESOM3_SE_CHECK invariants after se_trim_finish's commit, while helem is still at
         ! n; reduced over the ranks (collective). eta^{n+1} = eta_n, eta^n = eta_old (the copy
         ! taken before the commit). vals(SE_CHK_*):
@@ -1124,25 +1196,35 @@ contains
         !   TRIM      max|sum_k helem^n uv_k - <<U>>| over the owned elements, both components
         !             [m^2/s]: the trimmed velocity carries the mean transport
         !   MSL       sum areasvol*eta^{n+1}/sum areasvol (owned nodes) minus the same mean at the
-        !             start of the run [m]: dyn%se_msl0, taken from eta^n by the first call of
-        !             this process. 0 to rounding in a closed linfs basin
+        !             start of the run [m] (dyn%se_msl0, taken from eta^n by the first call of
+        !             this process), minus the change the freshwater explains, FW. 0 to rounding
+        !             in a closed basin: the inflow I conserves volume
         !   SPREADU, SPREADUM  the copy spreads max|copy - designated copy| of U^M and <<U>> on
         !             the shared elements (plan D2: 0 by construction; 0 at 1 rank)
         !   MAXETA    max|eta^{n+1}| [m];  MAXU  max|U^M| [m^2/s]  (owned)
         !   NBAD      the number of non-finite values in eta_n and ssh_rhs_old (owned nodes),
         !             <<U>> and U^M (owned elements, per element) and uv (wet layers, owned)
+        !   FW        the mean-sea-level change of the freshwater since the start of the run [m],
+        !             dyn%se_fwmsl, - sum over the calls of tau*sum W*areasvol/sum areasvol
+        !             (open-surface owned nodes). Accumulated only when which_ALE /= linfs and
+        !             water_flux is present, so call this ONCE per step with water_flux
+        !             (se_check_core does); 0 under linfs (virtual salt, no volume flux)
         ! Exposed (not only through se_check_core) so that test_ssh_se can check the values.
-        type(t_dyn),    intent(inout) :: dyn          ! se_msl0 is set by the first call
+        type(t_dyn),    intent(inout) :: dyn          ! se_msl0 / se_fwmsl: set / accumulated
         type(t_mesh),   intent(in)    :: mesh
         type(t_partit), intent(in)    :: partit
         real(kind=WP),  intent(in)    :: dt
         real(kind=WP),  intent(in)    :: eta_old(:)   ! (>= nNodO) eta^n
         real(kind=WP),  intent(out)   :: vals(SE_NCHK)
+        real(kind=WP),  intent(in), optional :: water_flux(:)   ! (>= nNodO) + out of the ocean
         integer       :: n, e, nz, nbad
         integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
-        real(kind=WP) :: mx(6), sm(4), s(2)
+        real(kind=WP) :: mx(6), sm(5), s(2)
+        logical       :: fw
 
         call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        fw = .false.
+        if (present(water_flux)) fw = (trim(which_ALE) /= 'linfs')
         mx = 0.0_WP; sm = 0.0_WP; nbad = 0
         do n = 1, nNodO
             mx(1) = max(mx(1), abs(dyn%eta_n(n) - eta_old(n) - dt*dyn%ssh_rhs_old(n)/mesh%areasvol(n)))
@@ -1150,6 +1232,7 @@ contains
             sm(1) = sm(1) + mesh%areasvol(n)*dyn%eta_n(n)
             sm(2) = sm(2) + mesh%areasvol(n)
             sm(3) = sm(3) + mesh%areasvol(n)*eta_old(n)
+            if (fw .and. mesh%ulevels_nod2D(n) == 1) sm(5) = sm(5) + water_flux(n)*mesh%areasvol(n)
             if (.not. (ieee_is_finite(dyn%eta_n(n)) .and. ieee_is_finite(dyn%ssh_rhs_old(n)))) nbad = nbad + 1
         end do
         do e = 1, nElemO
@@ -1176,15 +1259,18 @@ contains
         if (.not. dyn%se_msl0_set) then
             dyn%se_msl0     = sm(3)/sm(2)
             dyn%se_msl0_set = .true.
+            dyn%se_fwmsl    = 0.0_WP
         end if
+        if (fw) dyn%se_fwmsl = dyn%se_fwmsl - dt*sm(5)/sm(2)
         vals(SE_CHK_ETACOMP)  = mx(1)
         vals(SE_CHK_TRIM)     = mx(2)
-        vals(SE_CHK_MSL)      = sm(1)/sm(2) - dyn%se_msl0
+        vals(SE_CHK_MSL)      = sm(1)/sm(2) - dyn%se_msl0 - dyn%se_fwmsl
         vals(SE_CHK_SPREADU)  = mx(3)
         vals(SE_CHK_SPREADUM) = mx(4)
         vals(SE_CHK_MAXETA)   = mx(5)
         vals(SE_CHK_MAXU)     = mx(6)
         vals(SE_CHK_NBAD)     = sm(4)
+        vals(SE_CHK_FW)       = dyn%se_fwmsl
     end subroutine se_check_values
 
     !===========================================================================
@@ -1193,29 +1279,33 @@ contains
         ! without blanks, e.g.
         !   SE_CHECK step=12 etacomp=1.2345E-16 trim=3.0518E-13 msl=-4.1633E-17 spreadU=0.0000E+00
         !            spreadUm=0.0000E+00 maxeta=1.0412E+00 maxU=2.5011E+02
-        ! (one line). grep '^SE_CHECK ', then split each token at '='.
+        ! (one line); when which_ALE /= linfs one more token, fw= (SE_CHK_FW, the freshwater
+        ! part of the mean-sea-level change, which msl= has already taken out). grep
+        ! '^SE_CHECK ', then split each token at '='.
         integer,       intent(in) :: step
         real(kind=WP), intent(in) :: vals(SE_NCHK)
         character(len=256) :: line
         character(len=16)  :: st
         write(st, '(i0)') step
-        line = 'SE_CHECK step='//trim(st)//kv('etacomp', vals(SE_CHK_ETACOMP))// &
-               kv('trim', vals(SE_CHK_TRIM))//kv('msl', vals(SE_CHK_MSL))// &
-               kv('spreadU', vals(SE_CHK_SPREADU))//kv('spreadUm', vals(SE_CHK_SPREADUM))// &
-               kv('maxeta', vals(SE_CHK_MAXETA))//kv('maxU', vals(SE_CHK_MAXU))
-    contains
-        function kv(key, x) result(t)
-            character(len=*), intent(in) :: key
-            real(kind=WP),    intent(in) :: x
-            character(len=:), allocatable :: t
-            character(len=16) :: buf
-            write(buf, '(es11.4)') x
-            t = ' '//key//'='//trim(adjustl(buf))
-        end function kv
+        line = 'SE_CHECK step='//trim(st)//se_kv('etacomp', vals(SE_CHK_ETACOMP))// &
+               se_kv('trim', vals(SE_CHK_TRIM))//se_kv('msl', vals(SE_CHK_MSL))// &
+               se_kv('spreadU', vals(SE_CHK_SPREADU))//se_kv('spreadUm', vals(SE_CHK_SPREADUM))// &
+               se_kv('maxeta', vals(SE_CHK_MAXETA))//se_kv('maxU', vals(SE_CHK_MAXU))
+        if (trim(which_ALE) /= 'linfs') line = trim(line)//se_kv('fw', vals(SE_CHK_FW))
     end function se_check_line
 
+    function se_kv(key, x) result(t)
+        ! ' key=value' with value in es11.4, no blanks (the SE_CHECK line tokens)
+        character(len=*), intent(in) :: key
+        real(kind=WP),    intent(in) :: x
+        character(len=:), allocatable :: t
+        character(len=16) :: buf
+        write(buf, '(es11.4)') x
+        t = ' '//key//'='//trim(adjustl(buf))
+    end function se_kv
+
     !===========================================================================
-    subroutine se_check_core(dyn, mesh, partit, dt, step, eta_old)
+    subroutine se_check_core(dyn, mesh, partit, dt, step, eta_old, water_flux)
         ! FESOM3_SE_CHECK, called by se_trim_finish after the commit (helem still at n):
         ! se_check_values, one SE_CHECK line on rank 0 (se_check_line), and a stop with the
         ! step number on any non-finite value. Collective.
@@ -1225,10 +1315,11 @@ contains
         real(kind=WP),  intent(in)    :: dt
         integer,        intent(in)    :: step
         real(kind=WP),  intent(in)    :: eta_old(:)
+        real(kind=WP),  intent(in), optional :: water_flux(:)
         real(kind=WP)      :: vals(SE_NCHK)
         character(len=160) :: msg
 
-        call se_check_values(dyn, mesh, partit, dt, eta_old, vals)
+        call se_check_values(dyn, mesh, partit, dt, eta_old, vals, water_flux)
         if (partit%mype == 0) then
             write(*,'(a)') trim(se_check_line(step, vals))
             flush(output_unit)
@@ -1241,19 +1332,106 @@ contains
     end subroutine se_check_core
 
     !===========================================================================
+    subroutine se_check_tail_values(dyn, mesh, partit, tvals)
+        ! The zstar invariants of FESOM3_SE_CHECK after the ALE tail (step_oce, after
+        ! update_thickness_ale): hnode, helem and zbar_3d_n are at n+1, eta_n = hbar = eta^{n+1},
+        ! hbar_old = eta^n (se_trim_finish), se_H = H^n and se_c are this step's (from
+        ! zbar_3d_n^n). Reduced over the ranks (collective). tvals(SE_TAIL_*):
+        !   LAYSUM  max over the owned open-surface nodes of |sum_k hnode(k,v) - (H0_v + eta_v)|
+        !           [m], k = 1..nlevels_nod2D(v)-1, H0_v = zbar(1) - zbar(nlevels_nod2D(v)) the
+        !           resting depth of the vertex column: the committed thicknesses carry the SE
+        !           elevation (vert_vel_ale stretches by hbar - hbar_old = eta^{n+1} - eta^n)
+        !   W1      max over the owned open-surface nodes of |w(1,v)| [m/s]. vert_vel_ale sets
+        !           w(1) = I_h/area - (hbar - hbar_old)/tau - W, I_h the column inflow of
+        !           sum_k helem^n uv; the SE elevation change is tau*(I(<<U>>) - W*areasvol)/
+        !           areasvol, area == areasvol (vertex bottom) and the trim makes sum_k helem^n uv
+        !           = <<U>>, so w(1) = 0 to rounding, with or without freshwater
+        !   HLAW    max over the owned elements of |sum_k helem^{n+1}(k,e) - H_e(eta^{n+1})| [m],
+        !           H_e(eta^{n+1}) = H^n_e + sum_v elem_w*c*(hbar - hbar_old), the depth law of
+        !           the substeps (plan D3, se_elem_depth) against what the tail built
+        !   NBAD    the number of non-finite values in hnode (wet layers) and w(1) (owned open-
+        !           surface nodes) and helem (wet layers, owned elements)
+        ! Exposed (not only through se_check_tail) so that test_ssh_se can check the values.
+        type(t_dyn),    intent(in)  :: dyn
+        type(t_mesh),   intent(in)  :: mesh
+        type(t_partit), intent(in)  :: partit
+        real(kind=WP),  intent(out) :: tvals(SE_NTAIL)
+        integer       :: n, e, nz, nbad, elnodes(MAX_NV)
+        integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
+        real(kind=WP) :: mx(3), s, HA, nb(1)
+
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        mx = 0.0_WP; nbad = 0
+        do n = 1, nNodO
+            if (mesh%ulevels_nod2D(n) /= 1) cycle
+            s = 0.0_WP
+            do nz = 1, mesh%nlevels_nod2D(n) - 1
+                s = s + mesh%hnode(nz, n)
+                if (.not. ieee_is_finite(real(mesh%hnode(nz, n), WP))) nbad = nbad + 1
+            end do
+            mx(1) = max(mx(1), abs(s - ((mesh%zbar(1) - mesh%zbar(mesh%nlevels_nod2D(n))) + dyn%eta_n(n))))
+            mx(2) = max(mx(2), abs(dyn%w(1, n)))
+            if (.not. ieee_is_finite(dyn%w(1, n))) nbad = nbad + 1
+        end do
+        do e = 1, nElemO
+            s = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                s = s + mesh%helem(nz, e)
+                if (.not. ieee_is_finite(real(mesh%helem(nz, e), WP))) nbad = nbad + 1
+            end do
+            elnodes = mesh%elem2D_nodes(:, e)
+            HA = dyn%se_H(e) + sum(mesh%elem_w(:, e)*dyn%se_c(:, e)*(mesh%hbar(elnodes) - mesh%hbar_old(elnodes)))
+            mx(3) = max(mx(3), abs(s - HA))
+        end do
+        nb(1) = real(nbad, WP)
+        if (is_multirank(partit)) then
+            call allreduce_max(mx, partit)
+            call allreduce_sum(nb, partit)
+        end if
+        tvals(SE_TAIL_LAYSUM) = mx(1)
+        tvals(SE_TAIL_W1)     = mx(2)
+        tvals(SE_TAIL_HLAW)   = mx(3)
+        tvals(SE_TAIL_NBAD)   = nb(1)
+    end subroutine se_check_tail_values
+
+    !===========================================================================
+    function se_check_tail_line(step, tvals) result(line)
+        ! The fixed-format zstar tail line, key=value tokens as se_check_line's, e.g.
+        !   SE_CHECK_TAIL step=12 laysum=2.2737E-12 w1=4.2352E-18 hlaw=9.0949E-13
+        ! (one line; '^SE_CHECK ' does not match it, so the SE_CHECK parsers are unaffected).
+        integer,       intent(in) :: step
+        real(kind=WP), intent(in) :: tvals(SE_NTAIL)
+        character(len=128) :: line
+        character(len=16)  :: st
+        write(st, '(i0)') step
+        line = 'SE_CHECK_TAIL step='//trim(st)//se_kv('laysum', tvals(SE_TAIL_LAYSUM))// &
+               se_kv('w1', tvals(SE_TAIL_W1))//se_kv('hlaw', tvals(SE_TAIL_HLAW))
+    end function se_check_tail_line
+
+    !===========================================================================
     subroutine se_check_tail(dyn, mesh, partit, step)
         ! FESOM3_SE_CHECK after the ALE tail (step_oce, after update_thickness_ale). Under zstar
-        ! it will check the committed thicknesses against the SE elevation, max|sum_k hnode -
-        ! (H0 + eta)| and max|w(1)| (plan Task 3.1). linfs has nothing to check here: hnode is
-        ! frozen and w(1) is the free-surface velocity, so this is a no-op; until Task 3.1 a
-        ! non-linfs SE run stops in se_elem_depth before it gets here.
+        ! the committed thicknesses against the SE elevation and the depth law
+        ! (se_check_tail_values), one SE_CHECK_TAIL line on rank 0, and a stop with the step
+        ! number on any non-finite value. Collective. linfs has nothing to check here (hnode is
+        ! frozen, w(1) is the free-surface velocity): a no-op.
         type(t_dyn),    intent(in) :: dyn
         type(t_mesh),   intent(in) :: mesh
         type(t_partit), intent(in) :: partit
         integer,        intent(in) :: step
+        real(kind=WP)      :: tvals(SE_NTAIL)
+        character(len=160) :: msg
         if (trim(which_ALE) == 'linfs') return
-        call se_die('se_check_tail: the zstar checks are not implemented yet '// &
-                    '(docs/plans/2026-10-17-split-explicit.md, Task 3.1)', partit)
+        call se_check_tail_values(dyn, mesh, partit, tvals)
+        if (partit%mype == 0) then
+            write(*,'(a)') trim(se_check_tail_line(step, tvals))
+            flush(output_unit)
+        end if
+        if (tvals(SE_TAIL_NBAD) > 0.0_WP) then
+            write(msg,'(a,i0,a,i0,a)') 'SE_CHECK_TAIL: ', nint(tvals(SE_TAIL_NBAD)), &
+                ' non-finite values (hnode, w(1) or helem) at step ', step, '; stopping'
+            call se_die(trim(msg), partit)
+        end if
     end subroutine se_check_tail
 
     !===========================================================================

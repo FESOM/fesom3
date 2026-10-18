@@ -528,8 +528,8 @@ foreach(_case badswitch badm cfl)
 endforeach()
 # The split-explicit step in fesom_conserve (step_oce's SE branch): pi, linfs, 20 steps with the
 # per-step SE_CHECK line; the driver's linfs invariants (T10, helem, finiteness) stop the run on a
-# violation, SE_CHECK on a non-finite value. Until the zstar depth law (plan Task 3.1) a zstar SE
-# run stops in se_elem_depth (the second test pins that stop).
+# violation, SE_CHECK on a non-finite value. The zstar tests below add the zstar depth law and the
+# hard conservation.
 add_test(NAME fesom_conserve_se_linfs_np1
          COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np 1 $<TARGET_FILE:fesom_conserve>)
 set_tests_properties(fesom_conserve_se_linfs_np1 PROPERTIES
@@ -537,10 +537,16 @@ set_tests_properties(fesom_conserve_se_linfs_np1 PROPERTIES
     PASS_REGULAR_EXPRESSION "SE_CHECK step=20 etacomp=.*fesom_conserve: done \\(20 steps, which_ALE=linfs\\)"
     FAIL_REGULAR_EXPRESSION "VIOLATED;non-finite"
     SKIP_REGULAR_EXPRESSION "cannot open;No such file")
-add_test(NAME fesom_conserve_se_zstar_np1
-         COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np 1 $<TARGET_FILE:fesom_conserve>)
-set_tests_properties(fesom_conserve_se_zstar_np1 PROPERTIES
-    ENVIRONMENT "${_se_conserve};FESOM3_WHICH_ALE=zstar;FESOM3_SSH_SE=1"
-    PASS_REGULAR_EXPRESSION "split-explicit supports which_ALE = linfs only so far"
-    FAIL_REGULAR_EXPRESSION "fesom_conserve: step 1 "
-    SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+# zstar (plan Task 3.1): the same 20 SE steps under zstar at np 1 and 2 with the hard heat/salt/volume
+# conservation of the zstar conserve tests (FESOM3_CONSERVE_TOL=1e-12), the per-step SE_CHECK line and
+# the SE_CHECK_TAIL line of the zstar checks after the ALE tail (layer sum, w(1), depth law); their
+# levels are gated by tools/run_conserve_pi.sh, a non-finite value stops the run.
+foreach(_np 1 2)
+    add_test(NAME fesom_conserve_se_zstar_np${_np}
+             COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np ${_np} $<TARGET_FILE:fesom_conserve>)
+    set_tests_properties(fesom_conserve_se_zstar_np${_np} PROPERTIES
+        ENVIRONMENT "FESOM3_MESH_DIR=${_mesh_pi};FESOM3_IC_FILE=${_icf};FESOM3_NSTEPS=20;FESOM3_WHICH_ALE=zstar;FESOM3_SSH_SE=1;FESOM3_SE_CHECK=1;FESOM3_CONSERVE_TOL=1e-12"
+        PASS_REGULAR_EXPRESSION "SE_CHECK_TAIL step=20 laysum=.*fesom_conserve: CONSERVATION OK within tol"
+        FAIL_REGULAR_EXPRESSION "VIOLATED;non-finite"
+        SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+endforeach()

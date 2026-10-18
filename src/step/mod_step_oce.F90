@@ -246,7 +246,7 @@ contains
             ! the tail is unchanged. partit is present here (se_step_guard). The hbar and eta_n
             ! dumps keep their substep ids; there is no ssh_rhs / d_eta in SE.
             call se_bt_forcing(dynamics, mesh, partit, dt, lfirst)
-            call se_subcycle(dynamics, mesh, partit, dt)
+            call se_subcycle(dynamics, mesh, partit, dt, water_flux)
             call se_trim_finish(dynamics, mesh, partit, dt, n, water_flux)
             call dump_node_2d(DUMP_SUBSTEP_HBAR, n, 'hbar', mesh%hbar)
             call dump_node_2d(DUMP_SUBSTEP_ETA_N, n, 'eta_n', dynamics%eta_n)
@@ -323,8 +323,8 @@ contains
         call timer_stop(TMR_OCE_TRACER)
 
         !_______________________________________________________________________
-        ! FESOM3_SE_CHECK: the split-explicit checks of the committed thicknesses (zstar; a no-op
-        ! under linfs). The core checks ran inside se_trim_finish.
+        ! FESOM3_SE_CHECK: the split-explicit checks of the committed thicknesses (zstar: layer
+        ! sum, w(1), the depth law; a no-op under linfs). The core checks ran inside se_trim_finish.
         if (dynamics%use_ssh_se .and. dynamics%se_check) call se_check_tail(dynamics, mesh, partit, n)
     end subroutine step_oce
 

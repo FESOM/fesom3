@@ -94,6 +94,8 @@ program test_ssh_se
     !       no non-finite value; the line is blank-separated key=value tokens; a uv perturbed by
     !       delta on one element shows as trim = helem*delta (the other checks unchanged), and a
     !       NaN there is counted.
+    !   Z1-Z6 zstar (Task 3.1): the depth law, the freshwater term and the zstar checks through the
+    !       real ALE tail; their own block at the end of this file (run last).
     ! FESOM3_MESH_DIR (default pi), FESOM3_TEST_ROTATE=1 reads it rotated (setup_test_mesh).
     use mpi
     use mod_precision,    only: WP, MP, MPI_WP
@@ -122,6 +124,11 @@ program test_ssh_se
                                 SE_CHK_ETACOMP, SE_CHK_TRIM, SE_CHK_MSL, SE_CHK_SPREADU, &
                                 SE_CHK_SPREADUM, SE_CHK_MAXETA, SE_CHK_MAXU, SE_CHK_NBAD
     use test_util,        only: setup_test_mesh, check, finish, sum_all, max_all, hval
+    ! zstar block (Z1-Z6)
+    use mod_config,       only: which_ALE
+    use oce_ale,          only: vert_vel_ale, update_thickness_ale
+    use oce_ssh_se,       only: se_depth_at, se_check_tail_values, se_check_tail_line, SE_NTAIL, &
+                                SE_TAIL_LAYSUM, SE_TAIL_W1, SE_TAIL_HLAW, SE_TAIL_NBAD, SE_CHK_FW
     implicit none
 
     character(len=*), parameter :: PI_DIR = '/home/a/a270088/port2/fesom2/tests/data/MESHES/pi'
@@ -145,6 +152,7 @@ program test_ssh_se
     call c10_trim_finish()
     call p_many_ranks()
     call c11_check()
+    call z_zstar()                ! last: it leaves the zstar thickness fields allocated
     call finish(partit, 'test_ssh_se')
 
 contains
@@ -1507,5 +1515,421 @@ contains
         if (ieee_support_halting(ieee_invalid)) call ieee_set_halting_mode(ieee_invalid, halt)
         call check(v2(SE_CHK_NBAD) == 1.0_WP, 'C11 a NaN in uv is counted (NBAD = 1)', partit%mype)
     end subroutine c11_check
+
+    !===========================================================================
+    ! ==== zstar (split-explicit Task 3.1): Z1-Z6 ===============================
+    ! z_zstar sets which_ALE = 'zstar' and restores it and helem on exit; the zstar thickness
+    ! fields it allocates (hnode, hnode_new, zbar_3d_n, Z_3d_n) stay, so it runs last.
+    !   Z1  the depth-law weights c of se_elem_depth on the cold and on a stretched thickness
+    !       state: nlevels(e) == min over the element's vertices of nlevels_nod2D (the vertex
+    !       bottom the formula relies on); c == 1 exactly at every vertex with nlevels_nod2D <=
+    !       nlevels(e)+1 (the shallowest vertex among them), 0 < c < 1 at the deeper ones, 0 beyond
+    !       elem2D_nnodes; some elements have a c < 1 (the law differs from sum_v elem_w*d eta).
+    !   Z2  H_e(eta^n) = sum_k helem^n: se_depth_at(eta_n) == se_H == sum_k helem (bitwise).
+    !   Z3  DECISIVE: a synthetic elevation change (hashed, |d eta| <= 0.5 m) through the REAL
+    !       vert_vel_ale + update_thickness_ale, twice: from the cold state, then from the
+    !       stretched one with c recomputed from the stretched zbar_3d_n. sum_k helem^{n+1} =
+    !       H_e(eta^{n+1}) on every owned element to 1e-14 of max H; the c = 1 law and the linfs
+    !       law (c = 0) miss by more than 1 mm (the check discriminates); the layer sum
+    !       sum_k hnode = H0 + eta^{n+1} to 1e-14 of max H; se_check_tail_values reports both.
+    !   Z4  a uniform freshwater flux W (1e-6 m/s) with U = 0, eta = 0, F = 0, M = 40: eta^M -
+    !       eta^0 = -tau*W on every owned node and sum areasvol*(eta^M - eta^0) = -tau*sum
+    !       W*areasvol (1e-12 relative); then se_trim_finish with SE_CHECK: ssh_rhs_old =
+    !       I(<<U>>) - W*areasvol (bitwise), the freshwater part of the mean-sea-level change
+    !       fw = -tau*W, msl net of it 0 and the eta-compatibility at rounding, the line carries
+    !       fw=. Under linfs the same W leaves eta exactly 0.
+    !   Z5  one full zstar SE step with a hashed W from a hashed state whose thicknesses carry its
+    !       elevation: se_subcycle(W) -> se_trim_finish(W, SE_CHECK) -> vert_vel_ale(W) ->
+    !       update_thickness_ale. SE_CHECK: eta-compatibility, trim, msl net of the freshwater at
+    !       rounding (1e-12 of their scales), fw /= 0, copy spreads 0; tail: the layer sum and the
+    !       depth law to 1e-14 of max H, w(1) = 0 to 1e-12 of max|d eta/tau| + max|W|; at npes > 1
+    !       the copies of c and helem on the shared elements agree (spread 0), and so do those of
+    !       <<U>> and U^M after the substeps for every M = 1..40 (this caught the division by M in
+    !       se_subcycle's running mean: copies differed in the last bit at intermediate substeps
+    !       and could round back to equal by M = 40); the SE_CHECK_TAIL line format.
+    !   Z6  linfs: se_elem_depth leaves c == 0 (bitwise).
+    ! Residuals are printed.
+
+    subroutine z_zstar()
+        real(kind=WP), allocatable :: helem0(:,:)
+        character(len=20) :: ale0
+        ale0 = which_ALE
+        helem0 = mesh%helem
+        which_ALE = 'zstar'
+        call z3_tail_law()           ! with Z1 and Z2
+        call z4_uniform_w()          ! with Z6
+        call z5_full_step()
+        which_ALE = ale0
+        mesh%helem = helem0
+    end subroutine z_zstar
+
+    subroutine z_thickness_cold()
+        ! the cold zstar thickness state of the drivers (fesom_conserve): full-cell hnode,
+        ! zbar_3d_n and Z_3d_n on owned + halo nodes, hnode_new = hnode, full-cell helem on every
+        ! held element, hbar = hbar_old = 0
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, n, e, nz, nl
+        nl = mesh%nl
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        if (.not. allocated(mesh%hnode))     allocate(mesh%hnode(nl-1, nNodL))
+        if (.not. allocated(mesh%hnode_new)) allocate(mesh%hnode_new(nl-1, nNodL))
+        if (.not. allocated(mesh%zbar_3d_n)) allocate(mesh%zbar_3d_n(nl, nNodL))
+        if (.not. allocated(mesh%Z_3d_n))    allocate(mesh%Z_3d_n(nl-1, nNodL))
+        if (.not. allocated(mesh%hbar))      allocate(mesh%hbar(nNodL), mesh%hbar_old(nNodL))
+        mesh%hnode = 0.0_MP; mesh%zbar_3d_n = 0.0_MP; mesh%Z_3d_n = 0.0_MP
+        do n = 1, nNodL
+            do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n) - 1
+                mesh%hnode(nz, n)  = mesh%zbar(nz) - mesh%zbar(nz+1)
+                mesh%Z_3d_n(nz, n) = 0.5_WP*(mesh%zbar(nz) + mesh%zbar(nz+1))
+            end do
+            mesh%zbar_3d_n(1:mesh%nlevels_nod2D(n), n) = mesh%zbar(1:mesh%nlevels_nod2D(n))
+        end do
+        mesh%hnode_new = mesh%hnode
+        mesh%helem = 0.0_MP
+        do e = 1, nElemF
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                mesh%helem(nz, e) = mesh%zbar(nz) - mesh%zbar(nz+1)
+            end do
+        end do
+        mesh%hbar = 0.0_MP; mesh%hbar_old = 0.0_MP
+    end subroutine z_thickness_cold
+
+    subroutine z_new_dyn(dyn)
+        ! new_dyn plus the vertical-velocity arrays vert_vel_ale writes (no w split, no GM)
+        type(t_dyn), intent(inout) :: dyn
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, nl
+        nl = mesh%nl
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        call new_dyn(dyn)
+        allocate(dyn%w(nl, nNodL), dyn%w_e(nl, nNodL), dyn%w_i(nl, nNodL), dyn%cfl_z(nl, nNodL))
+        dyn%w = 0.0_WP; dyn%w_e = 0.0_WP; dyn%w_i = 0.0_WP; dyn%cfl_z = 0.0_WP
+    end subroutine z_new_dyn
+
+    subroutine z_tail(dyn, eta_from, eta_to)
+        ! step_oce's ALE tail on a prescribed elevation change, as se_trim_finish leaves it
+        ! (owned + halo): hbar_old = eta_from, hbar = eta_to, then the real vert_vel_ale (no
+        ! freshwater) and update_thickness_ale
+        type(t_dyn),   intent(inout) :: dyn
+        real(kind=WP), intent(in)    :: eta_from(:), eta_to(:)
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        mesh%hbar_old(1:nNodL) = eta_from(1:nNodL)
+        mesh%hbar(1:nNodL)     = eta_to(1:nNodL)
+        call vert_vel_ale(dyn, mesh, dt, partit)
+        call update_thickness_ale(mesh, partit)
+    end subroutine z_tail
+
+    real(kind=WP) function z_maxH()
+        ! max over all elements of sum_k helem (the scale of the depth-law checks)
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, e
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        z_maxH = 0.0_WP
+        do e = 1, nElemO
+            z_maxH = max(z_maxH, real(sum(mesh%helem(mesh%ulevels(e):mesh%nlevels(e)-1, e)), WP))
+        end do
+        call max_all(z_maxH, partit)
+    end function z_maxH
+
+    subroutine z1_weights(dyn, label)
+        ! Z1 on the current thickness state (se_elem_depth has run under zstar)
+        type(t_dyn),      intent(in) :: dyn
+        character(len=*), intent(in) :: label
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, e, k, nn, nlv, nle
+        integer :: nbad_min, nbad_one, nbad_frac, nbad_zero, nfrac
+        real(kind=WP) :: cmin
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        nbad_min = 0; nbad_one = 0; nbad_frac = 0; nbad_zero = 0; nfrac = 0; cmin = 1.0_WP
+        do e = 1, nElemO
+            nn  = mesh%elem2D_nnodes(e)
+            nle = mesh%nlevels(e)
+            if (nle /= minval(mesh%nlevels_nod2D(mesh%elem2D_nodes(1:nn, e)))) nbad_min = nbad_min + 1
+            if (any(dyn%se_c(1:nn, e) < 1.0_WP)) nfrac = nfrac + 1
+            do k = 1, MAX_NV
+                if (k > nn) then
+                    if (dyn%se_c(k, e) /= 0.0_WP) nbad_zero = nbad_zero + 1
+                    cycle
+                end if
+                nlv = mesh%nlevels_nod2D(mesh%elem2D_nodes(k, e))
+                if (nlv <= nle + 1) then
+                    if (dyn%se_c(k, e) /= 1.0_WP) nbad_one = nbad_one + 1
+                else
+                    if (.not. (dyn%se_c(k, e) > 0.0_WP .and. dyn%se_c(k, e) < 1.0_WP)) nbad_frac = nbad_frac + 1
+                    cmin = min(cmin, dyn%se_c(k, e))
+                end if
+            end do
+        end do
+        call sum_all(nbad_min, partit); call sum_all(nbad_one, partit); call sum_all(nbad_frac, partit)
+        call sum_all(nbad_zero, partit); call sum_all(nfrac, partit)
+        cmin = -cmin; call max_all(cmin, partit); cmin = -cmin
+        call check(nbad_min == 0, 'Z1 '//label//': nlevels(e) == min over the vertices of nlevels_nod2D', &
+                   partit%mype)
+        call check(nbad_one == 0, 'Z1 '//label//': c == 1 at the vertices with nlevels_nod2D <= nlevels(e)+1', &
+                   partit%mype)
+        call check(nbad_frac == 0, 'Z1 '//label//': 0 < c < 1 at the deeper vertices', partit%mype)
+        call check(nbad_zero == 0, 'Z1 '//label//': c == 0 beyond elem2D_nnodes', partit%mype)
+        call check(nfrac > 0, 'Z1 '//label//': some elements have a c < 1', partit%mype)
+        if (partit%mype == 0) write(*,'(a,i0,a,f8.5)') 'test_ssh_se: Z1 '//label//': elements with a c < 1: ', &
+            nfrac, ', min c = ', cmin
+    end subroutine z1_weights
+
+    subroutine z3_tail_law()
+        ! Z1, Z2 and the decisive Z3 (header of this block)
+        type(t_dyn) :: d, dz
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, n, e, nz, i, nbad
+        integer :: elnodes(MAX_NV)
+        real(kind=WP), allocatable :: eta_a(:), eta_b(:), HA(:)
+        real(kind=WP) :: maxH, s, res(2), resone(2), reslin(2), lay(2), tv(SE_NTAIL), deta
+        character(len=8) :: tag
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        call z_thickness_cold()
+        allocate(eta_a(nNodL), eta_b(nNodL), HA(nElemL))
+        call z_new_dyn(d)                                  ! eta_n = 0 = the cold elevation
+        call se_init(d, mesh, partit, dt)
+        call z_new_dyn(dz)                                 ! the tail's scratch state (uv = 0)
+        maxH = z_maxH()
+        eta_a = 0.0_WP
+        do i = 1, 2
+            ! eta^n = eta_a (d%eta_n); eta^{n+1} = eta_b
+            do n = 1, nNodL
+                eta_b(n) = eta_a(n) + 0.5_WP*hval(partit%myList_nod2D(n), 60 + i)
+            end do
+            d%eta_n(1:nNodL) = eta_a
+            call se_elem_depth(d, mesh, partit)
+            if (i == 1) then
+                call z1_weights(d, 'cold')
+            else
+                call z1_weights(d, 'stretched')
+            end if
+            ! Z2: H_e(eta^n) == se_H == sum_k helem^n (bitwise)
+            call se_depth_at(d, mesh, partit, d%eta_n, HA)
+            nbad = 0
+            do e = 1, nElemO
+                s = 0.0_WP
+                do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                    s = s + mesh%helem(nz, e)
+                end do
+                if (HA(e) /= d%se_H(e) .or. d%se_H(e) /= s) nbad = nbad + 1
+            end do
+            call sum_all(nbad, partit)
+            call check(nbad == 0, 'Z2 H_e(eta^n) == se_H == sum_k helem^n (bitwise)', partit%mype)
+            ! Z3: the depth law at eta^{n+1}, then the real tail
+            call se_depth_at(d, mesh, partit, eta_b, HA)
+            call z_tail(dz, eta_a, eta_b)
+            res(i) = 0.0_WP; resone(i) = 0.0_WP; reslin(i) = 0.0_WP
+            do e = 1, nElemO
+                s = 0.0_WP
+                do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                    s = s + mesh%helem(nz, e)
+                end do
+                elnodes = mesh%elem2D_nodes(:, e)
+                res(i)    = max(res(i), abs(s - HA(e)))
+                resone(i) = max(resone(i), abs(s - (d%se_H(e) + sum(mesh%elem_w(:, e)*(eta_b(elnodes) - eta_a(elnodes))))))
+                reslin(i) = max(reslin(i), abs(s - d%se_H(e)))
+            end do
+            lay(i) = 0.0_WP
+            do n = 1, nNodO
+                s = 0.0_WP
+                do nz = 1, mesh%nlevels_nod2D(n) - 1
+                    s = s + mesh%hnode(nz, n)
+                end do
+                lay(i) = max(lay(i), abs(s - ((mesh%zbar(1) - mesh%zbar(mesh%nlevels_nod2D(n))) + eta_b(n))))
+            end do
+            call max_all(res(i), partit); call max_all(resone(i), partit); call max_all(reslin(i), partit)
+            call max_all(lay(i), partit)
+            write(tag, '(a,i0)') 'step ', i
+            call check(res(i) <= 1.0e-14_WP*maxH, 'Z3 '//trim(tag)//': sum_k helem^{n+1} = H_e(eta^{n+1}) '// &
+                       'through the real vert_vel_ale + update_thickness_ale', partit%mype)
+            call check(resone(i) > 1.0e-3_WP .and. reslin(i) > 1.0e-3_WP, 'Z3 '//trim(tag)// &
+                       ': the c = 1 and c = 0 laws miss by > 1 mm (the check discriminates)', partit%mype)
+            call check(lay(i) <= 1.0e-14_WP*maxH, 'Z3 '//trim(tag)//': sum_k hnode = H0 + eta^{n+1}', partit%mype)
+            ! se_check_tail_values on this state: eta_n = eta^{n+1}, hbar - hbar_old = d eta
+            d%eta_n(1:nNodL) = eta_b
+            d%w = dz%w
+            call se_check_tail_values(d, mesh, partit, tv)
+            call check(tv(SE_TAIL_HLAW) <= 1.0e-14_WP*maxH .and. tv(SE_TAIL_LAYSUM) <= 1.0e-14_WP*maxH .and. &
+                       tv(SE_TAIL_NBAD) == 0.0_WP, 'Z3 '//trim(tag)//': se_check_tail_values reports '// &
+                       'the depth law and the layer sum at rounding', partit%mype)
+            eta_a = eta_b
+        end do
+        deta = maxval(abs(eta_b(1:nNodO)))
+        call max_all(deta, partit)
+        if (partit%mype == 0) then
+            write(*,'(a,es10.3,a,es10.3,a)') 'test_ssh_se: Z3 depth law through the tail (max H = ', maxH, &
+                ' m, max|eta| = ', deta, ' m):'
+            write(*,'(a,2es10.3,a,2es10.3,a,2es10.3,a,2es10.3)') 'test_ssh_se: Z3   steps 1, 2: max|sum helem - H_e(eta)| = ', &
+                res, ' m; c = 1 law ', resone, '; c = 0 law ', reslin, '; layer sum ', lay
+        end if
+        deallocate(eta_a, eta_b, HA)
+    end subroutine z3_tail_law
+
+    subroutine z4_uniform_w()
+        ! Z4 and Z6 (header of this block)
+        type(t_dyn) :: d0, d, dl
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, n, nbad
+        real(kind=WP), allocatable :: wf(:), infl(:)
+        real(kind=WP), parameter :: W = 1.0e-6_WP
+        real(kind=WP) :: res, vsum(2), vals(SE_NCHK), tw
+        character(len=256) :: line
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        call z_thickness_cold()
+        allocate(wf(nNodL), infl(nNodL))
+        wf = W
+        tw = dt*W
+        call z_new_dyn(d0)                                 ! uv = 0 (U ring 0), eta_n = 0
+        call se_init(d0, mesh, partit, dt)
+        call se_elem_depth(d0, mesh, partit)
+        d0%se_force = 0.0_WP
+        d0%se_M = 40
+        d = d0
+        call se_subcycle(d, mesh, partit, dt, wf)
+        res = 0.0_WP; vsum = 0.0_WP
+        do n = 1, nNodO
+            res = max(res, abs(d%se_etam(n) + tw))
+            vsum(1) = vsum(1) + mesh%areasvol(n)*d%se_etam(n)
+            vsum(2) = vsum(2) - dt*wf(n)*mesh%areasvol(n)
+        end do
+        call max_all(res, partit); call sum_all(vsum, partit)
+        call check(res <= 1.0e-12_WP*tw, 'Z4 uniform W, U = 0: eta^M - eta^0 = -tau*W', partit%mype)
+        call check(abs(vsum(1) - vsum(2)) <= 1.0e-12_WP*abs(vsum(2)), &
+                   'Z4 uniform W: sum areasvol*(eta^M - eta^0) = -tau*sum W*areasvol', partit%mype)
+        if (partit%mype == 0) write(*,'(a,es10.3,a,es10.3,a,es10.3,a,es10.3,a)') &
+            'test_ssh_se: Z4 uniform W: max|eta^M - eta^0 + tau*W| = ', res, ' m of tau*W = ', tw, &
+            '; volume ', vsum(1), ' m3 (-tau*sum W*areasvol = ', vsum(2), ')'
+        ! the trim and SE_CHECK: ssh_rhs_old carries -W*areasvol, fw = -tau*W, msl net of it = 0
+        d%se_check = .true.
+        call se_trim_finish(d, mesh, partit, dt, 3, wf)          ! prints the SE_CHECK line (rank 0)
+        call se_inflow(mesh, partit, d%se_umean, infl)
+        nbad = 0
+        do n = 1, nNodO          ! to 4 ulp: the compilers may contract a - b*c into an FMA
+            if (abs(d%ssh_rhs_old(n) - (infl(n) - wf(n)*mesh%areasvol(n))) > &
+                4.0_WP*epsilon(1.0_WP)*(abs(infl(n)) + abs(wf(n)*mesh%areasvol(n)))) nbad = nbad + 1
+        end do
+        call sum_all(nbad, partit)
+        call check(nbad == 0, 'Z4 ssh_rhs_old = I(<<U>>) - W*areasvol on owned nodes', partit%mype)
+        call se_check_values(d, mesh, partit, dt, d0%eta_n, vals)    ! no water_flux: no accumulation
+        call check(abs(vals(SE_CHK_FW) + tw) <= 1.0e-12_WP*tw .and. vals(SE_CHK_FW) == d%se_fwmsl, &
+                   'Z4 the freshwater part of the mean-sea-level change fw = -tau*W', partit%mype)
+        call check(abs(vals(SE_CHK_MSL)) <= 1.0e-12_WP*tw, 'Z4 msl net of the freshwater = 0', partit%mype)
+        call check(vals(SE_CHK_ETACOMP) <= 1.0e-12_WP*tw, 'Z4 eta-compatibility with W at rounding', partit%mype)
+        line = se_check_line(3, vals)
+        call check(index(line, ' maxU=') > 0 .and. index(line, ' fw=') > index(line, ' maxU='), &
+                   'Z4 zstar SE_CHECK line ends with fw=: '//trim(line), partit%mype)
+        if (partit%mype == 0) write(*,'(a,es10.3,a,es10.3,a,es10.3)') 'test_ssh_se: Z4 SE_CHECK: fw = ', &
+            vals(SE_CHK_FW), ' m, msl net of it ', vals(SE_CHK_MSL), ' m, etacomp ', vals(SE_CHK_ETACOMP)
+
+        ! linfs: Z6 c == 0, and W leaves eta exactly 0
+        which_ALE = 'linfs'
+        call z_new_dyn(dl)
+        call se_init(dl, mesh, partit, dt)
+        call se_elem_depth(dl, mesh, partit)
+        nbad = count(dl%se_c /= 0.0_WP)
+        call sum_all(nbad, partit)
+        call check(nbad == 0, 'Z6 linfs: se_elem_depth leaves c == 0 (bitwise)', partit%mype)
+        dl%se_force = 0.0_WP
+        dl%se_M = 40
+        call se_subcycle(dl, mesh, partit, dt, wf)
+        nbad = count(dl%se_etam /= 0.0_WP) + count(dl%se_eta /= 0.0_WP)
+        call sum_all(nbad, partit)
+        call check(nbad == 0, 'Z4 linfs: W leaves eta exactly 0 (virtual salt)', partit%mype)
+        which_ALE = 'zstar'
+        deallocate(wf, infl)
+    end subroutine z4_uniform_w
+
+    subroutine z5_full_step()
+        ! Z5 (header of this block)
+        type(t_dyn) :: d, dz, dm
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, n, e, nz, m
+        real(kind=WP), allocatable :: wf(:), eta0(:), zero(:), hel(:,:)
+        real(kind=WP) :: vals(SE_NCHK), tv(SE_NTAIL), sa(2), etascale, trimscale, wscale, maxH, sp(2)
+        character(len=128) :: line
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        ! thicknesses that carry eta^0 = hashed_step_state's eta_n (seed 11): the tail from rest
+        call z_thickness_cold()
+        allocate(wf(nNodL), eta0(nNodL), zero(nNodL))
+        zero = 0.0_WP
+        do n = 1, nNodL
+            eta0(n) = 0.1_WP*hval(partit%myList_nod2D(n), 11)
+            wf(n)   = 1.0e-6_WP*hval(partit%myList_nod2D(n), 72)
+        end do
+        call z_new_dyn(dz)
+        call z_tail(dz, zero, eta0)
+        ! the hashed SE state (se_elem_depth under zstar), the w arrays, SE_CHECK on
+        call hashed_step_state(d)
+        allocate(d%w(mesh%nl, nNodL), d%w_e(mesh%nl, nNodL), d%w_i(mesh%nl, nNodL), d%cfl_z(mesh%nl, nNodL))
+        d%w = 0.0_WP; d%w_e = 0.0_WP; d%w_i = 0.0_WP; d%cfl_z = 0.0_WP
+        d%se_M = 40
+        d%se_check = .true.
+        maxH = z_maxH()
+        if (partit%npes > 1) then
+            ! the copies of <<U>> and U^M after every M = 1..40 from this state: a copy that differs
+            ! at an intermediate substep can round back to equal by M = 40 (it did: se_subcycle)
+            sp = 0.0_WP
+            do m = 1, 40
+                dm = d
+                dm%se_M = m
+                call se_subcycle(dm, mesh, partit, dt, wf)
+                sp(1) = max(sp(1), shared_copy_max_elem(dm%se_umean, partit))
+                sp(2) = max(sp(2), shared_copy_max_elem(dm%se_ubt(:, :, 0), partit))
+            end do
+            call max_all(sp(1), partit); call max_all(sp(2), partit)
+            call check(all(sp == 0.0_WP), 'Z5 every M = 1..40: copies of <<U>> and U^M equal', partit%mype)
+            if (partit%mype == 0) write(*,'(a,2es10.3)') 'test_ssh_se: Z5 M = 1..40: spreads <<U>>, U^M ', sp
+        end if
+        call se_subcycle(d, mesh, partit, dt, wf)
+        call se_trim_finish(d, mesh, partit, dt, 5, wf)          ! prints the SE_CHECK line (rank 0)
+        call se_check_values(d, mesh, partit, dt, eta0, vals)    ! no water_flux: no accumulation
+        etascale = 0.0_WP; wscale = 0.0_WP
+        do n = 1, nNodO
+            etascale = max(etascale, abs(eta0(n)), abs(d%eta_n(n) - eta0(n)))
+            wscale   = max(wscale, abs(d%eta_n(n) - eta0(n))/dt + abs(wf(n)))
+        end do
+        trimscale = 0.0_WP
+        do e = 1, nElemO
+            sa = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                sa = sa + mesh%helem(nz, e)*abs(d%uv(:, nz, e))
+            end do
+            trimscale = max(trimscale, maxval(sa))
+        end do
+        call max_all(etascale, partit); call max_all(wscale, partit); call max_all(trimscale, partit)
+        call check(vals(SE_CHK_ETACOMP) <= 1.0e-12_WP*etascale, 'Z5 eta-compatibility with W at rounding', &
+                   partit%mype)
+        call check(vals(SE_CHK_TRIM) <= 1.0e-12_WP*trimscale, 'Z5 trim at rounding', partit%mype)
+        call check(abs(vals(SE_CHK_MSL)) <= 1.0e-12_WP*etascale .and. vals(SE_CHK_FW) /= 0.0_WP, &
+                   'Z5 msl net of the (nonzero) freshwater part = 0', partit%mype)
+        call check(vals(SE_CHK_SPREADU) == 0.0_WP .and. vals(SE_CHK_SPREADUM) == 0.0_WP .and. &
+                   vals(SE_CHK_NBAD) == 0.0_WP, 'Z5 copy spreads 0, no non-finite value', partit%mype)
+        ! the tail with W, then the zstar tail checks
+        call vert_vel_ale(d, mesh, dt, partit, water_flux=wf)
+        call update_thickness_ale(mesh, partit)
+        call se_check_tail_values(d, mesh, partit, tv)
+        call check(tv(SE_TAIL_LAYSUM) <= 1.0e-14_WP*maxH, 'Z5 tail: sum_k hnode = H0 + eta^{n+1}', partit%mype)
+        call check(tv(SE_TAIL_W1) <= 1.0e-12_WP*wscale, 'Z5 tail: w(1) = 0 with freshwater', partit%mype)
+        call check(tv(SE_TAIL_HLAW) <= 1.0e-14_WP*maxH, 'Z5 tail: sum_k helem^{n+1} = H_e(eta^{n+1})', &
+                   partit%mype)
+        call check(tv(SE_TAIL_NBAD) == 0.0_WP, 'Z5 tail: no non-finite value', partit%mype)
+        sp = 0.0_WP
+        if (partit%npes > 1) then
+            hel = real(mesh%helem, WP)
+            sp(1) = shared_copy_max_elem(d%se_c, partit)
+            sp(2) = shared_copy_max_elem(hel, partit)
+            call max_all(sp(1), partit); call max_all(sp(2), partit)
+            call check(all(sp == 0.0_WP), 'Z5 c and helem^{n+1}: shared copies equal', partit%mype)
+        end if
+        line = se_check_tail_line(5, tv)
+        call check(index(line, 'SE_CHECK_TAIL step=5 laysum=') == 1 .and. index(line, ' w1=') > 0 .and. &
+                   index(line, ' hlaw=') > 0 .and. index(trim(line), '  ') == 0 .and. &
+                   index(trim(line), '= ') == 0, 'Z5 the SE_CHECK_TAIL line: '//trim(line), partit%mype)
+        if (partit%mype == 0) then
+            write(*,'(a,es10.3,a,es10.3,a,es10.3,a,es10.3,a,es10.3,a,3es10.3)') 'test_ssh_se: Z5 SE_CHECK: etacomp ', &
+                vals(SE_CHK_ETACOMP), ' m of ', etascale, '; trim ', vals(SE_CHK_TRIM), ' m2/s; msl ', &
+                vals(SE_CHK_MSL), ' m net of fw ', vals(SE_CHK_FW), '; spreads U, <<U>>, nbad ', &
+                vals(SE_CHK_SPREADU), vals(SE_CHK_SPREADUM), vals(SE_CHK_NBAD)
+            write(*,'(a,es10.3,a,es10.3,a,es10.3,a,es10.3,a,es10.3,a,2es10.3)') 'test_ssh_se: Z5 tail: laysum ', &
+                tv(SE_TAIL_LAYSUM), ' m, hlaw ', tv(SE_TAIL_HLAW), ' m (max H ', maxH, '), w(1) ', &
+                tv(SE_TAIL_W1), ' m/s of ', wscale, '; spreads c, helem ', sp
+        end if
+        deallocate(wf, eta0, zero)
+    end subroutine z5_full_step
+    ! ==== end of the zstar block ===============================================
 
 end program test_ssh_se
