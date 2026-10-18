@@ -683,6 +683,9 @@ scripts and logs in its `jobs/`)
   **M = 35 = M_min blows up at step 5**: the CFL guard's 0.5·res/√(gH) is not a sufficient stability limit (M = 50
   is 0.69 of it). **The gate therefore runs with `FESOM3_SE_CHI=0.25`** (inside D1's knob range); the default χ =
   0.1 is unchanged here, and the choice of the default (χ, `se_visc_ah`, M) is Stage 5's (➕ note at Task 5.1).
+  Diagnosed 2026-10-18 (➕ note at Task 5.1): both blow-ups are the scheme, not a code defect. M = 35 exceeds the
+  AB3–AM4 limit (the guard underestimates ω_max by 3.29×; true M_min 36 at χ = 0.1, 43 at χ = 0.25); the step-337
+  growth is a 3-step-period grid-scale shelf mode fed through the sea ice (ice tilt + ice→ocean stress, frozen per step).
   Results with χ = 0.25 and the fixed binary (`bin_t22_5a43ca3` = this tree's Intel build, sha256
   `5a43ca392d64eebe…`):
   - **np 8** (job 28218250, shared, 725 s): **divsum ≤ 1.19e-15; dUV = dAB = dsig = 0; spreadU = spreadUm = 0**;
@@ -831,6 +834,82 @@ sbatch at a time or in a short chain; each wait is a background `sacct` watcher.
   Antarctic shelf near 74°W 72°S); (b) M = M_min = 35 blows up at step 5 at χ = 0.1 (the guard is not a stability
   limit); (c) `se_visc_ah = 0` blows up at step 298; M = 100 at step 192. χ = 0.25 and `se_visc_ah = 0.1` run 480
   steps. So the screens start from a decision on the default χ / `se_visc_ah` (and the guard's safety factor)
+- ➕ ⚠️ **Diagnosis of both Task 2.2 blow-ups (2026-10-18): the scheme, not a code defect; nothing changed in
+  src/.** Diagnostic build = HEAD 376f187 plus env-only hacks, never committed
+  (`/work/ab0995/a270088/fesom3_se_diag/src_dbg1`): `DBG_EIG` (in se_init: power iteration and an F = 0 stability
+  test of the real `se_subcycle`), `DBG_SHELF` (in se_trim_finish: one line per step for the shallow Antarctic shelf,
+  lat < 60°S and H ≤ 40 m: max|η|, grid-scale noise |η − mean of the surrounding element means|, |U^M − ⟨⟨Ū⟩⟩|/H,
+  η at 4 probe nodes of the blow-up cluster), `DBG_CD` (bottom drag), `DBG_NO_IOSTRESS` (ice→ocean stress zeroed),
+  `DBG_ICE_NOTILT` (the ice sees η = 0). Jobs `/work/ab0995/a270088/fesom3_se_ref/jobs/dbg_eig.sbatch` (28218500),
+  `dbg_shelf.sbatch` (28218513), `dbg_margin.sbatch` (28218732); run dirs `/scratch/a/a270088/se_dbg/`; 0.35 node-h.
+  CORE2 `prod_env`, np 8, Δt 1800 s, cold start throughout.
+  - **(A) M = 35 at step 5: the CFL guard underestimates the fastest discrete gravity wave; the substeps reach
+    exactly their theoretical limit.** Power iteration of the substeps' linear operator Aη = −I(H·(−g∇η))/areasvol
+    (CORE2, linfs H): **ω_max = 3.152e-2 s⁻¹** (8 digits after 50 iterations). Its eigenvector peaks in the
+    Kuril–Kamchatka trench (gid 81175, 160.8°E 50.9°N, H 5712 m, res 28.1 km, ω_max·res/c = 3.76 there), not on a
+    shelf; the guard's critical node is in the Aleutian trench (gid 32328, 166.4°W 52.1°N, H 6000 m, c/res =
+    9.579e-3 s⁻¹). ω_max/(c/res)_max = 3.29, so at the guard limit ω_max·dtbt = 1.645. The AB3–AM4 limit of the
+    oce_ssh_se weights (largest root of z⁴(z−1)² + a²(w₀z² + w₁z + w₂)(δz³ + d₀z² + γz + ζ), a = ω·dtbt) is
+    **a_crit = 1.853 / 1.579 / 1.329 at χ = 0 / 0.1 / 0.25**, so the stable minimum on CORE2 at Δt 1800 s is
+    **M = 31 / 36 / 43**, not the guard's 35. The real substep loop (F = 0, U = 0, η = 10⁻³ × the eigenvector)
+    agrees with the theory to the substep: χ = 0.1 unstable at M = 30 / 33 / 35 (growth 2.56 / 1.73 / 1.24 per
+    substep; theory 2.68 / 1.79 / 1.26), stable from M = 38; χ = 0.25 unstable up to M = 40, stable at 45; χ = 0
+    unstable at 30, stable at 33; the same with `se_visc_ah = 0`. 1.24³⁵ ≈ 1.6e3 per baroclinic step is the growth of
+    the Task 2.2 M = 35 run (×3300 per step at steps 2-3). M = 50 and M = 100 at χ = 0.1 decay over 20 000 F = 0
+    substeps (no slow substep instability). The ratio 3.29 is mesh-dependent: an ideal equilateral P1 mesh with res =
+    2√(areasvol/π) gives ω_max·res/c = √6·1.05 = 2.57. **At χ = 0.25 the guard's M_min = 35 admits the unstable
+    M = 35-42.**
+  - **(B) χ = 0.1, M = 50, step 337: an instability of a grid-scale gravity mode on the 20 m shelf, fed through
+    the sea ice once per baroclinic step.** The diagnostic build reproduces the blow-up (steps 337-340). The shelf
+    noise starts growing at step ~150, at **+0.9 %/step** (steps 150-330; 0.31 m at step 150, 1.37 m at step 330),
+    and the probe nodes oscillate with a **period of 3.0 baroclinic steps (ωτ ≈ 2.1)**: a grid-scale gravity wave in
+    20 m of water. The SM substeps damp it only by about χ(ωτ)²/M ≈ 0.9 %/step (χ = 0.1, M = 50; ∝ 1/M), while SI's
+    backward Euler damps it to 1/√(1 + (ωτ)²) ≈ 0.43 in amplitude per step, so SI never sees it. On/off runs at χ =
+    0.1, M = 50, 480 steps:
+    - **no ice→ocean stress** (R1): runs, shelf noise **decays −0.45 %/step** (0.10 m at step 330), no 3-step period;
+      max|η| 4.74 m (step 67, a gulf), max CFL_z 1.60, the same as the χ = 0.25 gate run;
+    - **ice sees η = 0** (R3, no ssh-tilt force on the ice): runs, noise **decays −0.45 %/step** (0.09 m at step
+      330), max|η| 4.74 m, CFL_z 1.60;
+    - **no bottom drag** (R2): runs, growth reduced to +0.1 … +0.6 %/step, then decays (0.31 m at step 330);
+      max|η| 8.80 m (step 156, without drag elsewhere);
+    - margins (job 28218732, 400 steps): **χ = 0.25** noise decays −0.3 … −0.55 %/step (0.05 m at step 330);
+      **`se_visc_ah = 0.1`** decays −0.05 … −0.65 %/step (0.08 m); **M = 100** the same cluster grows from step ~60
+      at +0.9 … +1.6 %/step and blows up at step 190-192.
+
+    So the feedback runs through the ice: before each ocean step the runloop calls ocean2ice → ice_timestep →
+    oce_fluxes_mom, so the ice reads hbar = ηⁿ (the previous step's η^M), the grid-scale tilt −m g∇ηⁿ drives the
+    compact ice (a = 1), and the ice hands the force to the ocean through the ice→ocean stress, which enters the
+    barotropic forcing F frozen over the whole step [tⁿ, tⁿ⁺¹].
+    Cutting either link removes the growth; the explicit bottom drag (also frozen in F, from the previous step's
+    velocity) adds to it. It is not the linfs breakdown (CFL_z > 1 appears only after the noise has grown, and R1/R3
+    run with CFL_z 1.6 elsewhere), and not a defect of SE on shallow or boundary elements (R1/R3 run the same SE code
+    on the same elements and decay). The same coupling exists under SI (the ice reads hbar = ηⁿ⁺¹ there too); only
+    the damping of the mode differs. A one-mode model of the SE substeps plus a pressure-like force of relative size
+    ε = 0.03 taken from the elevation at the start of the step and frozen over it (`jobs/dbg_toy_ice.py`; the
+    lagged-drag variant `dbg_toy_lag.py`, the limit `dbg_sm_limit.py`, the series `dbg_shelf_series.py`, the
+    diagnostic patch `dbg_src_dbg1.diff`, all in `/work/ab0995/a270088/fesom3_se_ref/jobs/`) gives the observed pattern: χ = 0.1, M = 50: +0.9 %/step at ωτ = 2.2 (observed 2.1); `se_visc_ah`
+    = 0: +1.4 %; M = 100: +1.5 %; χ = 0.25: +0.07 %; `se_visc_ah` = 0.1: −0.02 %. port_kokkos M12 recorded the same
+    Antarctic-shelf death at χ = 0.05 with zstar and the flow-dependent Zenodo viscosity.
+  - **Remedies for Nikolay to choose (none applied):**
+    - (A) guard: compute ω_max in se_init by power iteration (≤ 50 iterations of the 2-D operator on CORE2) and set
+      M_min = ⌈τ·ω_max/(s·a_crit(χ))⌉ with a_crit from the polynomial above and a safety s < 1 (s = 0.9 gives
+      M_min = 40 / 48 at χ = 0.1 / 0.25); or keep the res-based bound with a smaller factor: on CORE2 the true limit
+      is 0.48 (χ = 0.1) / 0.40 (χ = 0.25) / 0.56 (χ = 0) instead of 0.5, but the ratio is mesh-dependent. Screen
+      (b) "M = M_min from the guard" needs the corrected M_min.
+    - (B1) χ = 0.25: measured stable (480 steps np 8 and np 128, noise decays); lowers the substep limit (M ≥ 43 at
+      Δt 1800 s; M = 50 has a 15 % margin) and damps the resolved fast waves more (max|η| 4.70 vs 4.74 m at step
+      67 in R1).
+    - (B2) `se_visc_ah = 0.1`: measured stable; V(Ūᵐ − Ūⁿ) acts only on the change within the step, so it damps
+      the fast modes and leaves the slow flow alone; explicit-viscosity limit far away (ν·dtbt ≈ 24·0.1·36 s/l ≈
+      4e-3 at l = 20 km).
+    - (B3) give the ice a time-filtered elevation instead of η^M (targets the feedback path; R3 shows that the path
+      is the whole growth); not tested.
+    - (B4) the SM2005 averaging filter (secondary weights) for ⟨⟨Ū⟩⟩ and the elevation handed to the slow consumers
+      (D1 chose none); not tested.
+    - (B5) the flow-dependent γ₀/γ₁ viscosity of port_kokkos; not tested here.
+    - Not remedies: larger M (M = 100 fails earlier), χ < 0.1, `se_visc_ah = 0`.
+    - Stage 3 (zstar): the same coupling and the same guard issue apply (port_kokkos died the same way with zstar);
+      H_e(η) changes ω_max negligibly in the deep trenches where it peaks.
 
 #### Task 5.2: 1-year SE vs SI twin (linfs)
 
