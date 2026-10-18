@@ -492,10 +492,17 @@ set_tests_properties(fesom_conserve_linfs_vinv_shsync_np2 PROPERTIES
 # identical on all ranks at np 2, the decision for M = 1) and se_init's cold start under
 # FESOM3_SSH_SE=1 FESOM3_SE_M=40.
 set(_se_env FESOM3_TEST_ROTATE=1 FESOM3_SSH_SE=1 FESOM3_SE_M=40)
+# Stage 2 (P1-P4, many ranks; plan Task 2.1): np 8 too, and the partition-independence check P4:
+# np 1 writes eta and U after 6 SE steps by global id to FESOM3_TEST_SE_P4REF (fixture setup), np 2
+# and np 8 compare with it.
+list(APPEND _se_env FESOM3_TEST_SE_P4REF=${CMAKE_CURRENT_BINARY_DIR}/test_ssh_se_p4_np1.bin)
 add_fesom_test(test_ssh_se 1)
 set_tests_properties(test_ssh_se_np1 PROPERTIES ENVIRONMENT "FESOM3_MESH_DIR=${_mesh_pi};${_se_env}")
 require_files(test_ssh_se_np1 ${_mesh_pi}/nod2d.out)
 add_mesh_test(test_ssh_se_np2 test_ssh_se ${_mesh_pi} 2 ${_se_env})
+add_mesh_test(test_ssh_se_np8 test_ssh_se ${_mesh_pi} 8 ${_se_env})
+set_tests_properties(test_ssh_se_np1 PROPERTIES FIXTURES_SETUP se_p4_ref)
+set_tests_properties(test_ssh_se_np2 test_ssh_se_np8 PROPERTIES FIXTURES_REQUIRED se_p4_ref)
 # The driver-facing stops in fesom_conserve's se_init (the regex pair of the wsplit guards: the
 # message, and the step-0 line the driver prints only if it went on): a bad FESOM3_SSH_SE, a bad
 # FESOM3_SE_M, and M = 1 below the CFL-guard minimum.

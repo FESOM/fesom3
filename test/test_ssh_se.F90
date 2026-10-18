@@ -96,6 +96,7 @@ program test_ssh_se
     use mod_mesh_areas,   only: elem_center
     use mod_mesh_rotate,  only: trim_cyclic
     use oce_dyn_velrhs,   only: compute_vel_rhs
+    use oce_dyn_visc,     only: viscosity_filter
     use oce_ssh_se,       only: se_env_requested, se_parse_knob, se_init, se_sm_coeffs, &
                                 se_cfl_dtbt_limit, se_cfl_m_min, se_cfl_decision, &
                                 SE_CFL_OK, SE_CFL_FORCED, SE_CFL_DIE, se_bt_forcing, &
@@ -125,6 +126,7 @@ program test_ssh_se
     call c8_visc()
     call c9_subcycle()
     call c10_trim_finish()
+    call p_many_ranks()
     call c11_check()
     call finish(partit, 'test_ssh_se')
 
@@ -902,6 +904,324 @@ contains
             deallocate(tmp)
         end if
     end subroutine c10_trim_finish
+
+    !===========================================================================
+    ! ---- Stage 2 (plan Task 2.1): split-explicit on many ranks, P1-P4 ----
+    ! The state at the end of a real predictor: uv (0.02 m/s), eta_n (0.1 m) and the baroclinic
+    ! pgf hashed from the global ids (every copy of a node or element holds the same value),
+    ! then every step the real compute_vel_rhs (momentum advection off) and viscosity_filter
+    ! (opt_visc 7, the drivers' coefficients). The filter scatters its edge fluxes into a shared
+    ! border element in each rank's own edge order, so the owners' copies of UV_rhs differ by
+    ! roundoff, and with them G = sum_k helem*UV_rhs and F: the duplicated state of LESSONS L70.
+    ! Plan D2 syncs F once per step (the last statement of se_bt_forcing); every substep operator
+    ! is a gather, so U and <<U>> then stay bitwise equal on all copies without a per-substep sync.
+    ! P1 and P2 run together: NK = 6 SE steps through the real kernels (compute_vel_rhs,
+    ! viscosity_filter, se_bt_forcing, se_subcycle with M = 40, se_trim_finish; step_oce's order
+    ! without the implicit vertical viscosity and the tail), the shared-element sync on.
+    !   P1  the F sync, every step: a copy of the state runs se_bt_forcing with
+    !       partit%sync_shared_elem off; its copy spread of F is > 0 in at least one step at
+    !       np 8 (the roundoff exists; the UV_rhs spread is printed; at np 2 printed only: there
+    !       the Intel build's UV_rhs roundoff is absorbed in G in every step). The real call (sync on)
+    !       leaves the spread exactly 0, and every slot that is not a receive slot of
+    !       com_elem2D_shared holds bitwise the unsynced value (the designated copies are kept).
+    !       At np 1 both spreads are 0.
+    !   P2  after every step the copy spreads of the three U ring levels, <<U>>, uv and uv_rhsAB
+    !       are exactly 0, and the inflow-sum ratios |sum I(X)| / sum|I(X)| over the owned nodes
+    !       (reduced; the divsum ratio of FESOM3_STEP_DIAG and fesom_conserve) of X = <<U>>
+    !       (= ssh_rhs_old) and X = U^M are <= 1e-14. Every value finite; eta and U non-trivial.
+    !   P3  (npes > 1) the same NK steps with the shared-element sync off (F and uv): the copy
+    !       spreads of U^M and <<U>> are > 0 at np 8 (printed at np 2), so P2's zeros are the
+    !       sync's doing, not a lack of shared elements or of roundoff. The ratios are printed.
+    !   P4  partition independence: eta and U^M after P2's NK steps, by global id. With
+    !       FESOM3_TEST_SE_P4REF set (ctest), np 1 writes them to that file (fixture se_p4_ref)
+    !       and np 2 / np 8 compare: max|eta - eta(np 1)| <= 1e-12 max|eta|, the same for U; the
+    !       levels are printed. Without the variable P4 is skipped (one line).
+    subroutine p_many_ranks()
+        integer, parameter :: NK = 6       ! the SE steps of P1-P4
+        type(t_dyn) :: ds, doff, d, dp2
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, e, n, nz, k, l
+        integer :: nbad, nkeep, ndiff, nrecv, npos
+        logical :: sync_env
+        logical, allocatable :: is_recv(:)
+        real(kind=WP), allocatable :: infl(:), wf(:)
+        real(kind=WP) :: x, sp_off, sp_on, sp_rhs, fmax, sp(4), spmax(4), r(2), rmax(2), mxe, mxu
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        sync_env = partit%sync_shared_elem
+        allocate(is_recv(nElemL), infl(nNodL), wf(nNodL))
+        wf = 0.0_WP
+        is_recv = .false.
+        if (allocated(partit%com_elem2D_shared%rlist)) then
+            do l = 1, size(partit%com_elem2D_shared%rlist)
+                is_recv(partit%com_elem2D_shared%rlist(l)) = .true.
+            end do
+        end if
+        nrecv = count(is_recv)
+        call sum_all(nrecv, partit)
+
+        ! ---- P1 + P2: NK SE steps, sync on ----
+        call p_state(ds)
+        d = ds
+        sp_off = 0.0_WP; sp_on = 0.0_WP; sp_rhs = 0.0_WP; fmax = 0.0_WP
+        spmax = 0.0_WP; rmax = 0.0_WP; nbad = 0; nkeep = 0; ndiff = 0; npos = 0
+        do k = 1, NK
+            call compute_vel_rhs(d, mesh, dt, k == 1, partit)
+            call viscosity_filter(7, d, mesh, dt, partit)
+            x = shared_copy_max_elem(d%uv_rhs, partit)
+            call max_all(x, partit)
+            sp_rhs = max(sp_rhs, x)
+            ! P1: the forcing without the sync (a copy), then the real call
+            doff = d
+            partit%sync_shared_elem = .false.
+            call se_bt_forcing(doff, mesh, partit, dt, k == 1)
+            partit%sync_shared_elem = .true.
+            call se_bt_forcing(d, mesh, partit, dt, k == 1)
+            partit%sync_shared_elem = sync_env
+            x = shared_copy_max_elem(doff%se_force, partit)
+            call max_all(x, partit)
+            sp_off = max(sp_off, x)
+            if (x > 0.0_WP) npos = npos + 1
+            x = shared_copy_max_elem(d%se_force, partit)
+            call max_all(x, partit)
+            sp_on = max(sp_on, x)
+            do e = 1, nElemO
+                fmax = max(fmax, maxval(abs(d%se_force(:, e))))
+                if (.not. any(d%se_force(:, e) /= doff%se_force(:, e))) cycle
+                if (is_recv(e)) then
+                    ndiff = ndiff + 1
+                else
+                    nkeep = nkeep + 1
+                end if
+            end do
+            call se_subcycle(d, mesh, partit, dt)
+            call se_trim_finish(d, mesh, partit, dt, k, wf)
+            ! P2: the copy spreads and the inflow-sum ratios
+            sp(1) = max(shared_copy_max_elem(d%se_ubt(:, :, 0), partit), &
+                        shared_copy_max_elem(d%se_ubt(:, :, 1), partit), &
+                        shared_copy_max_elem(d%se_ubt(:, :, 2), partit))
+            sp(2) = shared_copy_max_elem(d%se_umean, partit)
+            sp(3) = shared_copy_max_elem(d%uv, partit)
+            sp(4) = shared_copy_max_elem(d%uv_rhsAB(1, :, :, :), partit)
+            do l = 1, 4
+                call max_all(sp(l), partit)
+            end do
+            spmax = max(spmax, sp)
+            call se_inflow(mesh, partit, d%se_ubt(:, :, 0), infl)
+            r(1) = p_ratio(d%ssh_rhs_old(1:nNodO))
+            r(2) = p_ratio(infl(1:nNodO))
+            rmax = max(rmax, r)
+            do n = 1, nNodO
+                if (.not. (abs(d%eta_n(n)) <= huge(1.0_WP))) nbad = nbad + 1
+            end do
+            do e = 1, nElemO
+                if (.not. all(abs(d%se_ubt(:, e, 0)) <= huge(1.0_WP))) nbad = nbad + 1
+                do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                    if (.not. all(abs(d%uv(:, nz, e)) <= huge(1.0_WP))) nbad = nbad + 1
+                end do
+            end do
+        end do
+        call max_all(fmax, partit)
+        call sum_all(nkeep, partit); call sum_all(ndiff, partit); call sum_all(nbad, partit)
+
+        call check(fmax > 0.0_WP, 'P1 F is non-trivial', partit%mype)
+        call check(sp_on == 0.0_WP, 'P1 the copy spread of F after the sync is 0 (every step)', partit%mype)
+        call check(nkeep == 0, 'P1 the sync keeps every slot that is not a receive slot (bitwise)', partit%mype)
+        if (partit%npes > 1) then
+            call check(nrecv > 0, 'P1 the partition has shared elements', partit%mype)
+            ! required at np >= 8 only: at pi np 2 (35 receive slots) the Intel build's UV_rhs roundoff
+            ! is absorbed in the layer sum G in all NK steps (measured, plan Task 2.1)
+            if (partit%npes >= 8) call check(sp_off > 0.0_WP, 'P1 the copy spread of F before the sync '// &
+                                             'is > 0 (roundoff of R)', partit%mype)
+        else
+            call check(sp_off == 0.0_WP .and. nrecv == 0, 'P1 np 1: no shared copies, spread 0', partit%mype)
+        end if
+        if (partit%mype == 0) write(*,'(a,i0,a,es10.3,a,i0,a,es10.3,a,es10.3,a,es10.3,a,i0,a,i0,a)') &
+            'test_ssh_se: P1 ', NK, ' steps: max F copy spread before the sync ', sp_off, ' m2/s2 (> 0 in ', &
+            npos, ' steps; max|F| ', fmax, ', max UV_rhs spread ', sp_rhs, ' m/s), after ', sp_on, '; ', &
+            ndiff, ' receive slots changed (', nrecv, ' per step)'
+
+        mxe = maxval(abs(d%eta_n(1:nNodO)))
+        mxu = maxval(abs(d%se_ubt(:, 1:nElemO, 0)))
+        call max_all(mxe, partit); call max_all(mxu, partit)
+        call check(nbad == 0 .and. mxe > 0.0_WP .and. mxu > 0.0_WP, 'P2 eta, U, uv finite and non-trivial', &
+                   partit%mype)
+        call check(all(spmax == 0.0_WP), 'P2 copy spreads of U (3 levels), <<U>>, uv, uv_rhsAB are 0 '// &
+                   'after every step', partit%mype)
+        call check(all(rmax <= 1.0e-14_WP), 'P2 inflow-sum ratios of <<U>> and U^M <= 1e-14', partit%mype)
+        if (partit%mype == 0) write(*,'(a,i0,a,4es10.3,a,2es10.3,a,es10.3,a,es10.3,a)') &
+            'test_ssh_se: P2 ', NK, ' SE steps, sync on: max spreads U/<<U>>/uv/uv_rhsAB', spmax, &
+            '; max inflow-sum ratio <<U>>, U^M', rmax, '; max|eta| ', mxe, ' m, max|U| ', mxu, ' m2/s'
+        dp2 = d
+
+        ! ---- P3: the same steps without the shared-element sync ----
+        if (partit%npes > 1) then
+            d = ds
+            partit%sync_shared_elem = .false.
+            do k = 1, NK
+                call p_step(d, k)
+            end do
+            partit%sync_shared_elem = sync_env
+            sp(1) = shared_copy_max_elem(d%se_ubt(:, :, 0), partit)
+            sp(2) = shared_copy_max_elem(d%se_umean, partit)
+            call max_all(sp(1), partit); call max_all(sp(2), partit)
+            call se_inflow(mesh, partit, d%se_ubt(:, :, 0), infl)
+            r(1) = p_ratio(d%ssh_rhs_old(1:nNodO))
+            r(2) = p_ratio(infl(1:nNodO))
+            ! required at np >= 8 only (as P1: at pi np 2 the roundoff of F can be absorbed in U)
+            if (partit%npes >= 8) call check(sp(1) > 0.0_WP .and. sp(2) > 0.0_WP, 'P3 sync off: the '// &
+                                             'copies of U^M and <<U>> drift apart (P2 is not vacuous)', partit%mype)
+            if (partit%mype == 0) write(*,'(a,2es10.3,a,2es10.3)') &
+                'test_ssh_se: P3 sync off: spreads U^M, <<U>>', sp(1:2), '; inflow-sum ratio <<U>>, U^M', r
+        end if
+
+        ! ---- P4: np 1 vs np 2 vs np 8 ----
+        call p_partition_independence(dp2, NK)
+        deallocate(is_recv, infl, wf)
+    end subroutine p_many_ranks
+
+    subroutine p_state(d)
+        ! the pre-predictor state of the P tests (block header), se_init's cold start, hbar = eta_n
+        type(t_dyn), intent(inout) :: d
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, n, e, nz, c
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        call new_dyn(d)
+        do e = 1, nElemF
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                do c = 1, 2
+                    d%uv(c, nz, e) = 0.02_WP*hval(partit%myList_elem2D(e), 10*nz + c + 60)
+                end do
+                d%work%pgf_x(nz, e) = 1.0e-6_WP*hval(partit%myList_elem2D(e), 10*nz + 7)
+                d%work%pgf_y(nz, e) = 1.0e-6_WP*hval(partit%myList_elem2D(e), 10*nz + 8)
+            end do
+        end do
+        do n = 1, nNodL
+            d%eta_n(n) = 0.1_WP*hval(partit%myList_nod2D(n), 61)
+        end do
+        allocate(d%work%u_c(mesh%nl-1, nElemF), d%work%v_c(mesh%nl-1, nElemF))
+        d%work%u_c = 0.0_WP; d%work%v_c = 0.0_WP
+        d%visc_gamma0   = 0.003_WP          ! opt_visc 7 as the drivers set it
+        d%visc_gamma1   = 0.1_WP
+        d%visc_gamma2   = 0.285_WP
+        d%visc_gamma0_h = 0.0_WP
+        d%visc_gamma1_h = 0.0_WP
+        call se_init(d, mesh, partit, dt)
+        if (.not. allocated(mesh%hbar)) allocate(mesh%hbar(nNodL), mesh%hbar_old(nNodL))
+        mesh%hbar(1:nNodL)     = d%eta_n(1:nNodL)
+        mesh%hbar_old(1:nNodL) = 0.0_WP
+    end subroutine p_state
+
+    subroutine p_step(d, k)
+        ! SE step k of the P tests through the real kernels, in step_oce's order
+        type(t_dyn), intent(inout) :: d
+        integer,     intent(in)    :: k
+        real(kind=WP), allocatable :: wf(:)
+        allocate(wf(size(d%eta_n)))
+        wf = 0.0_WP
+        call compute_vel_rhs(d, mesh, dt, k == 1, partit)
+        call viscosity_filter(7, d, mesh, dt, partit)
+        call se_bt_forcing(d, mesh, partit, dt, k == 1)
+        call se_subcycle(d, mesh, partit, dt)
+        call se_trim_finish(d, mesh, partit, dt, k, wf)
+    end subroutine p_step
+
+    real(kind=WP) function p_ratio(x)
+        ! the inflow-sum (divsum) ratio |sum x| / sum|x| of owned-node values, reduced
+        real(kind=WP), intent(in) :: x(:)
+        real(kind=WP) :: s(2)
+        s = [sum(x), sum(abs(x))]
+        call sum_all(s, partit)
+        p_ratio = abs(s(1))/max(s(2), tiny(1.0_WP))
+    end function p_ratio
+
+    subroutine p_gather(vals, gids, nglob, out)
+        ! out(gid) on rank 0 from every rank's (gids, vals); a gid held by several ranks (a shared
+        ! element) takes the value of the last one, the copies being equal. Unheld gids keep huge.
+        real(kind=WP), intent(in)  :: vals(:)
+        integer,       intent(in)  :: gids(:)
+        integer,       intent(in)  :: nglob
+        real(kind=WP), intent(out) :: out(nglob)
+        integer :: i, ierr, nloc, cnt(partit%npes), displ(partit%npes)
+        integer,       allocatable :: gl(:), ga(:)
+        real(kind=WP), allocatable :: vl(:), va(:)
+        out  = huge(1.0_WP)
+        nloc = size(vals)
+        gl = gids
+        vl = vals
+        if (partit%npes == 1) then
+            do i = 1, nloc
+                out(gl(i)) = vl(i)
+            end do
+            return
+        end if
+        call MPI_Gather(nloc, 1, MPI_INTEGER, cnt, 1, MPI_INTEGER, 0, partit%MPI_COMM_FESOM, ierr)
+        displ = 0
+        if (partit%mype == 0) then
+            do i = 2, partit%npes
+                displ(i) = displ(i-1) + cnt(i-1)
+            end do
+            allocate(ga(sum(cnt)), va(sum(cnt)))
+        else
+            allocate(ga(1), va(1))
+        end if
+        call MPI_Gatherv(gl, nloc, MPI_INTEGER, ga, cnt, displ, MPI_INTEGER, 0, partit%MPI_COMM_FESOM, ierr)
+        call MPI_Gatherv(vl, nloc, MPI_WP, va, cnt, displ, MPI_WP, 0, partit%MPI_COMM_FESOM, ierr)
+        if (partit%mype == 0) then
+            do i = 1, size(ga)
+                out(ga(i)) = va(i)
+            end do
+        end if
+    end subroutine p_gather
+
+    subroutine p_partition_independence(d, nsteps)
+        ! P4 (block header): eta (owned nodes) and U^M (owned elements) by global id; np 1 writes
+        ! the reference file, npes > 1 compares with it (rank 0)
+        type(t_dyn), intent(in) :: d
+        integer,     intent(in) :: nsteps
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, u, ios, hdr(4), hdr_ref(4)
+        character(len=512) :: path
+        real(kind=WP), allocatable :: eta(:), ux(:), uy(:), eta_r(:), ux_r(:), uy_r(:)
+        real(kind=WP) :: de, du, se, su
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        path = ''
+        call get_environment_variable('FESOM3_TEST_SE_P4REF', path, status=ios)
+        if (ios /= 0 .or. len_trim(path) == 0) then
+            if (partit%mype == 0) write(*,'(a)') 'test_ssh_se: P4 skipped (FESOM3_TEST_SE_P4REF unset)'
+            return
+        end if
+        allocate(eta(mesh%nod2D), ux(mesh%elem2D), uy(mesh%elem2D))
+        call p_gather(d%eta_n(1:nNodO), partit%myList_nod2D(1:nNodO), mesh%nod2D, eta)
+        call p_gather(d%se_ubt(1, 1:nElemO, 0), partit%myList_elem2D(1:nElemO), mesh%elem2D, ux)
+        call p_gather(d%se_ubt(2, 1:nElemO, 0), partit%myList_elem2D(1:nElemO), mesh%elem2D, uy)
+        hdr = [mesh%nod2D, mesh%elem2D, nsteps, d%se_M]
+        if (partit%mype /= 0) return
+        call check(all(eta < huge(1.0_WP)) .and. all(ux < huge(1.0_WP)) .and. all(uy < huge(1.0_WP)), &
+                   'P4 every global node and element gathered', partit%mype)
+        if (partit%npes == 1) then
+            open(newunit=u, file=trim(path), access='stream', form='unformatted', status='replace', &
+                 action='write', iostat=ios)
+            if (ios == 0) write(u, iostat=ios) hdr, eta, ux, uy
+            if (ios == 0) close(u)
+            call check(ios == 0, 'P4 np 1 writes the reference '//trim(path), partit%mype)
+            write(*,'(a,a)') 'test_ssh_se: P4 np 1 reference written: ', trim(path)
+            return
+        end if
+        allocate(eta_r(mesh%nod2D), ux_r(mesh%elem2D), uy_r(mesh%elem2D))
+        hdr_ref = -1
+        open(newunit=u, file=trim(path), access='stream', form='unformatted', status='old', &
+             action='read', iostat=ios)
+        if (ios == 0) read(u, iostat=ios) hdr_ref
+        if (ios == 0 .and. all(hdr_ref == hdr)) read(u, iostat=ios) eta_r, ux_r, uy_r
+        if (ios == 0) close(u)
+        call check(ios == 0 .and. all(hdr_ref == hdr), 'P4 the np 1 reference '//trim(path)// &
+                   ' exists and matches (nod2D, elem2D, steps, M)', partit%mype)
+        if (.not. (ios == 0 .and. all(hdr_ref == hdr))) return
+        de = maxval(abs(eta - eta_r));  se = maxval(abs(eta_r))
+        du = max(maxval(abs(ux - ux_r)), maxval(abs(uy - uy_r)));  su = max(maxval(abs(ux_r)), maxval(abs(uy_r)))
+        call check(de <= 1.0e-12_WP*se, 'P4 eta agrees with np 1 to 1e-12 of max|eta|', partit%mype)
+        call check(du <= 1.0e-12_WP*su, 'P4 U^M agrees with np 1 to 1e-12 of max|U|', partit%mype)
+        write(*,'(a,i0,a,i0,a,es10.3,a,es10.3,a,es10.3,a,es10.3,a)') 'test_ssh_se: P4 np ', partit%npes, &
+            ' vs np 1 after ', nsteps, ' SE steps: max|d eta| ', de, ' m (', de/se, ' of max|eta|), max|d U| ', &
+            du, ' m2/s (', du/su, ' of max|U|)'
+    end subroutine p_partition_independence
 
     subroutine c11_check()
         ! Task 1.4: FESOM3_SE_CHECK on a full SE step (M = 40 substeps + the trim) of the hashed

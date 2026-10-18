@@ -601,19 +601,53 @@ scripts and logs in its `jobs/`)
 ### Stage 2 — linfs, many ranks
 *The risk port_kokkos never had: shared border elements under the vertex bottom.*
 
-#### Task 2.1: One-owner forcing sync and copy-spread checks
+#### Task 2.1: One-owner forcing sync and copy-spread checks ✅
 
 **Files:**
 - Modify: `src/oce/oce_ssh_se.F90`
 - Modify: `test/test_ssh_se.F90`, `test/CMakeLists.txt`
 
-- [ ] `exchange_elem_shared(se_force)` after `se_bt_forcing` (under `sync_shared_elem`)
-- [ ] tests (`test_ssh_se` np 2/8 on rotated pi):
-  - before the F sync the spread is > 0 (R̄ roundoff exists);
-  - after K steps of the barotropic loop the copy spreads of Ū and ⟨⟨Ū⟩⟩ are exactly 0;
-  - the inflow-sum ratio is ≤ 1e-14;
-  - np 1 vs np 2 vs np 8: η agrees to roundoff (record the level)
-- [ ] ctest green
+- [x] `exchange_elem_shared(se_force)` after `se_bt_forcing` (under `sync_shared_elem`). In place since Task 1.1: it
+  is the last statement of `se_bt_forcing` (the `is_multirank` / `partit%sync_shared_elem` block after the F loop,
+  timer TMR_OCE_SHSYNC); P1 below tests it
+- [x] tests (`test_ssh_se` np 2/8 on rotated pi): a separate block P1-P4 (`p_many_ranks`, between C10 and C11),
+  ➕ `test_ssh_se_np8` registered. The state is a real predictor: hashed uv (0.02 m/s), η (0.1 m) and pgf, then
+  every step the real `compute_vel_rhs` and `viscosity_filter` (opt_visc 7, the drivers' coefficients), whose edge
+  scatter adds into a shared element in each rank's own edge order. P1 and P2 share 6 SE steps (M = 40) with the
+  sync on. Levels (Intel; GNU in brackets where it differs), job 28218252:
+  - **P1, F before the sync > 0:** every step a copy runs `se_bt_forcing` with the sync off. **np 8: spread
+    8.7e-19 m²/s² in 5 of 6 steps** (GNU 1.7e-18), max|F| 1.4e-4, UV_rhs spread 3.5e-18 m/s; 10 of the 6 × 226
+    receive slots differ before the sync. The real call leaves the spread **exactly 0**, and every slot that is not
+    a receive slot of `com_elem2D_shared` keeps its unsynced value bitwise. ⚠️ At **np 2 the Intel build has no F
+    spread in any of the 6 steps** (35 receive slots; the UV_rhs spread of 1.7e-18 m/s is absorbed in the layer sum
+    G; GNU 8.7e-19 in 2 steps), so the "> 0" checks of P1 and P3 are required at np ≥ 8 only (printed at np 2)
+  - **P2, after every step:** copy spreads of the three Ū ring levels, ⟨⟨Ū⟩⟩, uv and uv_rhsAB **exactly 0** (np 2
+    and 8); **inflow-sum ratio** |Σ I(X)| / Σ|I(X)| over the owned nodes, reduced (the STEP_DIAG / fesom_conserve
+    divsum), **≤ 1.2e-17 for X = ⟨⟨Ū⟩⟩ and ≤ 1.4e-17 for X = Ū^M** (tolerance 1e-14)
+  - **P3, the same 6 steps with the sync off (F and uv):** np 8 spreads Ū^M 5.6e-15, ⟨⟨Ū⟩⟩ 4.4e-15 m²/s (GNU
+    4.4e-15 both), so P2's zeros are the sync's doing; np 2 Intel 3.6e-15 / 1.3e-15 (GNU 0 / 0: absorbed)
+  - **P4, np 1 vs np 2 vs np 8** (η and Ū^M after the 6 steps, gathered by global id; np 1 writes
+    `FESOM3_TEST_SE_P4REF` = `<build>/test/test_ssh_se_p4_np1.bin`, ctest fixture `se_p4_ref`, np 2 and 8
+    compare): **np 2 bitwise identical to np 1** (Intel and GNU); **np 8: max|Δη| 6.9e-17 m = 3.6e-16 of max|η|
+    0.19 m, max|ΔŪ| 2.3e-14 m²/s = 7.7e-16 of max|Ū| 30 m²/s** (GNU 3.8e-16, 8.6e-16); tolerance 1e-12
+  - ⚠️ **Found and fixed: the copies of ⟨⟨Ū⟩⟩ differed by 1 ULP although every input was bitwise equal.** The first
+    run (job 28218068) failed P2 on Intel at np 2 and 8: ⟨⟨Ū⟩⟩ spread 1.8e-15 m²/s, the Ū ring spreads 0 (GNU
+    passed). `se_subcycle` accumulated `umean += ustar/rM`. The Intel anchor flags include `-no-prec-div`, and the
+    element loop is vectorised (vector length 2) with a scalar remainder loop (vectorisation report, job
+    28218254). A division by a loop invariant then rounds differently in the vector body and in the remainder, so
+    the result depended on the element's local index, which differs between the owners of a shared element. The
+    fix is `umean += ustar·(1/M)` with the reciprocal computed once (`rMinv`); a product is correctly rounded on
+    every code path, and the report shows the loop no longer vectorised. After the fix all P2 spreads are 0 (job
+    28218127). The defect was also visible at scale with the old binary: CORE2 np 128, spreadUm > 0 in 298 of
+    340 steps, up to 1.1e-13 m²/s (job 28218070); pi np 2 and 8 over 1000 steps, spreadUm 2.8e-14 (job
+    28218069), which the new SE np 2/8 lines of `run_conserve_pi.sh` would have failed. So D2's "gather in fixed
+    slot order" is necessary but not sufficient: **the arithmetic of a per-element loop must not depend on the
+    element's local index.** No other division by a loop invariant feeds unsynced duplicated state: F's `G/τ` is
+    synced afterwards, the trim divides by the per-element Hⁿ (and uv is synced), the checks are diagnostics
+- [x] ctest green. Job 28218252 (shared, ctest 30 s Intel, 45 s GNU): **Intel 175/175** (174 + `test_ssh_se_np8`);
+  **GNU 169/175, exactly the 6 known failures**; `test_ssh_se_np1/np2/np8` pass on both. Scripts
+  `/work/ab0995/a270088/fesom3_se_ref/jobs/t21_ctest.sbatch` (TAG t21, t21b), `t21_optrpt.sbatch`,
+  `t22_final.sbatch`
 
 #### Task 2.2: GATE Stage 2 — linfs np > 1
 

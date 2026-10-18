@@ -696,6 +696,7 @@ contains
         integer       :: m, M_sub, n, e
         integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
         real(kind=WP) :: rM, dtbt, w0, w1, w2, d0, d1, d2, d3
+        real(kind=WP) :: rMinv
         logical       :: visc
         real(kind=WP), allocatable :: ustar(:,:), unew(:,:), tend(:,:), dU(:,:)
         real(kind=WP), allocatable :: etaA(:), inflow(:), HA(:)
@@ -705,6 +706,14 @@ contains
         M_sub = dyn%se_M
         rM    = real(M_sub, WP)
         dtbt  = dt/rM
+        ! <<U>> accumulates U*·(1/M), a MULTIPLICATION by this one reciprocal, not U*/M: with
+        ! the Intel anchor's -no-prec-div a division by a loop invariant may become a multiply by
+        ! the hoisted reciprocal in the vectorised body of the element loop but stay a true
+        ! division in its scalar peel/remainder iterations, so the result depended on the
+        ! element's local index, and the copies of a shared element (other local index on each
+        ! owner) differed by 1 ULP in <<U>> (test_ssh_se P2, plan Task 2.1). A product is
+        ! correctly rounded on every code path.
+        rMinv = 1.0_WP/rM
         ! AB3: w0 U^m + w1 U^{m-1} + w2 U^{m-2};  AM4: d3 eta^{m+1} + d0 eta^m + d1 eta^{m-1} + d2 eta^{m-2}
         w0 =  1.5_WP + dyn%se_beta
         w1 = -(0.5_WP + 2.0_WP*dyn%se_beta)
@@ -730,8 +739,8 @@ contains
             do e = 1, nElemO
                 ustar(1, e) = w0*dyn%se_ubt(1, e, 0) + w1*dyn%se_ubt(1, e, 1) + w2*dyn%se_ubt(1, e, 2)
                 ustar(2, e) = w0*dyn%se_ubt(2, e, 0) + w1*dyn%se_ubt(2, e, 1) + w2*dyn%se_ubt(2, e, 2)
-                dyn%se_umean(1, e) = dyn%se_umean(1, e) + ustar(1, e)/rM
-                dyn%se_umean(2, e) = dyn%se_umean(2, e) + ustar(2, e)/rM
+                dyn%se_umean(1, e) = dyn%se_umean(1, e) + ustar(1, e)*rMinv
+                dyn%se_umean(2, e) = dyn%se_umean(2, e) + ustar(2, e)*rMinv
             end do
 
             ! elevation (closed basin, linfs: no freshwater term -- Task 3.1)
