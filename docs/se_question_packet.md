@@ -155,3 +155,11 @@ built on the SESM scheme, which is more stable and should work with less dissipa
 - He recommends building the barotropic stepping on the "SESM" scheme (more stable, less dissipation needed).
   ⚠️ Open: which scheme "SESM" is (not in the notes, the Zenodo code or the literature search); ask for a
   reference.
+
+**Question 2.** The sea ice should see η^M; the damping should keep the fast waves out of it. An averaged
+elevation is what models with a filter use.
+
+- The ice sees η^M, as implemented (hbar = η^M). The damping (χ) is what must keep the fast waves out of η^M;
+  an averaged elevation belongs to models with a filter. So the filtered-η-for-the-ice option is dropped: on CORE2
+  the shelf mode at χ = 0.1 is the case where the damping is too weak for that, and χ = 0.25 (or 0.2, his setups)
+  is the fix.
