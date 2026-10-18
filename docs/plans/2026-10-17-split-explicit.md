@@ -961,20 +961,52 @@ M = 35 blows up at step 5 at χ = 0.1. The defaults (χ 0.1, M 50, `se_visc_ah` 
     Jobs, scripts and logs: `/work/ab0995/a270088/fesom3_se_t02_jobs/t41_*`; run dirs
     `/scratch/a/a270088/fesom3_se_rgate/t41_*`, G0 `/scratch/a/a270088/g0_se/t41_28216588`. 0.23 node-h in total
 
-#### Task 4.2: SE fields in the checkpoint
+#### Task 4.2: SE fields in the checkpoint ✅
 
 **Files:**
 - Modify: `src/io/mod_io_restart.F90`
+- ➕ Modify: `src/drivers/fesom_restartroundtrip.F90`, `tools/run_restartroundtrip.sh` (the SE round trip and
+  pre-check), `tools/run_restart_gate_core2.sh`, `tools/run_restart_gate_multirank.sh` (echo of the case env and
+  of each leg's se_init line)
 
-- [ ] in `restart_register_state` (:280-354), `if (dyn%use_ssh_se)`:
+- [x] in `restart_register_state` (:280-354), `if (dyn%use_ssh_se)`:
   - `se_eta1`, `se_eta2` (node, default halo);
   - `se_ubt{0,1,2}_{u,v}` (elem, `RESTART_HALO_ELEM`);
   - `se_sbar_old_{u,v}` (elem, `RESTART_HALO_NONE`);
   - the rank-0 count of registered fields grows by 10
-- [ ] pre-check on read: SE on and the checkpoint has no `se_eta1/.zgroup` → `die('checkpoint has no split-explicit
-  state: written with FESOM3_SSH_SE off; SI<->SE restarts are not supported')`
-- [ ] verify that both legs of the restart gates inherit `FESOM3_SSH_SE`, `FESOM3_SE_*` and `FESOM3_WHICH_ALE`
-  (`run_seg` uses `env "${e[@]}"`)
+
+  Done as written, after sigma (2-D pointers into `se_eta(:,k)`, `se_ubt(c,:,k)`, `se_sbar_old(c,:)`, units m and
+  m2/s); a flag `R%se` in `t_restart` marks the SE set for the read pre-check. The halo modes, from the code:
+  - η levels are kept on owned + halo nodes, each level `exchange_nod`'ed in its substep → NODE;
+  - with `se_visc_ah > 0` V reads Ū at eDim neighbours; level 0 is `exchange_elem`'ed after every substep and the
+    shift copies over nElemL (owned + eDim), so all three levels hold owner values there → ELEM;
+  - š^{n−1} is written and read on owned elements only (`se_bt_forcing`); its halo keeps se_init's 0 in a
+    straight run and in a resumed one → NONE.
+
+  ⚠️ With `se_visc_ah = 0` the eDim entries of the Ū ring stay at their cold-start values in a straight run, while
+  a resumed run (ELEM) gets owner values there. Nothing reads them in that mode (the exchange and V are skipped,
+  `se_ubtn`'s copy is used only by V, `se_inflow` reads owned elements); the visc_ah = 0 gate of Task 4.3 is the
+  test: a read of a stale entry would make the resumed run differ, and it is max|Δ| = 0. The registered count on
+  the CORE2 lifecycle (default physics, no TKE) goes **27 → 37** (log line `restart: registered 37 prognostic
+  fields`); at most 42 with AB3 + TKE + SE, so RESTART_MAXF = 64 suffices. SE off: the set is unchanged (G0)
+- [x] pre-check on read: SE on and the checkpoint has no `se_eta1/.zgroup` → `die('checkpoint has no split-explicit
+  state: written with FESOM3_SSH_SE off; SI<->SE restarts are not supported')`. In `restart_read` right after the
+  folder is resolved, before any field is read, through the module's `zarr_check` (error stop on every rank; the
+  folder is appended to the message). Not covered: an SE checkpoint read with SE off reads silently (the se_*
+  stores are ignored); the plan asks only for the SE-on direction
+- [x] verify that both legs of the restart gates inherit `FESOM3_SSH_SE`, `FESOM3_SE_*` and `FESOM3_WHICH_ALE`
+  (`run_seg` uses `env "${e[@]}"`). `run_seg` (core2 gate) and both legs of the multirank gate set only the restart,
+  run-length and dump variables on top of the inherited environment. Both scripts now print the case env
+  (`FESOM3_WHICH_ALE`, `FESOM3_SSH_SE`, `FESOM3_SE_*`, `FESOM3_SHARED_SYNC`) and grep each leg's se_init line
+  (`oce_ssh_se:   M = 50, dtbt = 36.000 s, chi = 0.1000, visc_ah = …`); in job 28218753 every leg of every SE gate
+  shows it with the requested visc_ah, and SI runs print nothing new
+- [x] ➕ test: `fesom_restartroundtrip` (pi) with `FESOM3_RESTARTRT_SE=1` allocates the SE rings with se_init's
+  shapes (nNodL, nElemL), fills distinct owned values per ring level and component, and round-trips **38 fields
+  max|Δ| = 0 over the full local extent** at np 1 and np 2 (the corrupt step now uses each array's own size, as the
+  SE element rings are nElemL long, not nElemF). `FESOM3_RESTARTRT_SE=2` writes without SE and reads with SE
+  registered: **aborts with the message at np 1 and np 2** (exit 1). Both in `tools/run_restartroundtrip.sh`
+  (AB2/AB3 28/32 fields unchanged); GATE GREEN, 33 s, job 28218753. ctest unchanged (176): **Intel 176/176, GNU
+  170/176 (the 6 known failures)**, job 28218753; Intel `fesom_lifecycle_native_mr` sha256 `c27836e46fd1331e…`
 
 #### Task 4.3: GATE Stage 4 — restart exactness
 
