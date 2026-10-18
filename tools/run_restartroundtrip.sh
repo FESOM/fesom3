@@ -9,7 +9,7 @@
 # nonzero Δ. Runs AB_order=2 (26 fields) AND AB_order=3 (30 fields: +urhs_AB3/vrhs_AB3/temp_M2/salt_M2),
 # at np 1 AND 2 (np=2 = real cross-rank gather + halo exchange — a wrong variant/gather shows up as a
 # nonzero Δ in the halo/eXDim region). Then the split-explicit pass (FESOM3_RESTARTRT_SE=1, AB_order=2,
-# 38 fields: + se_eta1/2, se_ubt{0,1,2}_{u,v}, se_sbar_old_{u,v}) and the SE read pre-check
+# 36 fields: + se_eta1/2, se_ubt{0,1,2}_{u,v}; until 2026-10-18 also se_sbar_old_{u,v}) and the SE read pre-check
 # (FESOM3_RESTARTRT_SE=2: a checkpoint without SE state read with SE registered must abort with
 # "checkpoint has no split-explicit state"), both at every np.
 #
@@ -45,16 +45,16 @@ for AB in 2 3; do
     done
 done
 
-# split-explicit state (plan 2026-10-17 Task 4.2): the 10 SE stores round-trip like the rest
+# split-explicit state (plan 2026-10-17 Tasks 4.2, 5.4): the 8 SE stores round-trip like the rest
 export FESOM3_AB_ORDER=2
 for NP in $NPS; do
     DIR="$RUN/se_np$NP"
     rm -rf "$DIR"; mkdir -p "$DIR"
-    echo "=== fesom_restartroundtrip SE AB_order=2 np=$NP (expect 38 fields, max|Δ|=0) ==="
+    echo "=== fesom_restartroundtrip SE AB_order=2 np=$NP (expect 36 fields, max|Δ|=0) ==="
     s=0
     out=$(FESOM3_RESTARTRT_SE=1 FESOM3_RESTARTRT_DIR="$DIR" "${MPIRUN[@]}" -n "$NP" "$BUILD/bin/fesom_restartroundtrip" 2>&1) || s=$?
     grep -E "fields=|global max|ROUNDTRIP" <<<"$out" || true
-    if [ "$s" = 0 ] && grep -q "fields=38$" <<<"$out" && grep -q "ROUNDTRIP OK" <<<"$out"; then :; else
+    if [ "$s" = 0 ] && grep -q "fields=36$" <<<"$out" && grep -q "ROUNDTRIP OK" <<<"$out"; then :; else
         echo "SE ROUNDTRIP FAIL (exit $s)"; rc=1
     fi
 done

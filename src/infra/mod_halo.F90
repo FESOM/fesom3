@@ -78,8 +78,8 @@ module mod_halo
     ! overwrite their own copy (local numbers 1..myDim_elem2D). Same broadcast-only cores;
     ! a no-op on an empty list, and so at 1 rank.
     interface exchange_elem_shared
-        module procedure exchange_elem_shared_2D_i, exchange_elem_shared_3D_r, &
-                         exchange_elem_shared_blk_r
+        module procedure exchange_elem_shared_2D_i, exchange_elem_shared_2D_r, &
+                         exchange_elem_shared_3D_r, exchange_elem_shared_blk_r
     end interface
 
     ! Copy spread of the shared elements: this rank's max|arr - the designated owner's copy|
@@ -182,6 +182,12 @@ contains
         integer,        intent(inout) :: arr(:)       ! (elem), e.g. the builder's self-check
         type(t_partit), intent(in)    :: partit
         call core_2D_i(arr, partit%com_elem2D_shared, partit%MPI_COMM_FESOM)
+    end subroutine
+
+    subroutine exchange_elem_shared_2D_r(arr, partit)
+        real(kind=WP),  intent(inout) :: arr(:)       ! (elem), e.g. the split-explicit
+        type(t_partit), intent(in)    :: partit       ! barotropic drag rate
+        call core_2D_r(arr, partit%com_elem2D_shared, partit%MPI_COMM_FESOM)
     end subroutine
 
     subroutine exchange_elem_shared_3D_r(arr, partit)

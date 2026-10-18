@@ -9,21 +9,27 @@ module oce_ssh_se
     !     eta^{m+1} = eta^m + dtbt*(I(U*) - W*areasvol)/areasvol
     !     eta^A     = delta eta^{m+1} + (1-delta-gamma-zeta) eta^m + gamma eta^{m-1}
     !                 + zeta eta^{m-2}                                                       (AM4)
-    !     U^{m+1}   = U^m + dtbt*(-f e_z x U* - g H^A grad(eta^A) + F + V(U^m - U^n))
+    !     U^{m+1}   = U^m + dtbt*(-f e_z x U* - g H^A grad(eta^A) + F + V(U^m - U^n)
+    !                             + D(U^m - U^n))
     ! with (notes, subcycling.tex:81-91)
     !     beta = 0.281105, zeta = 0.00976186 - 0.13451357 chi, gamma = 0.083445 - 0.513584 chi,
     !     delta = 1/2 + 2 zeta + gamma + 2 chi,
     ! chi the dissipation parameter, V the linear BT viscosity (FESOM3_SE_VISC_FLOW=1: the
-    ! flow-dependent W(U^m) - W(U^n) of se_visc_flow in its place). Afterwards the 3-D velocity
-    ! is trimmed to the mean transport <<U>>, and the existing ALE tail consumes the result
-    ! through hbar/hbar_old.
+    ! flow-dependent W(U^m) - W(U^n) of se_visc_flow in its place), D the barotropic bottom drag
+    ! D(U)_e = -(r_e/H^n_e) U_e, r_e = C_d |u_bottom,e| frozen over the step (FESOM3_SE_BOTTDRAG).
+    ! F is the depth-integrated 3-D increment minus the barotropic right-hand side of the FIRST
+    ! substep (Sergey Danilov, 2026-10-18, answers 3 and 5 of docs/se_question_packet.md), so the
+    ! first substep is forced exactly as the 3-D predictor. Afterwards the 3-D velocity is trimmed
+    ! to the mean transport <<U>>, and the existing ALE tail consumes the result through
+    ! hbar/hbar_old.
     !
     ! IN PLACE: the knobs, the state in t_dyn, se_init (coefficients, cold start, CFL guard) and
     ! the step_oce guard (Task 0.3); the element depth H^n and the barotropic forcing F
     ! (se_elem_depth, se_bt_forcing; Task 1.1); the substeps (se_subcycle) with their operators
     ! (se_inflow, se_visc, se_tendency, se_depth_at) and the viscosity coefficients (se_kappa_build,
     ! from se_init; Task 1.2), the opt-in flow-dependent viscosity of the Zenodo SE code
-    ! (se_visc_flow, FESOM3_SE_VISC_FLOW; plan Task 5.1 remedy B5); the trim and the commit of
+    ! (se_visc_flow, FESOM3_SE_VISC_FLOW; plan Task 5.1 remedy B5), the barotropic bottom drag
+    ! and the first-substep consistency of F (plan Task 5.4); the trim and the commit of
     ! the elevation (se_trim_finish, Task 1.3);
     ! the invariant suite FESOM3_SE_CHECK (se_check_core, se_check_tail; Task 1.4); zstar: the
     ! depth law c (se_elem_depth), the freshwater W in the eta equation (se_subcycle,
@@ -54,6 +60,9 @@ module oce_ssh_se
     !                      (the defaults of the Zenodo SE code, MOD_DYN.F90:135-136, and of
     !                      port_kokkos). FESOM3_SE_VISC_AH has no effect with FLOW=1 and the
     !                      GAMMAs none without it: setting a knob that has no effect stops.
+    !   FESOM3_SE_BOTTDRAG 1 = barotropic bottom drag D in the substeps, 0 = none     default 1
+    !                      (0/1; plan Task 5.4: Sergey's answer 3, the drag belongs in the
+    !                      barotropic equation)
     !   FESOM3_SE_CHECK    1 = per-step invariant suite (0/1)                         default 0
     !                      one rank-0 line per step, key=value tokens (se_check_line):
     !                      SE_CHECK step=<n> etacomp= trim= msl= spreadU= spreadUm= maxeta= maxU=
@@ -95,7 +104,8 @@ module oce_ssh_se
     use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
     use mod_precision,   only: WP, MPI_WP
     use mod_constants,   only: g, r_earth
-    use mod_config,      only: ab_epsilon, which_ALE
+    use mod_param_phys,  only: C_d
+    use mod_config,      only: which_ALE
     use mod_mesh,        only: t_mesh, MAX_NV
     use mod_dyn,         only: t_dyn
     use mod_partit,      only: t_partit
@@ -139,9 +149,9 @@ module oce_ssh_se
     integer, parameter :: SE_TAIL_LAYSUM = 1, SE_TAIL_W1 = 2, SE_TAIL_HLAW = 3, SE_TAIL_NBAD = 4
 
     ! the knobs se_read_env reads (FESOM3_SSH_SE itself: se_env_requested)
-    character(len=21), parameter :: SE_KNOBS(8) = [character(len=21) :: &
+    character(len=21), parameter :: SE_KNOBS(9) = [character(len=21) :: &
         'FESOM3_SE_M', 'FESOM3_SE_M_FORCE', 'FESOM3_SE_CHI', 'FESOM3_SE_VISC_AH', 'FESOM3_SE_CHECK', &
-        'FESOM3_SE_VISC_FLOW', 'FESOM3_SE_VISC_GAMMA0', 'FESOM3_SE_VISC_GAMMA1']
+        'FESOM3_SE_VISC_FLOW', 'FESOM3_SE_VISC_GAMMA0', 'FESOM3_SE_VISC_GAMMA1', 'FESOM3_SE_BOTTDRAG']
 
 contains
 
@@ -172,7 +182,8 @@ contains
     !===========================================================================
     subroutine se_read_env(dyn, partit)
         ! The FESOM3_SE_* knobs into dyn; an unset knob keeps its t_dyn default (M 50, chi 0.25,
-        ! visc_ah 0.01, the linear viscosity, gamma0 10, gamma1 2750, check and force off). Stops
+        ! visc_ah 0.01, the linear viscosity, gamma0 10, gamma1 2750, the bottom drag on, check and
+        ! force off). Stops
         ! on a bad value and on a set knob that has no effect (se_knob_conflict). Called by se_init.
         type(t_dyn),    intent(inout) :: dyn
         type(t_partit), intent(in)    :: partit
@@ -263,6 +274,10 @@ contains
             call parse_real(str, rv, ok)
             if (ok) ok = (rv >= 0.0_WP)
             if (ok) dyn%se_visc_g1 = rv
+        case ('FESOM3_SE_BOTTDRAG')
+            need = 'must be 0 or 1'
+            call parse_01(str, lv, ok)
+            if (ok) dyn%se_bottdrag = lv
         case default
             need = 'is not a split-explicit knob'
         end select
@@ -541,8 +556,7 @@ contains
         ! cold start, the viscosity coefficients (se_kappa_build), the CFL guard, and se_ready.
         ! Cold start: the eta ring holds eta_n (eta^{-1/M} = eta^{-2/M} = eta^n), the U ring the
         ! depth-integrated velocity sum_k helem*uv on owned + eDim elements (helem and uv are
-        ! halo-valid), and s_old = 0 (the first step is lfirst: its Coriolis weight on s_old is
-        ! 0 then, as compute_vel_rhs's ff = 1).
+        ! halo-valid), so the first step's U*^0 (se_bt_forcing) is that transport.
         type(t_dyn),    intent(inout) :: dyn
         type(t_mesh),   intent(in)    :: mesh
         type(t_partit), intent(in)    :: partit
@@ -561,8 +575,9 @@ contains
         call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
 
         ! ---- guards ----
-        ! F carries the AB2 Coriolis weights of compute_vel_rhs; the SE eta equation and the
-        ! CFL guard assume an open surface at every vertex.
+        ! SE is built and gated on the AB2 momentum predictor only (the forcing F takes any 3-D
+        ! increment since plan Task 5.4, but AB3 was never run with it); the SE eta equation and
+        ! the CFL guard assume an open surface at every vertex.
         if (dyn%AB_order /= 2) &
             call se_die('split-explicit needs the AB2 momentum predictor (AB_order == 2)', partit)
         if (any(mesh%ulevels_nod2D(1:nNodL) > 1)) &
@@ -572,14 +587,14 @@ contains
 
         ! ---- state ----
         allocate(dyn%se_eta(nNodL, 2), dyn%se_etam(nNodL), dyn%se_etanew(nNodL))
-        allocate(dyn%se_ubt(2, nElemL, 0:2), dyn%se_sbar_old(2, nElemL), dyn%se_ubtn(2, nElemL))
+        allocate(dyn%se_ubt(2, nElemL, 0:2), dyn%se_ubtn(2, nElemL), dyn%se_kdrag(nElemL))
         allocate(dyn%se_umean(2, nElemL), dyn%se_force(2, nElemL), dyn%se_H(nElemL))
         allocate(dyn%se_c(MAX_NV, nElemO), dyn%se_kappa(MAX_NV, nElemO))
         allocate(dyn%se_zlen(MAX_NV, nElemO), dyn%se_vn(2, nElemO))
         dyn%se_etam  = 0.0_WP; dyn%se_etanew = 0.0_WP
         dyn%se_ubtn  = 0.0_WP; dyn%se_umean  = 0.0_WP; dyn%se_force = 0.0_WP
         dyn%se_H     = 0.0_WP; dyn%se_c      = 0.0_WP; dyn%se_kappa = 0.0_WP
-        dyn%se_zlen  = 0.0_WP; dyn%se_vn     = 0.0_WP
+        dyn%se_zlen  = 0.0_WP; dyn%se_vn     = 0.0_WP; dyn%se_kdrag = 0.0_WP
 
         ! ---- cold start ----
         do n = 1, nNodL
@@ -596,7 +611,6 @@ contains
             dyn%se_ubt(:, e, 1) = ub
             dyn%se_ubt(:, e, 2) = ub
         end do
-        dyn%se_sbar_old = 0.0_WP
 
         ! ---- BT viscosity coefficients (geometry, once) ----
         call se_kappa_build(dyn, mesh, partit)
@@ -612,14 +626,15 @@ contains
         if (partit%mype == 0) then
             write(*,'(a)') 'oce_ssh_se: split-explicit barotropic solver ON (Shchepetkin-McWilliams AB3-AM4)'
             if (dyn%se_visc_flow) then
-                write(*,'(a,i0,a,f0.3,a,f6.4,a,es9.2,a,es9.2,a,l1)') 'oce_ssh_se:   M = ', dyn%se_M, &
+                write(*,'(a,i0,a,f0.3,a,f6.4,a,es9.2,a,es9.2,a,l1,a,l1)') 'oce_ssh_se:   M = ', dyn%se_M, &
                     ', dtbt = ', dt/real(dyn%se_M, WP), ' s, chi = ', dyn%se_chi, &
                     ', visc = flow (gamma0 = ', dyn%se_visc_g0, ' m3/s2, gamma1 = ', dyn%se_visc_g1, &
-                    ' m2), check = ', dyn%se_check
+                    ' m2), bottdrag = ', dyn%se_bottdrag, ', check = ', dyn%se_check
             else
-                write(*,'(a,i0,a,f0.3,a,f6.4,a,es9.2,a,l1)') 'oce_ssh_se:   M = ', dyn%se_M, &
+                write(*,'(a,i0,a,f0.3,a,f6.4,a,es9.2,a,l1,a,l1)') 'oce_ssh_se:   M = ', dyn%se_M, &
                     ', dtbt = ', dt/real(dyn%se_M, WP), ' s, chi = ', dyn%se_chi, &
-                    ', visc_ah = ', dyn%se_visc_ah, ' m/s, check = ', dyn%se_check
+                    ', visc_ah = ', dyn%se_visc_ah, ' m/s, bottdrag = ', dyn%se_bottdrag, &
+                    ', check = ', dyn%se_check
             end if
             write(*,'(a,4(a,f12.9))') 'oce_ssh_se:  ', ' beta = ', dyn%se_beta, ', zeta = ', &
                 dyn%se_zeta, ', gamma = ', dyn%se_gamma, ', delta = ', dyn%se_delta
@@ -732,69 +747,85 @@ contains
     end subroutine se_elem_depth
 
     !===========================================================================
-    subroutine se_bt_forcing(dyn, mesh, partit, dt, lfirst)
+    subroutine se_bt_forcing(dyn, mesh, partit, dt)
         ! Once per baroclinic step, after the predictor (compute_vel_rhs, viscosity_filter,
         ! impl_vert_visc_ale), when uv = u^{n-1/2}, UV_rhs = u** - u^{n-1/2}, helem = helem^n and
         ! eta_n = eta^n. H^n (se_elem_depth), then on the OWNED elements the forcing F = Rbar - r
-        ! of the notes (subcycling.tex:55-58):
-        !     G   = sum_k helem^n*UV_rhs          = tau*Rbar, the depth-integrated predictor
-        !     s^n = sum_k helem^n*uv              the stored Coriolis transport (plan D4)
-        !     F   = G/tau + g H^n grad(eta^n) + f e_z x (a2 s^n + a1 s^{n-1})
-        ! The r-term removes what compute_vel_rhs put into UV_rhs and the substep operator
-        ! (se_tendency: -f e_z x U* - g H^A grad(eta^A)) adds back:
+        ! of the notes (subcycling.tex:55-58), with r the barotropic right-hand side of the FIRST
+        ! substep (Sergey Danilov, 2026-10-18, answers 3 and 5, docs/se_question_packet.md §6):
+        !     G    = sum_k helem^n*UV_rhs          = tau*Rbar, the depth-integrated predictor
+        !     U*^0 = w0 U^0 + w1 U^{-1/M} + w2 U^{-2/M}    the AB3 transport of substep m = 0
+        !                                          (ring levels 0, 1, 2, the weights of se_subcycle)
+        !     F    = G/tau + g H^n grad(eta^n) + f e_z x U*^0
+        ! The r-term removes what the 3-D predictor put into UV_rhs and the substep operator
+        ! (se_tendency: -f e_z x U* - g H^A grad(eta^A) + V + D) adds back:
         !   - pressure: compute_vel_rhs adds dt*Fx to every layer, Fx = gradient_sca . (-g*eta_n)
         !     (oce_dyn_velrhs.F90:105-111). F subtracts H^n*Fx with Fx formed by the same
         !     expression, so the two cancel to rounding; no second discretisation of grad(eta).
-        !   - Coriolis: compute_vel_rhs stores (v*ff, -u*ff) = -f e_z x u (times elem_area) in
-        !     uv_rhsAB and blends ab2*(this step) + ab1*(previous step), ab2 = 1.5+eps (1 on
-        !     lfirst), ab1 = -(0.5+eps). The same weights over the stored transports, a2 = ab2,
-        !     a1 = ab1, cancel it exactly under linfs (helem constant) and to second order under
-        !     zstar (uv_rhsAB weighs the previous layer velocities with helem^{n-1}). On lfirst
-        !     s^{n-1} = 0 (se_init), as compute_vel_rhs's cold uv_rhsAB.
-        ! Momentum advection (also in uv_rhsAB), viscosity, the baroclinic pressure and the
-        ! wind stress stay in F.
-        ! Then s^{n-1} <- s^n; U^n (ring level 0, owned + eDim) is copied to se_ubtn for the
-        ! viscosity V(U^m - U^n); and F is synced over the shared elements, one owner as uv in
+        !   - Coriolis: compute_vel_rhs keeps its AB2 Coriolis of the layer velocities in UV_rhs
+        !     (mixed with momentum advection in uv_rhsAB; untouched). F adds f e_z x U*^0, the
+        !     substeps' Coriolis at m = 0, so substep m sees -f e_z x (U*^m - U*^0) on top of the
+        !     3-D Coriolis, and the first substep exactly the 3-D one. U*^0 rather than U^n (ring
+        !     level 0): U* is what the substep's Coriolis acts on. Cold start: the ring is all
+        !     U^n = sum_k helem*uv (se_init), so U*^0 = U^n to rounding. (Until 2026-10-18 the
+        !     r-term rebuilt the 3-D AB2 Coriolis from stored transport sums s = sum_k helem*uv,
+        !     exact under linfs; plan D4, replaced by plan Task 5.4.)
+        !   - viscosity and bottom drag: the substeps use V(U^m - U^n) and D(U^m - U^n), both 0 at
+        !     m = 0, so their m = 0 values are already removed: the 3-D viscosity and the 3-D
+        !     explicit bottom drag (oce_dyn_ivertvisc, frozen in UV_rhs) stay in F, and the
+        !     substeps damp only the change within the step.
+        ! Momentum advection, viscosity, the baroclinic pressure, the wind and ice stress and the
+        ! 3-D bottom drag stay in F.
+        ! The barotropic bottom drag rate (FESOM3_SE_BOTTDRAG, se_tendency's D):
+        !     kdrag_e = r_e/H^n_e,  r_e = C_d*|uv(:, nlevels(e)-1, e)|
+        ! the C_d, level and velocity of the 3-D drag of impl_vert_visc_ale (oce_dyn_ivertvisc.F90:
+        ! 196, uv not yet updated), frozen over the step: the explicit form of the Zenodo
+        ! se_bottdrag (oce_ale_ssh_splitexpl_subcycl.F90:900-921, 1036-1100), there with the
+        ! total depth -zbar_e_bot + mean hbar, here H^n. 0 with the drag off.
+        ! Then U^n (ring level 0, owned + eDim) is copied to se_ubtn for V(U^m - U^n) and
+        ! D(U^m - U^n); and F and kdrag are synced over the shared elements, one owner as uv in
         ! update_vel (plan D2): the copies of G differ by roundoff (the viscosity filter's
-        ! order-dependent sums). A no-op at 1 rank.
+        ! order-dependent sums), and kdrag holds a division (LESSONS L71: the rounding of a
+        ! division may depend on the element's position in a vectorised loop). A no-op at 1 rank.
         type(t_dyn),    intent(inout) :: dyn
         type(t_mesh),   intent(in)    :: mesh
         type(t_partit), intent(in)    :: partit
         real(kind=WP),  intent(in)    :: dt       ! tau, the baroclinic step
-        logical,        intent(in)    :: lfirst   ! first Euler step (compute_vel_rhs's ff = 1)
-        integer       :: e, nz, elnodes(MAX_NV)
+        integer       :: e, nz, nb, elnodes(MAX_NV)
         integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
-        real(kind=WP) :: a1, a2, f, Fx, Fy, pre(MAX_NV), gb(2), sn(2), sc(2)   ! gb: G (g is gravity)
+        real(kind=WP) :: w0, w1, w2, f, Fx, Fy, pre(MAX_NV), gb(2), us(2)   ! gb: G (g is gravity)
 
         call se_elem_depth(dyn, mesh, partit)
         call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
 
-        ! the AB2 weights of compute_vel_rhs (oce_dyn_velrhs.F90:97-100, :141-142)
-        a1 = -(0.5_WP + ab_epsilon)
-        a2 =  (1.5_WP + ab_epsilon)
-        if (lfirst) a2 = 1.0_WP
+        ! the AB3 weights of se_subcycle (formed by the same expressions)
+        w0 =  1.5_WP + dyn%se_beta
+        w1 = -(0.5_WP + 2.0_WP*dyn%se_beta)
+        w2 =  dyn%se_beta
 
         do e = 1, nElemO
             gb = 0.0_WP
-            sn = 0.0_WP
             do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
                 gb(1) = gb(1) + mesh%helem(nz, e)*dyn%uv_rhs(1, nz, e)
                 gb(2) = gb(2) + mesh%helem(nz, e)*dyn%uv_rhs(2, nz, e)
-                sn(1) = sn(1) + mesh%helem(nz, e)*dyn%uv(1, nz, e)
-                sn(2) = sn(2) + mesh%helem(nz, e)*dyn%uv(2, nz, e)
             end do
             ! grad(eta^n) exactly as compute_vel_rhs: Fx = -g d(eta)/dx
             elnodes = mesh%elem2D_nodes(:, e)
             pre = -(g*dyn%eta_n(elnodes))
             Fx  = sum(mesh%gradient_sca(1:4, e)*pre)
             Fy  = sum(mesh%gradient_sca(5:8, e)*pre)
-            ! f e_z x sc = f*(-sc(2), sc(1))
-            sc(1) = a2*sn(1) + a1*dyn%se_sbar_old(1, e)
-            sc(2) = a2*sn(2) + a1*dyn%se_sbar_old(2, e)
+            ! U*^0 as se_subcycle's first substep forms it; f e_z x us = f*(-us(2), us(1))
+            us(1) = w0*dyn%se_ubt(1, e, 0) + w1*dyn%se_ubt(1, e, 1) + w2*dyn%se_ubt(1, e, 2)
+            us(2) = w0*dyn%se_ubt(2, e, 0) + w1*dyn%se_ubt(2, e, 1) + w2*dyn%se_ubt(2, e, 2)
             f = mesh%coriolis(e)
-            dyn%se_force(1, e) = gb(1)/dt - dyn%se_H(e)*Fx - f*sc(2)
-            dyn%se_force(2, e) = gb(2)/dt - dyn%se_H(e)*Fy + f*sc(1)
-            dyn%se_sbar_old(:, e) = sn
+            dyn%se_force(1, e) = gb(1)/dt - dyn%se_H(e)*Fx - f*us(2)
+            dyn%se_force(2, e) = gb(2)/dt - dyn%se_H(e)*Fy + f*us(1)
+            if (dyn%se_bottdrag) then
+                nb = mesh%nlevels(e) - 1
+                dyn%se_kdrag(e) = C_d*sqrt(dyn%uv(1, nb, e)**2 + dyn%uv(2, nb, e)**2)/dyn%se_H(e)
+            else
+                dyn%se_kdrag(e) = 0.0_WP
+            end if
         end do
 
         do e = 1, nElemL
@@ -806,6 +837,7 @@ contains
             if (partit%sync_shared_elem) then
                 call timer_start(TMR_OCE_SHSYNC)
                 call exchange_elem_shared(dyn%se_force, partit)
+                if (dyn%se_bottdrag) call exchange_elem_shared(dyn%se_kdrag, partit)
                 call timer_stop(TMR_OCE_SHSYNC)
             end if
         end if
@@ -1037,15 +1069,21 @@ contains
     !===========================================================================
     subroutine se_tendency(dyn, mesh, partit, ustar, etaA, HA, uvis, tend)
         ! The right-hand side of the U substep on the OWNED elements (plan Technical Details §2):
-        !     tend = -f e_z x U* - g H^A grad(eta^A) + F + V(uvis)
+        !     tend = -f e_z x U* - g H^A grad(eta^A) + F + V(uvis) + D(U^m - U^n)
         ! -f e_z x U* = f*(U*_2, -U*_1), compute_vel_rhs's (v*ff, -u*ff); -g grad(eta^A) = Fx, Fy
-        ! through gradient_sca exactly as in compute_vel_rhs and se_bt_forcing. So with U* = s^n
-        ! = s^{n-1}, eta^A = eta^n, H^A = H^n and uvis = 0 the r-term inside F cancels and tend =
-        ! G/tau to rounding (test_ssh_se C7: the sign/factor consistency of F and the operator).
+        ! through gradient_sca exactly as in compute_vel_rhs and se_bt_forcing. So at the first
+        ! substep, U* = U*^0 (se_bt_forcing), with eta^A = eta^n, H^A = H^n and U^m = U^n, the
+        ! r-term inside F cancels and tend = G/tau to rounding (test_ssh_se C7: the sign/factor
+        ! consistency of F and the operator).
         ! The viscosity term: the linear V(uvis) of se_visc, uvis = U^m - U^n, when se_visc_ah >
         ! 0; with se_visc_flow W(uvis) - W(U^n) of se_visc_flow, uvis = U^m and W(U^n) = se_vn
-        ! (se_subcycle); else none. Reads eta^A at the element's vertices, uvis at eDim
-        ! neighbours.
+        ! (se_subcycle); else none. The bottom drag (FESOM3_SE_BOTTDRAG): D(U^m - U^n) =
+        ! -kdrag_e*(U^m - U^n) with U^m = ring level 0 and U^n = se_ubtn read from dyn, kdrag =
+        ! C_d|u_bottom|/H^n (se_bt_forcing): the anchored form of the viscosity, D(U^m) - D(U^n),
+        ! so F keeps the 3-D drag and the substeps damp the change. Purely local and explicit:
+        ! dtbt*kdrag <= 36 s*0.0025*|u_b|/20 m = 4.5e-3*|u_b|/(m/s) on the 20 m shelf at CORE2's
+        ! dtbt, far below the forward-Euler limit 2 (and the AB3-AM4 one). Reads eta^A at the
+        ! element's vertices, uvis at eDim neighbours.
         type(t_dyn),    intent(in)  :: dyn
         type(t_mesh),   intent(in)  :: mesh
         type(t_partit), intent(in)  :: partit
@@ -1072,6 +1110,12 @@ contains
                 tend(:, e) = 0.0_WP
             end do
         end if
+        if (dyn%se_bottdrag) then
+            do e = 1, nElemO
+                tend(1, e) = tend(1, e) - dyn%se_kdrag(e)*(dyn%se_ubt(1, e, 0) - dyn%se_ubtn(1, e))
+                tend(2, e) = tend(2, e) - dyn%se_kdrag(e)*(dyn%se_ubt(2, e, 0) - dyn%se_ubtn(2, e))
+            end do
+        end if
         do e = 1, nElemO
             elnodes = mesh%elem2D_nodes(:, e)
             pre = -(g*etaA(elnodes))
@@ -1096,12 +1140,13 @@ contains
         !     H^A       = H_e(eta^A)                                             owned elements
         !     U^{m+1}   = U^m + dtbt*se_tendency(U*, eta^A, H^A, U^m - U^n)      owned elements
         !                 (with se_visc_flow: se_tendency(U*, eta^A, H^A, U^m) and W(U^n) = se_vn
-        !                 from se_ubtn once per step, before the substeps)
+        !                 from se_ubtn once per step, before the substeps; the bottom drag
+        !                 D(U^m - U^n) inside se_tendency, from ring level 0 and se_ubtn)
         ! eta^0 = eta_n (= eta^n), U^0 = ring level 0. The rings shift BY COPYING, so no ring
         ! offset becomes restart state. With the viscosity on, exchange_elem(U^{m+1}) follows:
         ! V reads U at eDim neighbours. Without it nothing reads U off the owned elements (I reads
-        ! owned elements only), the exchange is skipped and the eDim entries of the U ring stay
-        ! stale (and unused). Per substep: one 2-D exchange_nod and, with the viscosity, one 2-D
+        ! owned elements only, the bottom drag is local), the exchange is skipped and the eDim
+        ! entries of the U ring stay stale (and unused). Per substep: one 2-D exchange_nod and, with the viscosity, one 2-D
         ! exchange_elem; no reductions. Timer TMR_OCE_SE_BT.
         ! On exit: eta^M in se_etam (eta^{M-1}, eta^{M-2} in se_eta(:,1), se_eta(:,2); all on
         ! owned + halo nodes), U^M in ring level 0 (U^{M-1}, U^{M-2} in levels 1, 2), <<U>> in

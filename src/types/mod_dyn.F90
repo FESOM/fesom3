@@ -140,9 +140,9 @@ module mod_dyn
         ! The knobs (env, se_read_env), the Shchepetkin-McWilliams (2005) AB3-AM4 coefficients
         ! and the state of docs/plans/2026-10-17-split-explicit.md (Technical Details §1). se_init
         ! sets them and allocates the arrays ONLY when SE is on; the semi-implicit path never
-        ! touches them. Not in write/read_t_dyn: the carried arrays (se_eta, se_ubt, se_sbar_old)
-        ! belong to the Zarr checkpoint (mod_io_restart). Ring levels are shifted by copying, so
-        ! no ring offset is state.
+        ! touches them. Not in write/read_t_dyn: the carried arrays (se_eta, se_ubt) belong to the
+        ! Zarr checkpoint (mod_io_restart). Ring levels are shifted by copying, so no ring offset
+        ! is state.
         logical       :: use_ssh_se = .false.   ! FESOM3_SSH_SE=1
         integer       :: se_M       = 50        ! substeps per baroclinic step (FESOM3_SE_M)
         real(kind=WP) :: se_chi     = 0.25_WP   ! SM dissipation parameter chi (FESOM3_SE_CHI)
@@ -150,6 +150,7 @@ module mod_dyn
         logical       :: se_visc_flow = .false. ! flow-dependent BT viscosity in place of A_h (FESOM3_SE_VISC_FLOW)
         real(kind=WP) :: se_visc_g0 = 10.0_WP   ! its background gamma0 [m^3/s^2] (FESOM3_SE_VISC_GAMMA0)
         real(kind=WP) :: se_visc_g1 = 2750.0_WP ! its flow factor gamma1 [m^2] (FESOM3_SE_VISC_GAMMA1)
+        logical       :: se_bottdrag = .true.   ! barotropic bottom drag in the substeps (FESOM3_SE_BOTTDRAG)
         logical       :: se_check   = .false.   ! per-step invariant suite (FESOM3_SE_CHECK)
         logical       :: se_m_force = .false.   ! run with M below the CFL-guard minimum (FESOM3_SE_M_FORCE)
         logical       :: se_ready   = .false.   ! se_init done; step_oce refuses FESOM3_SSH_SE=1 otherwise
@@ -159,8 +160,8 @@ module mod_dyn
         real(kind=WP) :: se_delta = 0.0_WP
         real(kind=WP), allocatable, dimension(:,:)   :: se_eta        ! (nNodL,2): eta^{-1/M}, eta^{-2/M}
         real(kind=WP), allocatable, dimension(:,:,:) :: se_ubt        ! (2,nElemL,0:2): U^n, U^{-1/M}, U^{-2/M}
-        real(kind=WP), allocatable, dimension(:,:)   :: se_sbar_old   ! (2,nElemL): s^{n-1} = sum_k helem*uv
-        real(kind=WP), allocatable, dimension(:,:)   :: se_ubtn       ! (2,nElemL): copy of U^n for V(U^m - U^n)
+        real(kind=WP), allocatable, dimension(:,:)   :: se_ubtn       ! (2,nElemL): copy of U^n for V, D(U^m - U^n)
+        real(kind=WP), allocatable, dimension(:)     :: se_kdrag      ! (nElemL): BT drag rate C_d*|u_bottom|/H^n [1/s]
         real(kind=WP), allocatable, dimension(:)     :: se_etam       ! (nNodL): eta^m
         real(kind=WP), allocatable, dimension(:)     :: se_etanew     ! (nNodL): eta^{m+1}
         real(kind=WP), allocatable, dimension(:,:)   :: se_umean      ! (2,nElemL): <<U>>, the mean transport
