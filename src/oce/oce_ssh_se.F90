@@ -20,10 +20,10 @@ module oce_ssh_se
     ! the step_oce guard (Task 0.3); the element depth H^n and the barotropic forcing F
     ! (se_elem_depth, se_bt_forcing; Task 1.1); the substeps (se_subcycle) with their operators
     ! (se_inflow, se_visc, se_tendency, se_depth_at) and the viscosity coefficients (se_kappa_build,
-    ! from se_init; Task 1.2); the trim and the commit of the elevation (se_trim_finish, Task 1.3).
-    ! step_oce calls se_bt_forcing -> se_subcycle -> se_trim_finish in place of the CG solve block.
-    ! Still to come: the invariant suite FESOM3_SE_CHECK (Task 1.4), the zstar depth law and
-    ! freshwater (Task 3.1), the SE fields in the checkpoint (Task 4.2).
+    ! from se_init; Task 1.2); the trim and the commit of the elevation (se_trim_finish, Task 1.3);
+    ! the invariant suite FESOM3_SE_CHECK (se_check_core, se_check_tail; Task 1.4). step_oce calls
+    ! se_bt_forcing -> se_subcycle -> se_trim_finish in place of the CG solve block. Still to come:
+    ! the zstar depth law and freshwater (Task 3.1), the SE fields in the checkpoint (Task 4.2).
     !
     ! DETERMINISM (plan D2): every per-element operator of the substeps is a GATHER over the
     ! element's own vertex / neighbour slots in fixed slot order, never a scatter into elements.
@@ -39,6 +39,8 @@ module oce_ssh_se
     !   FESOM3_SE_CHI      SM dissipation parameter, 0 <= chi <= 0.25                 default 0.1
     !   FESOM3_SE_VISC_AH  BT viscosity A_h = value*l_e [m/s], >= 0; 0 = off          default 0.01
     !   FESOM3_SE_CHECK    1 = per-step invariant suite (0/1)                         default 0
+    !                      one rank-0 line per step, key=value tokens (se_check_line):
+    !                      SE_CHECK step=<n> etacomp= trim= msl= spreadU= spreadUm= maxeta= maxU=
     ! Value-checked like FESOM3_SHARED_SYNC: anything outside the range stops the run, so a run
     ! never carries a setting other than the one its job file asked for. The FESOM3_SE_* knobs
     ! are read only when FESOM3_SSH_SE=1. SE is SILENT when off: run_conserve_pi.sh and
@@ -64,7 +66,8 @@ module oce_ssh_se
     use mod_dyn,         only: t_dyn
     use mod_partit,      only: t_partit
     use mod_part_bounds, only: local_dims, is_multirank
-    use mod_halo,        only: exchange_elem_shared, exchange_elem, exchange_nod
+    use mod_halo,        only: exchange_elem_shared, exchange_elem, exchange_nod, &
+                               allreduce_max, allreduce_sum, shared_copy_max_elem
     use mod_timer,       only: timer_start, timer_stop, TMR_OCE_SHSYNC, TMR_OCE_SE_BT
     use mod_mesh_rotate, only: trim_cyclic
     use mod_mesh_areas,  only: elem_center
@@ -72,14 +75,22 @@ module oce_ssh_se
     private
     public :: se_env_requested, se_read_env, se_parse_knob, se_init, se_step_guard
     public :: se_elem_depth, se_bt_forcing, se_subcycle, se_trim_finish
+    public :: se_check_core, se_check_values, se_check_line, se_check_tail
     public :: se_inflow, se_visc, se_tendency, se_depth_at, se_kappa_build
     public :: se_sm_coeffs, se_cfl_dtbt_limit, se_cfl_m_min, se_cfl_decision
     public :: SE_CFL_OK, SE_CFL_FORCED, SE_CFL_DIE
+    public :: SE_NCHK, SE_CHK_ETACOMP, SE_CHK_TRIM, SE_CHK_MSL, SE_CHK_SPREADU, SE_CHK_SPREADUM, &
+              SE_CHK_MAXETA, SE_CHK_MAXU, SE_CHK_NBAD
 
     ! se_cfl_decision verdicts
     integer, parameter :: SE_CFL_OK     = 0   ! M >= M_min
     integer, parameter :: SE_CFL_FORCED = 1   ! M <  M_min, FESOM3_SE_M_FORCE=1: warn and run
     integer, parameter :: SE_CFL_DIE    = 2   ! M <  M_min: stop
+
+    ! FESOM3_SE_CHECK: the entries of se_check_values' vals (meaning there)
+    integer, parameter :: SE_NCHK = 8
+    integer, parameter :: SE_CHK_ETACOMP = 1, SE_CHK_TRIM = 2, SE_CHK_MSL = 3, SE_CHK_SPREADU = 4, &
+                          SE_CHK_SPREADUM = 5, SE_CHK_MAXETA = 6, SE_CHK_MAXU = 7, SE_CHK_NBAD = 8
 
     ! the knobs se_read_env reads (FESOM3_SSH_SE itself: se_env_requested)
     character(len=17), parameter :: SE_KNOBS(5) = [character(len=17) :: &
@@ -792,6 +803,7 @@ contains
         !     halo-valid; the ice reads hbar and compute_vel_rhs eta_n at halo vertices).
         !     update_eta_n's alpha blend of hbar and hbar_old does not apply: eta^M is the
         !     elevation at n+1.
+        !  4. FESOM3_SE_CHECK: se_check_core, while helem is still at n. Nothing when off.
         ! U^M stays in ring level 0 for the next step. dhe (read only by the SI stiffness
         ! update), d_eta and ssh_rhs (SI only) are not touched.
         type(t_dyn),    intent(inout) :: dyn
@@ -803,6 +815,7 @@ contains
         integer       :: e, n, nz
         integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
         real(kind=WP) :: s(2), c(2)
+        real(kind=WP), allocatable :: eta_old(:)
 
         call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
 
@@ -843,12 +856,165 @@ contains
         end if
 
         ! ---- 3. commit the elevation ----
+        if (dyn%se_check) then
+            allocate(eta_old(nNodL))
+            eta_old = dyn%eta_n(1:nNodL)
+        end if
         do n = 1, nNodL
             mesh%hbar_old(n) = mesh%hbar(n)
             mesh%hbar(n)     = dyn%se_etam(n)
             dyn%eta_n(n)     = dyn%se_etam(n)
         end do
+
+        ! ---- 4. invariants ----
+        if (dyn%se_check) then
+            call se_check_core(dyn, mesh, partit, dt, step, eta_old)
+            deallocate(eta_old)
+        end if
     end subroutine se_trim_finish
+
+    !===========================================================================
+    subroutine se_check_values(dyn, mesh, partit, dt, eta_old, vals)
+        ! The FESOM3_SE_CHECK invariants after se_trim_finish's commit, while helem is still at
+        ! n; reduced over the ranks (collective). eta^{n+1} = eta_n, eta^n = eta_old (the copy
+        ! taken before the commit). vals(SE_CHK_*):
+        !   ETACOMP   max|eta^{n+1} - eta^n - tau*ssh_rhs_old/areasvol| over the owned nodes [m]:
+        !             the elevation and the divergence the tail sees agree (ssh_rhs_old =
+        !             I(<<U>>) - W*areasvol); the eta-compatibility of the notes
+        !   TRIM      max|sum_k helem^n uv_k - <<U>>| over the owned elements, both components
+        !             [m^2/s]: the trimmed velocity carries the mean transport
+        !   MSL       sum areasvol*eta^{n+1}/sum areasvol (owned nodes) minus the same mean at the
+        !             start of the run [m]: dyn%se_msl0, taken from eta^n by the first call of
+        !             this process. 0 to rounding in a closed linfs basin
+        !   SPREADU, SPREADUM  the copy spreads max|copy - designated copy| of U^M and <<U>> on
+        !             the shared elements (plan D2: 0 by construction; 0 at 1 rank)
+        !   MAXETA    max|eta^{n+1}| [m];  MAXU  max|U^M| [m^2/s]  (owned)
+        !   NBAD      the number of non-finite values in eta_n and ssh_rhs_old (owned nodes),
+        !             <<U>> and U^M (owned elements, per element) and uv (wet layers, owned)
+        ! Exposed (not only through se_check_core) so that test_ssh_se can check the values.
+        type(t_dyn),    intent(inout) :: dyn          ! se_msl0 is set by the first call
+        type(t_mesh),   intent(in)    :: mesh
+        type(t_partit), intent(in)    :: partit
+        real(kind=WP),  intent(in)    :: dt
+        real(kind=WP),  intent(in)    :: eta_old(:)   ! (>= nNodO) eta^n
+        real(kind=WP),  intent(out)   :: vals(SE_NCHK)
+        integer       :: n, e, nz, nbad
+        integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
+        real(kind=WP) :: mx(6), sm(4), s(2)
+
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        mx = 0.0_WP; sm = 0.0_WP; nbad = 0
+        do n = 1, nNodO
+            mx(1) = max(mx(1), abs(dyn%eta_n(n) - eta_old(n) - dt*dyn%ssh_rhs_old(n)/mesh%areasvol(n)))
+            mx(5) = max(mx(5), abs(dyn%eta_n(n)))
+            sm(1) = sm(1) + mesh%areasvol(n)*dyn%eta_n(n)
+            sm(2) = sm(2) + mesh%areasvol(n)
+            sm(3) = sm(3) + mesh%areasvol(n)*eta_old(n)
+            if (.not. (ieee_is_finite(dyn%eta_n(n)) .and. ieee_is_finite(dyn%ssh_rhs_old(n)))) nbad = nbad + 1
+        end do
+        do e = 1, nElemO
+            s = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                s(1) = s(1) + mesh%helem(nz, e)*dyn%uv(1, nz, e)
+                s(2) = s(2) + mesh%helem(nz, e)*dyn%uv(2, nz, e)
+                if (.not. (ieee_is_finite(dyn%uv(1, nz, e)) .and. ieee_is_finite(dyn%uv(2, nz, e)))) &
+                    nbad = nbad + 1
+            end do
+            mx(2) = max(mx(2), abs(s(1) - dyn%se_umean(1, e)), abs(s(2) - dyn%se_umean(2, e)))
+            mx(6) = max(mx(6), abs(dyn%se_ubt(1, e, 0)), abs(dyn%se_ubt(2, e, 0)))
+            if (.not. (all(ieee_is_finite(dyn%se_umean(:, e))) .and. all(ieee_is_finite(dyn%se_ubt(:, e, 0))))) &
+                nbad = nbad + 1
+        end do
+        ! the spreads exchange with the neighbours: every rank calls them (0 without shared elements)
+        mx(3) = shared_copy_max_elem(dyn%se_ubt(:, :, 0), partit)
+        mx(4) = shared_copy_max_elem(dyn%se_umean, partit)
+        sm(4) = real(nbad, WP)
+        if (is_multirank(partit)) then
+            call allreduce_max(mx, partit)
+            call allreduce_sum(sm, partit)
+        end if
+        if (.not. dyn%se_msl0_set) then
+            dyn%se_msl0     = sm(3)/sm(2)
+            dyn%se_msl0_set = .true.
+        end if
+        vals(SE_CHK_ETACOMP)  = mx(1)
+        vals(SE_CHK_TRIM)     = mx(2)
+        vals(SE_CHK_MSL)      = sm(1)/sm(2) - dyn%se_msl0
+        vals(SE_CHK_SPREADU)  = mx(3)
+        vals(SE_CHK_SPREADUM) = mx(4)
+        vals(SE_CHK_MAXETA)   = mx(5)
+        vals(SE_CHK_MAXU)     = mx(6)
+        vals(SE_CHK_NBAD)     = sm(4)
+    end subroutine se_check_values
+
+    !===========================================================================
+    function se_check_line(step, vals) result(line)
+        ! The fixed-format SE_CHECK line: blank-separated key=value tokens, values es11.4
+        ! without blanks, e.g.
+        !   SE_CHECK step=12 etacomp=1.2345E-16 trim=3.0518E-13 msl=-4.1633E-17 spreadU=0.0000E+00
+        !            spreadUm=0.0000E+00 maxeta=1.0412E+00 maxU=2.5011E+02
+        ! (one line). grep '^SE_CHECK ', then split each token at '='.
+        integer,       intent(in) :: step
+        real(kind=WP), intent(in) :: vals(SE_NCHK)
+        character(len=256) :: line
+        character(len=16)  :: st
+        write(st, '(i0)') step
+        line = 'SE_CHECK step='//trim(st)//kv('etacomp', vals(SE_CHK_ETACOMP))// &
+               kv('trim', vals(SE_CHK_TRIM))//kv('msl', vals(SE_CHK_MSL))// &
+               kv('spreadU', vals(SE_CHK_SPREADU))//kv('spreadUm', vals(SE_CHK_SPREADUM))// &
+               kv('maxeta', vals(SE_CHK_MAXETA))//kv('maxU', vals(SE_CHK_MAXU))
+    contains
+        function kv(key, x) result(t)
+            character(len=*), intent(in) :: key
+            real(kind=WP),    intent(in) :: x
+            character(len=:), allocatable :: t
+            character(len=16) :: buf
+            write(buf, '(es11.4)') x
+            t = ' '//key//'='//trim(adjustl(buf))
+        end function kv
+    end function se_check_line
+
+    !===========================================================================
+    subroutine se_check_core(dyn, mesh, partit, dt, step, eta_old)
+        ! FESOM3_SE_CHECK, called by se_trim_finish after the commit (helem still at n):
+        ! se_check_values, one SE_CHECK line on rank 0 (se_check_line), and a stop with the
+        ! step number on any non-finite value. Collective.
+        type(t_dyn),    intent(inout) :: dyn
+        type(t_mesh),   intent(in)    :: mesh
+        type(t_partit), intent(in)    :: partit
+        real(kind=WP),  intent(in)    :: dt
+        integer,        intent(in)    :: step
+        real(kind=WP),  intent(in)    :: eta_old(:)
+        real(kind=WP)      :: vals(SE_NCHK)
+        character(len=160) :: msg
+
+        call se_check_values(dyn, mesh, partit, dt, eta_old, vals)
+        if (partit%mype == 0) then
+            write(*,'(a)') trim(se_check_line(step, vals))
+            flush(output_unit)
+        end if
+        if (vals(SE_CHK_NBAD) > 0.0_WP) then
+            write(msg,'(a,i0,a,i0,a)') 'SE_CHECK: ', nint(vals(SE_CHK_NBAD)), &
+                ' non-finite values (eta_n, ssh_rhs_old, <<U>>, U^M or uv) at step ', step, '; stopping'
+            call se_die(trim(msg), partit)
+        end if
+    end subroutine se_check_core
+
+    !===========================================================================
+    subroutine se_check_tail(dyn, mesh, partit, step)
+        ! FESOM3_SE_CHECK after the ALE tail (step_oce, after update_thickness_ale). Under zstar
+        ! it will check the committed thicknesses against the SE elevation, max|sum_k hnode -
+        ! (H0 + eta)| and max|w(1)| (plan Task 3.1). linfs has nothing to check here: hnode is
+        ! frozen and w(1) is the free-surface velocity, so this is a no-op; until Task 3.1 a
+        ! non-linfs SE run stops in se_elem_depth before it gets here.
+        type(t_dyn),    intent(in) :: dyn
+        type(t_mesh),   intent(in) :: mesh
+        type(t_partit), intent(in) :: partit
+        integer,        intent(in) :: step
+        if (trim(which_ALE) == 'linfs') return
+        call se_die('se_check_tail: the zstar checks are not implemented yet '// &
+                    '(docs/plans/2026-10-17-split-explicit.md, Task 3.1)', partit)
+    end subroutine se_check_tail
 
     !===========================================================================
     ! ---- helpers ----

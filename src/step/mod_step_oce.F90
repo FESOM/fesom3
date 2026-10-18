@@ -69,7 +69,8 @@ module mod_step_oce
     use oce_ale,            only: compute_vel_nodes, update_vel, compute_hbar_ale, &
                                   update_eta_n, vert_vel_ale, update_thickness_ale
     use oce_ale_tracer,     only: solve_tracers_ale
-    use oce_ssh_se,         only: se_step_guard, se_bt_forcing, se_subcycle, se_trim_finish
+    use oce_ssh_se,         only: se_step_guard, se_bt_forcing, se_subcycle, se_trim_finish, &
+                                  se_check_tail
     use mod_timer,          only: timer_start, timer_stop, &
                                   TMR_OCE_MIXPRES, TMR_OCE_DYN, TMR_OCE_SSH, &
                                   TMR_OCE_SOLVE, TMR_OCE_GMREDI, TMR_OCE_TRACER
@@ -320,6 +321,11 @@ contains
         call update_thickness_ale(mesh, partit)
         call dump_node(DUMP_SUBSTEP_THICKNESS, n, 'hnode', mesh%hnode, mesh%nlevels_nod2D)
         call timer_stop(TMR_OCE_TRACER)
+
+        !_______________________________________________________________________
+        ! FESOM3_SE_CHECK: the split-explicit checks of the committed thicknesses (zstar; a no-op
+        ! under linfs). The core checks ran inside se_trim_finish.
+        if (dynamics%use_ssh_se .and. dynamics%se_check) call se_check_tail(dynamics, mesh, partit, n)
     end subroutine step_oce
 
 end module mod_step_oce

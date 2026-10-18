@@ -40,9 +40,10 @@ module mod_halo
     ! selection (no rounding) so it is exact + deterministic; glob_max only drives the
     ! extrapolation loop COUNT (same global max => same iteration count on both codes).
     ! Guard callers with is_multirank — at npes==1 the local max already IS the global.
-    ! The integer variant takes maxima of COUNTS (setup statistics).
+    ! The integer variant takes maxima of COUNTS (setup statistics); the rank-1 variant
+    ! reduces a vector of diagnostics in one call (oce_ssh_se's SE_CHECK).
     interface allreduce_max
-        module procedure allreduce_max_r0, allreduce_max_i0
+        module procedure allreduce_max_r0, allreduce_max_r1, allreduce_max_i0
     end interface
 
     interface exchange_elem
@@ -273,6 +274,14 @@ contains
         call MPI_Allreduce(MPI_IN_PLACE, s, 1, MPI_WP, MPI_MAX, &
                            partit%MPI_COMM_FESOM, ierr)
     end subroutine allreduce_max_r0
+
+    subroutine allreduce_max_r1(s, partit)
+        real(kind=WP),  intent(inout) :: s(:)
+        type(t_partit), intent(in)    :: partit
+        integer :: ierr
+        call MPI_Allreduce(MPI_IN_PLACE, s, size(s), MPI_WP, MPI_MAX, &
+                           partit%MPI_COMM_FESOM, ierr)
+    end subroutine allreduce_max_r1
 
     subroutine allreduce_max_i0(s, partit)
         integer,        intent(inout) :: s

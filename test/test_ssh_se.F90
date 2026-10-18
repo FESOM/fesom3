@@ -1,7 +1,7 @@
 program test_ssh_se
-    ! Split-explicit barotropic solver (docs/plans/2026-10-17-split-explicit.md), Tasks 0.3-1.3: the
-    ! knobs, the CFL guard, se_init, the barotropic forcing, the substeps and the trim of
-    ! src/oce/oce_ssh_se.F90 on the rotated pi mesh.
+    ! Split-explicit barotropic solver (docs/plans/2026-10-17-split-explicit.md), Tasks 0.3-1.4: the
+    ! knobs, the CFL guard, se_init, the barotropic forcing, the substeps, the trim and the
+    ! invariant suite of src/oce/oce_ssh_se.F90 on the rotated pi mesh.
     !
     !   C1  the SM coefficients at chi = 0.1 equal the literal numbers worked out by hand from
     !       the notes (beta = 0.281105, zeta = -0.003689497, gamma = 0.0320866, delta =
@@ -70,7 +70,14 @@ program test_ssh_se
     !       depth-uniform, uv_k - u**_k = -(sum_j helem u**_j - <<U>>)/H^n for every layer (to 1e-13
     !       of max|u**|); the layers below nlevels untouched; hbar_old = old hbar, hbar = eta_n =
     !       eta^M on owned + halo nodes and ssh_rhs_old = I(<<U>>) on owned nodes (bitwise); the
-    !       U ring untouched; at npes > 1 uv is synced over the shared elements and halo-valid.
+    !       U ring untouched; SE_CHECK off computes nothing; at npes > 1 uv is synced over the
+    !       shared elements and halo-valid.
+    !   C11 FESOM3_SE_CHECK (Task 1.4) after a full SE step (M = 40 substeps + se_trim_finish, which
+    !       prints the SE_CHECK line): eta-compatibility, trim and mean-sea-level change at rounding
+    !       (1e-12 of their scales), copy spreads 0, max|eta| and max|U| equal to the direct maxima,
+    !       no non-finite value; the line is blank-separated key=value tokens; a uv perturbed by
+    !       delta on one element shows as trim = helem*delta (the other checks unchanged), and a
+    !       NaN there is counted.
     ! FESOM3_MESH_DIR (default pi), FESOM3_TEST_ROTATE=1 reads it rotated (setup_test_mesh).
     use mpi
     use mod_precision,    only: WP, MP, MPI_WP
@@ -82,6 +89,9 @@ program test_ssh_se
     use mod_part_bounds,  only: local_dims
     use mod_config,       only: ab_epsilon
     use mod_constants,    only: r_earth
+    use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan
+    use, intrinsic :: ieee_exceptions, only: ieee_invalid, ieee_support_halting, ieee_get_halting_mode, &
+                                             ieee_set_halting_mode, ieee_set_flag
     use mod_halo,         only: stale_halo_max_nod, stale_halo_max_elem, shared_copy_max_elem
     use mod_mesh_areas,   only: elem_center
     use mod_mesh_rotate,  only: trim_cyclic
@@ -90,7 +100,9 @@ program test_ssh_se
                                 se_cfl_dtbt_limit, se_cfl_m_min, se_cfl_decision, &
                                 SE_CFL_OK, SE_CFL_FORCED, SE_CFL_DIE, se_bt_forcing, &
                                 se_elem_depth, se_subcycle, se_inflow, se_visc, se_tendency, &
-                                se_trim_finish
+                                se_trim_finish, se_check_values, se_check_line, SE_NCHK, &
+                                SE_CHK_ETACOMP, SE_CHK_TRIM, SE_CHK_MSL, SE_CHK_SPREADU, &
+                                SE_CHK_SPREADUM, SE_CHK_MAXETA, SE_CHK_MAXU, SE_CHK_NBAD
     use test_util,        only: setup_test_mesh, check, finish, sum_all, max_all, hval
     implicit none
 
@@ -113,6 +125,7 @@ program test_ssh_se
     call c8_visc()
     call c9_subcycle()
     call c10_trim_finish()
+    call c11_check()
     call finish(partit, 'test_ssh_se')
 
 contains
@@ -872,6 +885,7 @@ contains
              + count(d%se_umean(:, 1:nElemO) /= d0%se_umean(:, 1:nElemO))
         call sum_all(nbad, partit)
         call check(nbad == 0, 'C10 the U ring and <<U>> are untouched', partit%mype)
+        call check(.not. d%se_msl0_set, 'C10 SE_CHECK off: nothing computed', partit%mype)
 
         ! (g) npes > 1: uv synced over the shared elements and halo-valid, as after update_vel
         if (partit%npes > 1) then
@@ -888,5 +902,99 @@ contains
             deallocate(tmp)
         end if
     end subroutine c10_trim_finish
+
+    subroutine c11_check()
+        ! Task 1.4: FESOM3_SE_CHECK on a full SE step (M = 40 substeps + the trim) of the hashed
+        ! state; then a perturbed uv on one element and a NaN.
+        type(t_dyn) :: d0, d, dp
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, n, e, nz, k0
+        real(kind=WP), allocatable :: wf(:)
+        real(kind=WP) :: vals(SE_NCHK), v2(SE_NCHK), sa(2), etascale, trimscale, mxe, mxu
+        real(kind=WP) :: expect, delta
+        character(len=256) :: line
+        logical :: halt
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        call hashed_step_state(d0)
+        allocate(wf(nNodL)); wf = 0.0_WP
+        d = d0
+        d%se_M = 40
+        d%se_check = .true.
+        call se_subcycle(d, mesh, partit, dt)
+        call se_trim_finish(d, mesh, partit, dt, 7, wf)          ! prints the SE_CHECK line (rank 0)
+        call check(d%se_msl0_set, 'C11 SE_CHECK on: the MSL reference is set by the first check', partit%mype)
+        call se_check_values(d, mesh, partit, dt, d0%eta_n, vals)
+
+        ! scales and the direct maxima
+        etascale = 0.0_WP; mxe = 0.0_WP
+        do n = 1, nNodO
+            etascale = max(etascale, abs(d0%eta_n(n)), abs(d%eta_n(n) - d0%eta_n(n)))
+            mxe      = max(mxe, abs(d%eta_n(n)))
+        end do
+        trimscale = 0.0_WP; mxu = 0.0_WP
+        do e = 1, nElemO
+            sa = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                sa = sa + mesh%helem(nz, e)*abs(d%uv(:, nz, e))
+            end do
+            trimscale = max(trimscale, maxval(sa))
+            mxu = max(mxu, maxval(abs(d%se_ubt(:, e, 0))))
+        end do
+        call max_all(etascale, partit); call max_all(mxe, partit)
+        call max_all(trimscale, partit); call max_all(mxu, partit)
+        call check(vals(SE_CHK_ETACOMP) <= 1.0e-12_WP*etascale, 'C11 eta-compatibility at rounding', partit%mype)
+        call check(vals(SE_CHK_TRIM) <= 1.0e-12_WP*trimscale, 'C11 trim at rounding', partit%mype)
+        call check(abs(vals(SE_CHK_MSL)) <= 1.0e-12_WP*etascale, 'C11 mean sea level unchanged (closed basin)', &
+                   partit%mype)
+        call check(vals(SE_CHK_SPREADU) == 0.0_WP .and. vals(SE_CHK_SPREADUM) == 0.0_WP, &
+                   'C11 copy spreads of U^M and <<U>> are 0', partit%mype)
+        call check(vals(SE_CHK_MAXETA) == mxe .and. vals(SE_CHK_MAXU) == mxu .and. mxe > 0.0_WP, &
+                   'C11 max|eta|, max|U| = the direct maxima', partit%mype)
+        call check(vals(SE_CHK_NBAD) == 0.0_WP, 'C11 no non-finite value', partit%mype)
+        if (partit%mype == 0) write(*,'(a,es10.3,a,es10.3,a,es10.3,a,es10.3,a,es10.3,a,2es10.3)') &
+            'test_ssh_se: C11 valid state: etacomp ', vals(SE_CHK_ETACOMP), ' m of ', etascale, &
+            '; trim ', vals(SE_CHK_TRIM), ' m2/s of ', trimscale, '; msl ', vals(SE_CHK_MSL), &
+            ' m; spreads ', vals(SE_CHK_SPREADU), vals(SE_CHK_SPREADUM)
+
+        ! the line format
+        line = se_check_line(7, vals)
+        call check(index(line, 'SE_CHECK step=7 etacomp=') == 1 .and. index(line, ' trim=') > 0 .and. &
+                   index(line, ' msl=') > 0 .and. index(line, ' spreadU=') > 0 .and. &
+                   index(line, ' spreadUm=') > 0 .and. index(line, ' maxeta=') > 0 .and. &
+                   index(line, ' maxU=') > 0 .and. index(trim(line), '  ') == 0 .and. &
+                   index(trim(line), '= ') == 0, 'C11 the SE_CHECK line: key=value tokens, '// &
+                   'single blanks: '//trim(line), partit%mype)
+
+        ! a perturbed uv on one element: rank 0's first element, its top layer
+        delta = 1.0e-3_WP
+        expect = 0.0_WP
+        dp = d
+        if (partit%mype == 0) then
+            k0 = mesh%ulevels(1)
+            dp%uv(1, k0, 1) = dp%uv(1, k0, 1) + delta
+            expect = real(mesh%helem(k0, 1), WP)*delta
+        end if
+        call max_all(expect, partit)
+        call se_check_values(dp, mesh, partit, dt, d0%eta_n, v2)
+        call check(abs(v2(SE_CHK_TRIM) - expect) <= 1.0e-6_WP*expect .and. &
+                   v2(SE_CHK_TRIM) > 1.0e6_WP*vals(SE_CHK_TRIM), &
+                   'C11 a perturbed uv on one element shows in the trim check (= helem*delta)', partit%mype)
+        call check(v2(SE_CHK_ETACOMP) == vals(SE_CHK_ETACOMP) .and. v2(SE_CHK_NBAD) == 0.0_WP, &
+                   'C11 the perturbation leaves the other checks unchanged', partit%mype)
+        if (partit%mype == 0) write(*,'(a,es10.3,a,es10.3,a)') &
+            'test_ssh_se: C11 perturbed uv: trim ', v2(SE_CHK_TRIM), ' m2/s (helem*delta = ', expect, ')'
+        ! a NaN on one element. The Intel build traps invalid operations (-fpe0), and the max and
+        ! sum over a NaN raise one: halting off around the check (a NaN reaches SE_CHECK in a run
+        ! only without that trap, e.g. the GNU build; with it the producing operation stops first)
+        halt = .false.
+        if (ieee_support_halting(ieee_invalid)) then
+            call ieee_get_halting_mode(ieee_invalid, halt)
+            call ieee_set_halting_mode(ieee_invalid, .false.)
+        end if
+        if (partit%mype == 0) dp%uv(2, mesh%ulevels(1), 1) = ieee_value(1.0_WP, ieee_quiet_nan)
+        call se_check_values(dp, mesh, partit, dt, d0%eta_n, v2)
+        call ieee_set_flag(ieee_invalid, .false.)
+        if (ieee_support_halting(ieee_invalid)) call ieee_set_halting_mode(ieee_invalid, halt)
+        call check(v2(SE_CHK_NBAD) == 1.0_WP, 'C11 a NaN in uv is counted (NBAD = 1)', partit%mype)
+    end subroutine c11_check
 
 end program test_ssh_se

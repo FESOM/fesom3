@@ -478,23 +478,60 @@ scripts and logs in its `jobs/`)
   configs), new `fesom_lifecycle_native_mr` sha256 `9abe27997a2f07be…`. Scripts
   `/work/ab0995/a270088/fesom3_se_ref/jobs/t13_gate.sbatch`, `t13_gnu_rerun.sbatch`
 
-#### Task 1.4: Invariant suite `FESOM3_SE_CHECK`
+#### Task 1.4: Invariant suite `FESOM3_SE_CHECK` ✅
 
 **Files:**
 - Modify: `src/oce/oce_ssh_se.F90`, `src/step/mod_step_oce.F90` (tail hook)
-- Modify: `test/test_ssh_se.F90`
+- Modify: `src/infra/mod_halo.F90` (➕ `allreduce_max_r1`), `src/types/mod_dyn.F90` (➕ the MSL reference)
+- Modify: `test/test_ssh_se.F90`, `test/CMakeLists.txt`
 
-- [ ] `se_check_core`, called inside `se_trim_finish`:
+- [x] `se_check_core`, called inside `se_trim_finish`:
   - η-compatibility, trim, mean-sea-level change in metres since the start of the run;
   - copy spreads of Ū and ⟨⟨Ū⟩⟩ (meaningful from Stage 2 on);
   - max|η|, max|Ū|;
   - NaN/Inf → die with the step number
-- [ ] `se_check_tail`, called in `step_oce` after `update_thickness_ale` when SE and SE_CHECK are on: the zstar layer
-  sum and max|w(1)| (filled in by Task 3.1)
-- [ ] reductions via `allreduce_max`/`allreduce_sum`; nothing is computed or printed when off
-- [ ] test: on a valid state the checks report rounding-level values; with a deliberately perturbed uv on one element
-  the trim check reports the perturbation
-- [ ] ctest green
+
+  Split into `se_check_values` (collective; returns `vals(SE_NCHK)`, so the test reads them), `se_check_line` (the
+  format) and `se_check_core` (values, the rank-0 line, the stop). se_trim_finish calls it after the commit, with a
+  copy of ηⁿ taken before it, while helem is still at n:
+  - etacomp = max over owned nodes |η^{n+1} − ηⁿ − τ·ssh_rhs_old/areasvol| [m] (ssh_rhs_old = I(⟨⟨Ū⟩⟩) − W·areasvol);
+  - trim = max over owned elements and both components |Σₖhelemⁿuvₖ − ⟨⟨Ū⟩⟩| [m²/s];
+  - msl = Σareasvol·η^{n+1}/Σareasvol − the same mean at the start of the run [m]. ➕ The reference lives in
+    `t_dyn` (`se_msl0`, `se_msl0_set`, two scalars beyond §1) and is set from ηⁿ by the first check of the process
+    (a restarted run measures from its own start);
+  - spreadU / spreadUm = `shared_copy_max_elem` of Ū^M (ring level 0) and ⟨⟨Ū⟩⟩ (0 at np 1);
+  - maxeta = max|η^{n+1}| [m], maxU = max|Ū^M| [m²/s] (owned);
+  - NaN/Inf: a count over eta_n and ssh_rhs_old (owned nodes), ⟨⟨Ū⟩⟩ and Ū^M (owned elements) and the wet layers of
+    uv; > 0 prints the line and stops ("SE_CHECK: k non-finite values ... at step n"). ⚠️ The Intel build traps
+    invalid operations (`-fpe0`), so there a NaN-producing operation stops the run before SE_CHECK sees it; the
+    count is the safety net of builds without the trap (GNU) and of NaN that arrive without an invalid operation
+
+  **The line** (rank 0, one per step, blank-separated key=value tokens, values `es11.4` without blanks):
+  `SE_CHECK step=20 etacomp=1.6792E-15 trim=1.1369E-13 msl=-1.7969E-17 spreadU=0.0000E+00 spreadUm=0.0000E+00
+  maxeta=1.8008E+00 maxU=4.2636E+02` (one line; pi, step 20 of `fesom_conserve_se_linfs_np1`). Parse with
+  `grep '^SE_CHECK '` and split each token at `=` (run_conserve_pi.sh does, Task 1.5)
+- [x] `se_check_tail`, called in `step_oce` after `update_thickness_ale` when SE and SE_CHECK are on: the zstar layer
+  sum and max|w(1)| (filled in by Task 3.1). Wired after `timer_stop(TMR_OCE_TRACER)`; a no-op under linfs (hnode is
+  frozen, w(1) is the free-surface velocity); for non-linfs it stops ("not implemented yet", Task 3.1), unreachable
+  today because se_elem_depth stops first
+- [x] reductions via `allreduce_max`/`allreduce_sum`; nothing is computed or printed when off. One `allreduce_max`
+  of the six maxima (➕ a rank-1 `allreduce_max_r1` in the generic interface, additions only) and one
+  `allreduce_sum` of four sums per step, plus the two spread probes. Off: se_trim_finish does not take the ηⁿ copy
+  and never calls the check (C10: `se_msl0_set` stays false)
+- [x] test: on a valid state the checks report rounding-level values; with a deliberately perturbed uv on one element
+  the trim check reports the perturbation. `test_ssh_se` C11 (np 1 and 2), a full SE step (M = 40 substeps + the
+  trim, which prints the line) on the hashed state: **etacomp 3.4e-16 m** of max(|ηⁿ|, |Δη|) = 0.41 m (GNU 3.1e-16),
+  **trim 7.1e-14 m²/s** of Σhelem|uv| = 766 (GNU 6.4e-14), **msl 8.7e-19 m** (np 2 −2.8e-18; GNU 1.7e-18), copy
+  spreads **0** at np 1 and np 2, maxeta and maxU equal to the direct maxima, no non-finite value (tolerances 1e-12 of
+  the scales).
+  The line has the key=value form with single blanks; uv + δ (δ = 1e-3 m/s) in the top layer of one element gives
+  **trim = 5.000e-3 m²/s = helemδ** (relative 1e-6) with etacomp and the count unchanged; a NaN there gives count 1
+  (the Intel `-fpe0` trap is switched off around that one call with `ieee_set_halting_mode`).
+  `fesom_conserve_se_linfs_np1` now runs with `FESOM3_SE_CHECK=1` and needs the step-20 SE_CHECK line
+- [x] ctest green. Job 28217323 (shared, 2.3 min): **Intel 174/174; GNU 168/174, the 6 known failures**, no new
+  one; `test_ssh_se_np1/np2` and `fesom_conserve_se_*` pass on both. The pi SE run (`fesom_conserve_se_linfs_np1`,
+  20 steps): step 1 etacomp 1.7e-16 m, trim 2.8e-14 m²/s; step 20 etacomp 1.7e-15 m, trim 1.1e-13 m²/s, msl
+  −1.8e-17 m, maxeta 1.80 m, maxU 426 m²/s (GNU: the same to 1-2 digits). Script `t13_gate.sbatch` (TAG=t14)
 
 #### Task 1.5: GATE Stage 1 — linfs np 1
 
