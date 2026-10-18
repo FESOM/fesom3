@@ -649,19 +649,70 @@ scripts and logs in its `jobs/`)
   `/work/ab0995/a270088/fesom3_se_ref/jobs/t21_ctest.sbatch` (TAG t21, t21b), `t21_optrpt.sbatch`,
   `t22_final.sbatch`
 
-#### Task 2.2: GATE Stage 2 — linfs np > 1
+#### Task 2.2: GATE Stage 2 — linfs np > 1 ✅
 
-- [ ] add an SE block to `tools/run_conserve_pi.sh` (linfs + ice, np 2 and 8, `FESOM3_SSH_SE=1`) next to the
+- [x] add an SE block to `tools/run_conserve_pi.sh` (linfs + ice, np 2 and 8, `FESOM3_SSH_SE=1`) next to the
   SHARED block; the existing blocks stay unchanged. (Task 1.5 put the SE block in place with np 1 configs: add
-  `<label> <np> <env>` lines to its `while read` list; re-measure the SE_TOL_* levels at np 2/8)
-- [ ] CORE2 `prod_env`, np 8 (480 steps) and np 128 on one node (480 steps), `FESOM3_STEP_DIAG=1 FESOM3_SE_CHECK=1`:
+  `<label> <np> <env>` lines to its `while read` list; re-measure the SE_TOL_* levels at np 2/8). Two lines,
+  `momadv-vinv-upw1+ice 2` and `… 8` (vector-invariant momentum, rvo_upwind 1, sea ice), with
+  `FESOM3_DIVSUM_TOL=$TOL`, so the driver's shared-element gate (divsum ≤ 1e-12, dUV = dAB = dsig = 0) runs as well.
+  Re-measured over **1000 steps** (job 28218250, fixed binary, default χ = 0.1), np 2 / np 8: **etacomp 4.7e-15 /
+  6.3e-15 m, trim 4.5e-13 / 3.4e-13 m²/s, |msl| 7.4e-16 / 3.0e-16 m, spreads 0, divsum 2.9e-16 / 1.7e-16**,
+  dUV = dAB = dsig = 0; at most 2.1 times the np 1 levels, so **SE_TOL_* stay unchanged** (margins ≥ 54). The full
+  script at 20 steps (job 28218252): **GATE OK, 30 configs**; np 2 etacomp 1.6e-15, trim 1.7e-13, |msl| 8.3e-17,
+  divsum 1.2e-16; np 8 1.7e-15, 1.7e-13, 5.7e-17, 1.5e-16. With the binary before Task 2.1's fix both lines fail
+  (spreadUm 2.8e-14 over 1000 steps, job 28218069)
+- [x] CORE2 `prod_env`, np 8 (480 steps) and np 128 on one node (480 steps), `FESOM3_STEP_DIAG=1 FESOM3_SE_CHECK=1`:
   - divsum ≤ 1e-13;
   - dUV = dAB = dsig = 0;
   - SE copy spreads = 0;
   - invariants at the Stage 1 level (the CORE2 gate column of the Task 1.5 table)
-- [ ] determinism: the same binary at the same np, run twice, is bitwise identical (`dump_diff.py --rel-floor 0`);
-  np 1 vs np 8 difference recorded
-- [ ] G0
+
+  ⚠️ **At the default χ = 0.1 CORE2 blows up at step 337-340** (7 days; floating overflow), at np 8 (job
+  28218069; job 28218164 with the fixed binary) and at np 128 (job 28218070) in the same step, so it is not
+  partition-dependent and not a shared-element defect (spreads 0, dUV = dAB = dsig = 0, divsum ≤ 1.5e-15 up to step
+  336). Where (node dumps of steps 325-340, jobs 28218164 / 28218239): a cluster of 20 m deep (minimum depth)
+  Antarctic shelf nodes at 72-75°W, 71-73°S (Bellingshausen Sea coast, sea ice a = 1) carries a grid-scale η
+  pattern, ±5 m between neighbouring nodes, with w ≈ 3-5e-3 m/s (CFL_z 1.0-1.8 in the top layer) from step 325 on;
+  SI at step 336 has a smooth −1.6 m there and CFL_z ≤ 0.032. At step 337 η reaches 21 m and uv 55 m/s. A
+  grid-scale gravity wave in 20 m of water (~30 km node spacing) has ωτ ≈ 2.6 but ω·dtbt ≈ 0.05: SI's
+  backward Euler damps it by 1/(1 + (ωτ)²) per step, while the SM substeps hardly damp it at χ = 0.1. Screens at
+  np 8, 480 steps (report only; jobs 28218164, 28218250): **χ = 0.25 runs 480 steps**; at χ = 0.1, **M = 100
+  blows up earlier (step 192)**,
+  **`se_visc_ah = 0` earlier (step 298)**, **`se_visc_ah = 0.1` runs 480 steps** (max|η| 4.72 m, max CFL_z 1.61), and
+  **M = 35 = M_min blows up at step 5**: the CFL guard's 0.5·res/√(gH) is not a sufficient stability limit (M = 50
+  is 0.69 of it). **The gate therefore runs with `FESOM3_SE_CHI=0.25`** (inside D1's knob range); the default χ =
+  0.1 is unchanged here, and the choice of the default (χ, `se_visc_ah`, M) is Stage 5's (➕ note at Task 5.1).
+  Results with χ = 0.25 and the fixed binary (`bin_t22_5a43ca3` = this tree's Intel build, sha256
+  `5a43ca392d64eebe…`):
+  - **np 8** (job 28218250, shared, 725 s): **divsum ≤ 1.19e-15; dUV = dAB = dsig = 0; spreadU = spreadUm = 0**;
+    SE_CHECK max **etacomp 6.6e-14 m, trim 3.2e-12 m²/s, |msl| 1.6e-15 m** (gate 2e-12, 3.5e-11, 6e-14); max|η|
+    4.70 m (step 67; 2.06 m at step 480), max|uv| 2.97 m/s, max CFL_z 1.60 (step 300);
+  - **np 128** (job 28218251, one compute node, 85 s): **divsum ≤ 3.1e-16; dUV = dAB = dsig = 0; spreads 0**;
+    **etacomp 6.3e-14 m, trim 2.3e-12 m²/s, |msl| 1.3e-16 m**; max|η| 4.69 m (step 67), max|uv| 2.98 m/s, max CFL_z
+    1.60 (step 301). SI on the same node: max|η| 2.04 m, max|uv| 2.97 m/s, max CFL_z 1.59 (step 300), divsum ≤
+    1.1e-15
+  - the invariant levels over 480 steps are 3-10 times the 48-step np 1 levels of Task 1.5 and stay inside the
+    CORE2 gate column
+  - timers at np 128 (job 28218251, the three runs one after the other on one node; mean ms/step over 480 steps;
+    informational): **SE (no SE_CHECK): TMR_OCE_SSH 12.93, of which TMR_OCE_SE_BT 10.52 and the shared sync
+    0.67; LOOP 146.2. SI: TMR_OCE_SSH 9.13, of which the CG solve 5.43 and the shared sync 0.29; LOOP 144.2.** SE
+    with SE_CHECK: 14.56 / 10.81, LOOP 150.3
+- [x] determinism: the same binary at the same np, run twice, is bitwise identical (`dump_diff.py --rel-floor 0`);
+  np 1 vs np 8 difference recorded. CORE2 np 8, 480 steps, χ = 0.25, runs A and B (job 28218250): the 1440 step /
+  CFL_z / SE_CHECK lines identical, **`dump_diff.py --rel-floor=0` on the step-480 node dumps: 1 395 438 records
+  max|Δ| = 0; `zarr_diff.py --rel-floor 0` on the step-480 checkpoint: 99 variables max|Δ| = 0**. (At χ = 0.1 the
+  two np 8 runs were also line-identical up to their common blow-up, job 28218069.) np 1 vs np 8 after 48 steps
+  (node dumps, χ = 0.25): **max|Δη| 4.6e-2 m (rms 9.7e-4 of rms η 0.55 m), max|Δw| 4.6e-4 m/s, max|ΔT| 5.1 °C (rms
+  0.027), max|ΔS| 1.9 (rms 0.011)**; SI the same: max|Δη| 4.9e-2 m (rms 8.7e-4), max|ΔT| 5.2 °C (rms 0.027), max|ΔS|
+  1.9. So SE adds no partition dependence beyond the model's own growth of roundoff over 48 steps (pi P4 after 6
+  SE steps: 3.6e-16 relative)
+- [x] G0. Job 28218252 (with the Task 2.1 tree): **G0 GREEN** (linfs, zstar: 99 checkpoint variables and 1 649 154
+  dump records max|Δ| = 0, 20 step lines equal; conserve: 249 log lines, 26 configs), 449 s; Intel
+  `fesom_lifecycle_native_mr` sha256 `5a43ca392d64eebe…`. Scripts `/work/ab0995/a270088/fesom3_se_ref/jobs/
+  t22_np8.sbatch`, `t22_np128.sbatch`, `t22_diag.sbatch`, `t22_where.sbatch`, `t22_gate2.sbatch`,
+  `t22_np128b.sbatch`, `t22_final.sbatch`; run dirs `/scratch/a/a270088/se_t22/`. Stage 2 cost: 1.0 node-h (the
+  two np 128 jobs 0.13)
 
 ### Stage 3 — zstar
 *Make "switch zstar on" a tested fact.*
@@ -776,6 +827,10 @@ sbatch at a time or in a short chain; each wait is a background `sacct` watcher.
 - [ ] per screen, record: max|η| over time, cold-start peak, max CFL_z, max|uv|, divsum, SE_CHECK, NaN. Decide
   whether the linear viscosity suffices (⚠️ if (a) misbehaves: try the γ1 term in the same gather operator, as a
   new task)
+- ➕ ⚠️ from Task 2.2 (480 steps, np 8): (a) χ = 0.1, M = 50 blows up at step 337 (grid-scale η on the 20 m
+  Antarctic shelf near 74°W 72°S); (b) M = M_min = 35 blows up at step 5 at χ = 0.1 (the guard is not a stability
+  limit); (c) `se_visc_ah = 0` blows up at step 298; M = 100 at step 192. χ = 0.25 and `se_visc_ah = 0.1` run 480
+  steps. So the screens start from a decision on the default χ / `se_visc_ah` (and the guard's safety factor)
 
 #### Task 5.2: 1-year SE vs SI twin (linfs)
 
