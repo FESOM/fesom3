@@ -4,8 +4,9 @@
 # TKE, GM + Redi, splines, vector-invariant momentum with rvo_upwind 1, w split, SW penetration, STEP_DIAG
 # on), Δt 1800 s, a cold start, one compute node, np 128, the cases of $CASES one after the other:
 #   si     the semi-implicit CG solve, linfs (the baseline)
-#   se_a   SE at the defaults (chi 0.25, M 50, se_visc_ah 0.01), linfs, FESOM3_SE_CHECK=1
-#   se_b   SE with M = M_min of the CFL guard (FESOM3_SE_M=48 at chi 0.25 on CORE2), linfs, SE_CHECK
+#   se_a   SE at the defaults (chi 0.25 in Task 5.1, 0.1 since Task 5.8; M 50, se_visc_ah 0.01), linfs, SE_CHECK=1
+#   se_b   SE with M = M_min of the CFL guard (FESOM3_SE_M=48 at chi 0.25 on CORE2; at the default chi 0.1 that
+#          is M = 48 above M_min 40: set FESOM3_SE_CHI=0.25 to repeat the Task 5.1 case), linfs, SE_CHECK
 #   se_c   SE without the barotropic viscosity (FESOM3_SE_VISC_AH=0), linfs, SE_CHECK
 #   se_z   SE at the defaults under zstar (the zstar headline), SE_CHECK (+ SE_CHECK_TAIL)
 #   si_z   the semi-implicit CG solve under zstar (the baseline of se_z)

@@ -567,7 +567,7 @@ A η = −I(Hⁿ·(−g∇η))/areasvol, by 100 power iterations (ω_max; one al
 iteration). It then sets M_min = ⌈τ·ω_max/(s·a_crit(χ))⌉, where a_crit is the AB3–AM4 stability
 limit for one oscillator (Schur–Cohn test of the characteristic polynomial: 1.853 / 1.700 / 1.648 /
 1.579 / 1.329 at χ = 0 / 0.05 / 0.07 / 0.1 / 0.25) and s = 0.9. CORE2 at Δt = 1800 s: ω_max = 3.15e-2 s⁻¹,
-M_min = 48 at the default χ = 0.25, 40 / 39 / 38 at χ = 0.1 / 0.07 / 0.05 (0.06 s at np 8). A smaller
+M_min = 40 at the default χ = 0.1, 39 / 38 at χ = 0.07 / 0.05 and 48 at χ = 0.25 (0.06 s at np 8). A smaller
 M stops the run unless `FESOM3_SE_M_FORCE=1`. The resolution estimate 0.5·res/√(gH) used before is not
 a stability limit (LESSONS L72).
 
@@ -579,7 +579,7 @@ prints nothing when off):
 | `FESOM3_SSH_SE` | 0 | 1 = split-explicit, 0 = CG; any other value stops |
 | `FESOM3_SE_M` | 50 | substeps per baroclinic step (≥ the CFL-guard minimum) |
 | `FESOM3_SE_M_FORCE` | 0 | 1 = run below the CFL-guard minimum (with a warning) |
-| `FESOM3_SE_CHI` | 0.25 | dissipation parameter χ, 0 ≤ χ ≤ 0.25 (0.1 until 2026-10-18). Mesh-dependent: use the smallest value that is stable on the mesh (CORE2: open, see below) |
+| `FESOM3_SE_CHI` | 0.1 | dissipation parameter χ, 0 ≤ χ ≤ 0.25 (0.25 from plan Task 5.0 to Task 5.8). Mesh-dependent: use the smallest value that is stable on the mesh (CORE2 with the drag: 0.1, see below) |
 | `FESOM3_SE_VISC_AH` | 0.01 | barotropic viscosity A_h = value·l [m/s]; 0 = off |
 | `FESOM3_SE_VISC_FLOW` | 0 | 1 = the flow-dependent viscosity in place of A_h (`FESOM3_SE_VISC_GAMMA0/1`, 10 / 2750) |
 | `FESOM3_SE_BOTTDRAG` | 1 | barotropic bottom drag in the substeps; 0 = none (the 3-D drag stays in F either way) |
@@ -609,7 +609,7 @@ drag off equals the straight run of the old binary). A resumed SE run equals the
   neither dhe nor the accumulated values are in the checkpoint (the resumed run departs at its first
   SSH solve). SE does not use the matrix, so SE-zstar is exact.
 
-**Default χ = 0.25: the blow-up at χ = 0.1 on CORE2.** With χ = 0.1 (the default until 2026-10-18),
+**The blow-up at χ = 0.1 without the drag (2026-10-18).** With χ = 0.1 (the first default),
 M 50 and `se_visc_ah` 0.01, a cold-started CORE2 run with production physics blows up at step 331–340
 (day 7), at np 8 and np 128, under linfs and zstar. The cause is a grid-scale gravity mode with a period of 3 baroclinic
 steps on the 20 m Antarctic shelf near 74°W 72°S under compact sea ice; it grows by 0.9 % per step.
@@ -639,8 +639,23 @@ max; its largest differences sit at 26°W 5°N in July (34 mm in the monthly mea
 χ = 0.25). **The 1-year zstar twin at χ = 0.05 blew up on day 229 (step 10989)**: max|η| began to
 alternate with a period of two baroclinic steps at step 10966 and grew by about 15 % per step until
 the overflow; its July mean already differed from SI zstar by 40 mm SSH and 1.7 °C at 85 m at
-25°W 5°N. So χ = 0.05 is too small for CORE2, and the smallest χ that is stable for a year under both
-linfs and zstar is not yet known (0.07 and 0.1 have only the 480-step screens; the year at χ = 0.25 ran
-only under linfs and without the drag). The drag costs 0.2–0.3 ms/step of the barotropic substeps at
+25°W 5°N. So χ = 0.05 is too small for CORE2 (the event is located below). The drag costs 0.2–0.3 ms/step of the barotropic substeps at
 np 128 (twin: SE barotropic 10.8 ms/step, the SSH phase 13.4 ms/step, loop 148.3 vs SI's 143.9 ms/step).
 LESSONS L75, L76; plan Tasks 5.4–5.6; question packet §6.
+
+**The zstar blow-up at χ = 0.05 and the default χ = 0.1 (plan Tasks 5.7, 5.8, 2026-10-18).** A replay
+from a day-220 checkpoint reproduces the failed year line for line and locates the event. It is not
+in the equatorial Atlantic but on one 30 m Kara-shelf node (75.65°E 74.53°N, 4 layers, under sea ice
+in the Ob–Yenisei plume): a grid-scale barotropic mode at the baroclinic Nyquist frequency (η changes
+sign every step, the neighbours move against it), already 5–6 cm on day 220 and growing by
+0.5–1 %/step; monthly means average it out. From the same checkpoint the mode grows at χ = 0.05 (faster
+without the drag or at M = 100), is marginal at 0.07 and decays at 0.1 (−0.46 %/step) and 0.25
+(−3.3 %/step); cutting either sea-ice link does not stop it. A one-mode model with a force of ≈ 0.8 %
+of the step-start elevation, frozen over the step, reproduces all these rates (the SM damping at
+ωτ = π is ≈ χπ²/M per step). The likely source is the zstar baroclinic pressure gradient, computed once
+per step from the step-start layers (a hypothesis, not tested by a switch). The zstar year at χ = 0.1
+runs clean: annual-mean SSH SE − SI rms 0.106 mm, max 1.74 mm; temp rms 3.7e-3 °C in the top 100 m;
+the same global salt drift; sea-ice area within 0.009 × 10⁶ km²; the July anomaly at 25°W 5°N is
+9–20 mm (27–40 mm at χ = 0.05). Loop 153.4 vs SI zstar's 149.1 ms/step (SSH phase 13.8 vs 9.5). So
+χ = 0.1 is the default since Task 5.8; linfs has clean years at χ = 0.05 (with the drag) and 0.25
+(without). LESSONS L77; plan Tasks 5.7, 5.8.

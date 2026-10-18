@@ -6,8 +6,8 @@ program test_ssh_se
     !   C1  the SM coefficients at chi = 0.1 equal the literal numbers worked out by hand from
     !       the notes (beta = 0.281105, zeta = -0.003689497, gamma = 0.0320866, delta =
     !       0.724707606; relative 1e-9), which catches a typo in a constant; at chi = 0 the
-    !       constant terms (zeta = 0.00976186, gamma = 0.083445, delta = 0.60296872); at the
-    !       default chi = 0.25 zeta = -0.0238665325, gamma = -0.044951, delta = 0.907315935. The
+    !       constant terms (zeta = 0.00976186, gamma = 0.083445, delta = 0.60296872); at
+    !       chi = 0.25 zeta = -0.0238665325, gamma = -0.044951, delta = 0.907315935. The
     !       AB3 and AM4 weights sum to 1.
     !   C2  knob parsing (se_parse_knob): every bad value is rejected (ok = .false., the t_dyn
     !       field unchanged, the message starts with the knob name); se_read_env and
@@ -27,7 +27,7 @@ program test_ssh_se
     !          Rayleigh quotient sqrt of the hashed vectors, identical on every rank (MIN == MAX)
     !          like M_min; np > 1 against the np 1 value (file FESOM3_TEST_SE_P4REF//'.c3', written
     !          by np 1): omega_max to 1e-12 relative, M_min equal;
-    !       d) at the default chi = 0.25, M_min = ceiling(tau*omega_max/(s*a_crit)):
+    !       d) at the default chi = 0.1, M_min = ceiling(tau*omega_max/(s*a_crit)):
     !          tau/M_min <= s*a_crit/omega_max < tau/(M_min - 1), M_min > 1 on pi, and the
     !          decision: SE_CFL_DIE for M = 1 and M_min - 1, SE_CFL_FORCED with
     !          FESOM3_SE_M_FORCE, SE_CFL_OK for M_min, 40 and 50;
@@ -394,8 +394,8 @@ contains
         call MPI_Allreduce(MPI_IN_PLACE, ll, 2, MPI_WP, MPI_MAX, partit%MPI_COMM_FESOM, ierr)
         call check(ll(1) == omega .and. -ll(2) == omega, 'C3c omega_max identical on every rank', partit%mype)
 
-        ! ---- d) M_min and the decision (chi = 0.25, the se_init default) ----
-        call check(dbase%se_chi == 0.25_WP, 'C3d chi = 0.25 (the default)', partit%mype)
+        ! ---- d) M_min and the decision (chi = 0.1, the se_init default) ----
+        call check(dbase%se_chi == 0.1_WP, 'C3d chi = 0.1 (the default)', partit%mype)
         acd   = se_cfl_acrit(dbase%se_chi)
         lim   = SE_CFL_SAFETY*acd/omega
         M_min = se_cfl_m_min(dt, lim)
@@ -420,7 +420,7 @@ contains
         call check(se_cfl_m_min(dt, huge(1.0_WP)) == 1, 'C3d no limit: M_min = 1', partit%mype)
         if (partit%mype == 0) write(*,'(a,f0.1,a,es14.7,a,es8.1,a,f6.4,a,f4.2,a,f0.3,a,i0)') &
             'test_ssh_se: C3 pi, tau = ', dt, ' s: omega_max = ', omega, ' 1/s (last change ', relchg, &
-            '), a_crit(0.25) = ', acd, ', s = ', SE_CFL_SAFETY, ' -> dtbt <= ', lim, ' s, M_min = ', M_min
+            '), a_crit(0.1) = ', acd, ', s = ', SE_CFL_SAFETY, ' -> dtbt <= ', lim, ' s, M_min = ', M_min
 
         ! ---- c) np > 1 against np 1 (the file next to the P4 reference) ----
         path = ''
@@ -566,10 +566,10 @@ contains
 
         call check(dyn%use_ssh_se .and. dyn%se_ready, 'C4 use_ssh_se and se_ready', partit%mype)
         call check(dyn%se_M == 40, 'C4 FESOM3_SE_M=40 from the environment', partit%mype)
-        call check(dyn%se_chi == 0.25_WP .and. dyn%se_visc_ah == 0.01_WP .and. .not. dyn%se_check &
+        call check(dyn%se_chi == 0.1_WP .and. dyn%se_visc_ah == 0.01_WP .and. .not. dyn%se_check &
                    .and. .not. dyn%se_m_force .and. dyn%se_bottdrag .and. .not. dyn%se_visc_flow, &
                    'C4 unset knobs keep the defaults', partit%mype)
-        call se_sm_coeffs(0.25_WP, b, z, gm, d)
+        call se_sm_coeffs(0.1_WP, b, z, gm, d)
         call check(dyn%se_beta == b .and. dyn%se_zeta == z .and. dyn%se_gamma == gm .and. &
                    dyn%se_delta == d, 'C4 the coefficients in t_dyn', partit%mype)
         ! extents (Technical Details §1)

@@ -50,11 +50,13 @@ module oce_ssh_se
     !   FESOM3_SSH_SE      0 (default) = semi-implicit CG, 1 = split-explicit
     !   FESOM3_SE_M        substeps per baroclinic step, an integer >= 1              default 50
     !   FESOM3_SE_M_FORCE  1 = run with M below the CFL-guard minimum (0/1)           default 0
-    !   FESOM3_SE_CHI      SM dissipation parameter, 0 <= chi <= 0.25                 default 0.25
-    !                      (0.1 until 2026-10-18: a cold CORE2 run blew up at step ~335 through
-    !                      the sea ice, plan Task 5.1 note; 0.25 damps that shelf mode). chi is
-    !                      mesh-dependent: use the smallest value that is stable on the mesh
-    !                      (minimal dissipation; Sergey Danilov, 2026-10-18; plan Task 5.5)
+    !   FESOM3_SE_CHI      SM dissipation parameter, 0 <= chi <= 0.25                 default 0.1
+    !                      chi is mesh-dependent: use the smallest value that is stable on the
+    !                      mesh (minimal dissipation; Sergey Danilov, 2026-10-18; plan Task 5.5).
+    !                      CORE2 with the barotropic drag: 0.1, the smallest chi with a clean zstar
+    !                      year (0.05 blew one up on day 229, 0.07 is marginal; plan Tasks 5.7, 5.8).
+    !                      From Task 5.0 to Task 5.8 the default was 0.25 (0.1 without the drag blew
+    !                      up a cold CORE2 run at step ~335 through the sea ice, plan Task 5.1 note)
     !   FESOM3_SE_VISC_AH  BT viscosity A_h = value*l_e [m/s], >= 0; 0 = off          default 0.01
     !   FESOM3_SE_VISC_FLOW 1 = the flow-dependent BT viscosity W of se_visc_flow in place of
     !                      the linear A_h (0/1)                                       default 0
@@ -184,7 +186,7 @@ contains
 
     !===========================================================================
     subroutine se_read_env(dyn, partit)
-        ! The FESOM3_SE_* knobs into dyn; an unset knob keeps its t_dyn default (M 50, chi 0.25,
+        ! The FESOM3_SE_* knobs into dyn; an unset knob keeps its t_dyn default (M 50, chi 0.1,
         ! visc_ah 0.01, the linear viscosity, gamma0 10, gamma1 2750, the bottom drag on, check and
         ! force off). Stops
         ! on a bad value and on a set knob that has no effect (se_knob_conflict). Called by se_init.

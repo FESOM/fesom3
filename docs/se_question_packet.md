@@ -12,7 +12,7 @@ step block; the predictor and the ALE/tracer tail are unchanged. Off by default.
 - **Scheme:** the AB3–AM4 subcycling of Sergey's notes (Shchepetkin & McWilliams 2005; Banerjee et al.
   2024), β = 0.281105, ζ, γ, δ as functions of χ, M substeps of dtbt = τ/M. No averaging filter:
   ⟨⟨Ū⟩⟩ = Σ U*/M, η^{n+1} = η^M, and `eta_n` = `hbar` = η^M at integer levels. Defaults χ = 0.25
-  (0.1 until 2026-10-18, see section 3), M = 50.
+  (0.1 until 2026-10-18, see section 3; ➕ 0.1 again since plan Task 5.8, section 6), M = 50.
 - **Transports and forcing:** Ū = Σₖ helem·u, R = Σₖ helemⁿ·UV_rhs, where UV_rhs is the full 3-D
   predictor increment (`compute_vel_rhs` with the vector-invariant momentum advection and
   `rvo_upwind` 1, `viscosity_filter`, the implicit vertical viscosity and the explicit bottom drag).

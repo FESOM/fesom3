@@ -67,9 +67,9 @@
 #       1000 steps, np 1, M = 50; Task 1.5, job 28217370): max etacomp 5.0e-15 m, trim 5.7e-13 m^2/s,
 #       |msl| 3.5e-16 m (default; vinv+ice 4.8e-15, 4.5e-13, 2.9e-16), spreads 0. Heat/salt drift
 #       -3.68e-4/-1.59e-6 (SI linfs: -3.69e-4/-1.60e-6).
-#   The SE blocks run at the solver's DEFAULT knobs (no FESOM3_SE_CHI etc.), so since 2026-10-18 (plan Task 5.0)
-#   at chi = 0.25 instead of 0.1; the levels quoted here are the chi = 0.1 ones, and the chi = 0.25 20-step maxima
-#   are at the same level (job 28220536: etacomp <= 2.1e-15 m, trim <= 2.3e-13 m^2/s, |msl| <= 1.3e-16 m).
+#   The SE blocks run at the solver's DEFAULT knobs (no FESOM3_SE_CHI etc.): chi = 0.1, which the levels quoted
+#   here were measured at (plan Task 5.8; from Task 5.0 to Task 5.8 the default was 0.25, and the chi = 0.25 20-step
+#   maxima are at the same level (job 28220536: etacomp <= 2.1e-15 m, trim <= 2.3e-13 m^2/s, |msl| <= 1.3e-16 m).
 #
 #   zstar + split-explicit (SE), np 1/2/8 -> the split-explicit solver under zstar (Task 3.1/3.2): the HARD
 #       conservation gate of the zstar cases (FESOM3_CONSERVE_TOL=$TOL; heat, salt and volume) plus the SE_CHECK

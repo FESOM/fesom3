@@ -131,7 +131,7 @@ GMD 17, 7051). Afterwards the 3-D velocities are trimmed to the time-mean transp
 
 | # | fork | decision |
 |---|---|---|
-| D1 | time stepping | SM AB3–AM4 as in the notes, no filtering, χ = 0.1, M per mesh with a startup CFL guard (➕ default χ = 0.25 since 2026-10-18, Task 5.0; ➕ Task 5.5: χ is mesh-dependent, use the smallest stable value per mesh; CORE2 with the drag: > 0.05 (the zstar year at 0.05 blew up, Task 5.6), the value is open; the code default stays 0.25; ➕ Task 5.7: 0.1 (the zstar year clean, the Kara-shelf mode decays; 0.07 marginal), the default Nikolay's call) |
+| D1 | time stepping | SM AB3–AM4 as in the notes, no filtering, χ = 0.1, M per mesh with a startup CFL guard (➕ default χ = 0.25 since 2026-10-18, Task 5.0; ➕ Task 5.5: χ is mesh-dependent, use the smallest stable value per mesh; CORE2 with the drag: > 0.05 (the zstar year at 0.05 blew up, Task 5.6), the value is open; the code default stays 0.25; ➕ Task 5.7: 0.1 (the zstar year clean, the Kara-shelf mode decays; 0.07 marginal), the default Nikolay's call; ➕ Task 5.8: default χ = 0.1, Nikolay 2026-10-18) |
 | D2 | shared elements | sync the barotropic forcing F **once per step** (one owner). Every per-substep element operator is a per-element **gather** in fixed slot order, so the copies stay bitwise equal by construction; the copy spreads of Ū and ⟨⟨Ū⟩⟩ (= 0) prove it. Per substep: `exchange_nod(η)` + `exchange_elem(Ū)`. The trim keeps update_vel's uv sync |
 | D3 | BT depth | H_e(η) = Hⁿ_e + Σ_v elem_w·c_{e,v}·(η_v − ηⁿ_v): the zstar law under the vertex bottom. c is recomputed once per step from zbar_3d_nⁿ; linfs is c ≡ 0. One depth function, no mode branch in the substep loop |
 | D4 | Coriolis in r | stored sum (port_kokkos D4): šⁿ = Σhelemⁿ·uv^{n−1/2}, r_cor = f×(a₂šⁿ + a₁š^{n−1}). Exact under linfs, second order under zstar. `compute_vel_rhs` untouched. ➕ Replaced by Task 5.4 (Sergey, Q3/Q5): r_cor = f e_z×U\*⁰, the barotropic Coriolis of the first substep; it blew up every cold CORE2 run. ➕ **Restored by Task 5.5** (commit 55f717b; the scheme's author: the first-substep form is unstable without a filter, D4 = Coriolis kept out of R̄ as in Banerjee et al. 2024) |
@@ -1541,7 +1541,7 @@ pick χ = 0.05, but the zstar year at χ = 0.05 blew up (Task 5.6), so the CORE2
   to SI as the χ = 0.25 year without the drag, far inside SI's own np spread, except one July event at 26°W 5°N
   (equatorial Atlantic, 4400 m): monthly-mean SSH +34 mm and temp at 85 m +1.6 °C against SI (χ 0.25: 6 mm), gone
   by August (7.5 mm)
-- [ ] ⚠️ the default χ: **not changed** (0.25 in code). χ = 0.05 is too small for CORE2 (Task 5.6: the zstar year
+- [x] the default χ: **not changed** (0.25 in code) ➕ (0.1 since Task 5.8). χ = 0.05 is too small for CORE2 (Task 5.6: the zstar year
   blew up). The smallest χ clean for a year under both linfs and zstar is open: next, a zstar year at χ = 0.1
   (and 0.07), ≈ 0.76 node-h each (Nikolay's call; commands in the HANDOFF). ➕ Task 5.7: the zstar year at 0.1 is
   clean, recommendation 0.1 (the default stays open)
@@ -1685,13 +1685,27 @@ it and runs the zstar year clean.
   drag −3.4 / −6.1 mm. At the Kara node the monthly SSH of SE χ 0.1 equals SI zstar to ≤ 2.4 mm (Jan) and ≤ 0.4 mm
   from February on. **Reading:** the zstar year at χ 0.1 is as close to SI zstar as the linfs year at χ 0.05 is to SI
   linfs, with a smaller July event
-- [ ] ⚠️ **the default χ (Nikolay's call):** the code default stays 0.25. Recommendation: **χ = 0.1 for CORE2** (the
+- [x] **the default χ (Nikolay's call):** ➕ Nikolay 2026-10-18: χ = 0.1 → Task 5.8. Recommendation: **χ = 0.1 for CORE2** (the
   smallest χ whose replay decays the Kara mode and whose zstar year is clean; 0.07 is marginal, +0.1 … +0.3 %/step for
   11 days at the event; a linfs year at 0.1 was not run, linfs at 0.05 passed). The margin is modest: at the event
   χ 0.1 decays the mode at −0.46 %/step against ≈ +1.6 %/step of drive (toy), χ 0.25 at −3.4 %/step. Open: test the zstar-PGF
   hypothesis with a debug switch (the PGF on the step-start geometry without the η part), and a linfs replay at χ 0.05
 - Task 5.7 cost: **1.58 node-h** (28228214 0.70, 28228604 0.0004, 28228624 0.07, 28228601 0.79, 28229080 0.015;
   AllocCPUS/256 × elapsed)
+
+#### ➕ Task 5.8: default χ = 0.1
+
+*Nikolay, 2026-10-18: "let's default χ be 0.1 for now".* The reverse of Task 5.0 at the CORE2 value of Task 5.7.
+
+**Files:** `src/types/mod_dyn.F90` (`se_chi = 0.1`), `src/oce/oce_ssh_se.F90` (knob comments), `test/test_ssh_se.F90`
+(C3d and C4 check the new default; C1 keeps its χ = 0.25 literals), comments of `tools/run_conserve_pi.sh` and
+`tools/run_se_screen_core2.sbatch`, README, IMPLEMENTATION §14, TESTING §6c, HANDOFF, the question packet.
+
+- [x] the default χ = 0.1 in code, tests, tool comments and docs
+- [ ] verify (`/work/ab0995/a270088/fesom3_se_ref/jobs/s5_H_verify.sbatch` = the Task 5.5 set without the
+  old-checkpoint case): ctest Intel all pass, GNU only the 6 known failures; G0 GREEN; `run_conserve_pi.sh` GATE OK;
+  SE restart gates linfs and zstar np 2 and multirank np 2 → 8 GREEN; round trip GREEN; CORE2 `prod_env 1e-5` np 8,
+  48 steps at the defaults (linfs, zstar): the guard prints `chi = 0.1000` and `M_min = 40`, SE_CHECK at the gate levels
 
 ### Stage 6 — Verify and document
 
@@ -1728,7 +1742,8 @@ sha256 `01e1d34f709fb0e0…`, `fesom_conserve` `1edbc30ba0f7ef18…`.
   - [x] G3 numbers recorded (Stage 5 approved by Nikolay 2026-10-18): Task 5.1 screens, Task 5.2 twin (annual-mean
     SSH SE − SI rms 0.110 mm, max 1.56 mm), Task 5.3 cost (SE SSH phase +3.55 ms/step at np 128, loop +2.9 %);
     ➕ Tasks 5.5/5.6 (D4 + drag): linfs year at χ 0.05 rms 0.110 mm, max 2.45 mm; ⚠️ the zstar year at χ 0.05 blew
-    up on day 229, a zstar year at a larger χ is open
+    up on day 229, a zstar year at a larger χ is open ➕ Task 5.7: the zstar year at χ 0.1 is clean (rms 0.106 mm,
+    max 1.74 mm); Task 5.8: default χ = 0.1
 - [x] full ctest Intel + GNU, `run_g0_se.sh`, conserve_pi, restart gates, `run_tri_regression.sh` (`NEW_BIN=` this
   build). **ctest Intel 176/176** (32 s); **GNU 170/176, exactly the 6 known failures** (`test_wimpl_tra_np1/np2`,
   `meshdiag_mixed/quad/pi_w`, `test_shared_elem_np1`; the serial rerun fails the same 6, no flake this time);
@@ -1822,7 +1837,7 @@ and halo exchange of uv. No global reductions outside SE_CHECK and the one-off C
 | `FESOM3_SSH_SE` | 0 | 1 = split-explicit |
 | `FESOM3_SE_M` | 50 | substeps per baroclinic step |
 | `FESOM3_SE_M_FORCE` | 0 | 1 = run below the CFL-guard minimum |
-| `FESOM3_SE_CHI` | 0.25 | SM dissipation parameter (➕ Task 5.0; 0.1 until 2026-10-18); ➕ mesh-dependent, the smallest stable value per mesh (CORE2 with the drag: above 0.05, open; Tasks 5.5/5.6) |
+| `FESOM3_SE_CHI` | 0.1 | SM dissipation parameter (➕ Task 5.0: 0.25; ➕ Task 5.8: 0.1 again); ➕ mesh-dependent, the smallest stable value per mesh (CORE2 with the drag: 0.1, Tasks 5.5–5.8) |
 | `FESOM3_SE_VISC_AH` | 0.01 | A_h = value·l_e (m/s); 0 = no BT viscosity |
 | `FESOM3_SE_VISC_FLOW` | 0 | 1 = the flow-dependent viscosity (`FESOM3_SE_VISC_GAMMA0/1`, 10 / 2750) in place of A_h |
 | `FESOM3_SE_BOTTDRAG` | 1 | ➕ Task 5.4: 1 = BT bottom drag D(Ūᵐ − Ūⁿ) in the substeps, 0 = none |

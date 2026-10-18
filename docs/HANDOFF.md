@@ -5,16 +5,15 @@ Full pre-M2.12 milestone detail + the per-gate recipes live in [`HANDOFF-archive
 
 ## Where we are
 
-- **Split-explicit barotropic solver — Stages 0–4 DONE, Stage 6 DONE except the G3 numbers, Stage 5 RUNNING
-  (2026-10-18, branch `split-explicit`, worktree `/work/ab0995/a270088/fesom3_se`, unpushed):** SE subcycling after
-  Sergey's notes (`FESOM3_SSH_SE=1`), linfs and zstar, any np, exact restarts; SE off byte-identical to main. At χ = 0.1
-  a cold CORE2 run blows up at step ~335 (sea-ice feedback, no code defect); Nikolay approved Stage 5 on 2026-10-18 and
-  chose χ = 0.25 as the default (Task 5.0 done, re-verified); the 3000-step screens run stably (Task 5.1); next the
-  1-year twin and perf → section "Split-explicit barotropic solver". Task 5.4 (commit 6a76b29) added the barotropic
-  bottom drag (kept) and a first-substep Coriolis r-term (blew up at every χ); Task 5.5 (commit 55f717b) restored the
-  stored-sum Coriolis (D4) with the drag, gated GREEN. ⚠️ Smallest stable χ on CORE2 open: χ 0.05 passes the
-  480/3000-step screens and the linfs year, but the zstar year at 0.05 blew up on day 229 (Task 5.6); next a zstar
-  year at χ 0.1 (≈ 0.76 node-h, needs a yes). Default χ unchanged (0.25).
+- **Split-explicit barotropic solver — Stages 0–5 DONE, Stage 6 DONE except the plan move (2026-10-18, branch `split-explicit`, worktree
+  `/work/ab0995/a270088/fesom3_se`, unpushed):** SE subcycling after Sergey's notes (SESM, `FESOM3_SSH_SE=1`), linfs
+  and zstar, any np, exact restarts; SE off byte-identical to main. Task 5.4 added the barotropic bottom drag (kept);
+  Task 5.5 (commit 55f717b) restored the stored-sum Coriolis (D4) with the drag. χ 0.05 passes the screens and the
+  linfs year, but its zstar year blew up on day 229 (Task 5.6): a grid-scale mode on one 30 m Kara-shelf node at the
+  baroclinic Nyquist frequency, located by a checkpoint replay (Task 5.7). The zstar year at χ 0.1 runs clean
+  (SE − SI annual-mean SSH rms 0.106 mm). **Default χ = 0.1 since Task 5.8 (Nikolay 2026-10-18)**; ⚠️ its gate job
+  `fesom3_se_ref/jobs/s5_H_verify.sbatch` to run. Open: the zstar-PGF hypothesis (debug switch), Sergey's reply on χ
+  and the PGF, plan → completed/, push/PR (Nikolay) → section "Split-explicit barotropic solver".
 - **Shared-element velocity sync ✅ DONE (2026-10-12, plan `plans/completed/20261012-shared-element-sync.md`,
   on `bottom-at-vertices`):** a border element is owned by every rank that owns one of its vertices;
   `update_vel` now gives every such element one owner for `uv` (the highest vertex-owner rank, whose copy
@@ -411,17 +410,18 @@ node-h in total).**
    Task 5.4 debug runs); gates GREEN (job 28227204, frozen `bin_s5f_28227204`); minimal-χ screens: χ 0.05/0.07/0.1/0.25
    all decay over 480 steps, χ 0.05 clean for 3000 steps under linfs and zstar; linfs year at χ 0.05: SSH SE − SI rms
    0.110 mm, max 2.45 mm (a July event at 26°W 5°N, 34 mm). ⚠️ Task 5.6: SI zstar year fine; SE zstar year at χ 0.05
-   blew up at step 10989 (2-step oscillation, ~15 %/step, likely the same equatorial-Atlantic spot). Open: SE zstar
-   year at χ 0.1 (then 0.07) — `cd /work/ab0995/a270088/fesom3_se_ref/jobs && sbatch -J s5_F_twin_se_zstar
-   s5_F_twin.sbatch se zstar /work/ab0995/a270088/fesom3_se_ref/bin_s5f_28227204 0.1`, then `sbatch s5_F_diff.sbatch
-   /scratch/a/a270088/se_s5f/twin_si_zstar_28227175 /scratch/a/a270088/se_s5f/twin_se_zstar_<jobid> SIz,SEz010
-   se_si_zstar_chi010`; then the default χ (Nikolay), Task 6.1's last box, the plan to `completed/`, a tag, the
-   memory update. Later: JAX port of SE (bitwise against this code), NEMO SE, storing M/χ in the checkpoint.
+   blew up at step 10989 (2-step oscillation, ~15 %/step). ✅ Task 5.7 (3a95def, 1.58 node-h): a checkpoint replay
+   located it on one 30 m Kara-shelf node (a grid-scale mode at the baroclinic Nyquist frequency, not the equatorial
+   Atlantic); χ 0.1 decays it, and the SE zstar year at χ 0.1 is clean (`se_s5g/twin_se_zstar_28228601`, SE − SI
+   SSH rms 0.106 mm). ✅ Task 5.8: default χ = 0.1 (Nikolay); gate job `jobs/s5_H_verify.sbatch` (Nikolay submits).
+   Then Task 6.1's last box, the plan to `completed/`, a tag, push/PR (Nikolay's yes, exact text first). Later: the
+   zstar-PGF debug switch, JAX port of SE (bitwise against this code), NEMO SE, storing M/χ in the checkpoint.
 
 **Gotchas.**
-- χ = 0.1 (the default until 2026-10-18) blows up a cold CORE2 production-physics run near step 335 without the
-  barotropic drag; with the drag (default since Task 5.4) it decays. The default is 0.25 (Task 5.0). χ = 0.05 with the
-  drag blew up a zstar year on day 229 although 3000-step screens were clean: screen χ with a full year under zstar.
+- χ = 0.1 blows up a cold CORE2 production-physics run near step 335 without the barotropic drag; with the drag
+  (default since Task 5.4) it decays. The default is 0.1 (Task 5.8; 0.25 from Task 5.0 to 5.8). χ = 0.05 with the
+  drag blew up a zstar year on day 229 although 3000-step screens were clean: screen χ with a full year under zstar,
+  and look for period-2 modes in per-step SSH, not in the step lines' global max|η| or in monthly means (L77).
   Runs that set `FESOM3_SE_CHI` explicitly keep their value.
 - M and χ must stay fixed across a restart chain (not stored, not checked); SE → SI is not detected.
 - The restart gate scripts default to a stale `F3`: always pass `F3=` and `BUILD=`. They `rm -rf` their run dir:
