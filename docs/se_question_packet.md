@@ -228,4 +228,17 @@ velocities are made consistent with the barotropic ones before the next 3-D step
   AB2 Coriolis in R acts on, carries the step-averaged fast mode, while the first-substep subtraction uses the
   instantaneous Ū; with the stored sums (D4) the two cancel exactly whatever the 3-D velocity holds.
 - ➕ Next test (not started): re-trim the 3-D velocities to Ū^{n+1/2} after the tracers, then re-screen the
-  first-substep Coriolis of answer 5 with the drag, at χ = 0.07 (the papers' value), 0.1 and 0.25.
+  first-substep Coriolis of answer 5 with the drag, at χ = 0.07 (the papers' value), 0.1 and 0.25. Superseded by
+  the next answer: with the Coriolis kept out of the barotropic forcing (D4) the re-trim is not needed.
+
+**Follow-up question 1 (the first-substep Coriolis).** That form is unstable. Subtract a stable estimate of the
+barotropic Coriolis instead, for example an AB2 from the barotropic transports at the end of the previous step and
+at step n, or keep everything as in Banerjee et al.; his suggestion was meant as the simpler option.
+
+- The first-substep value f e_z×U*⁰ is expected to be unstable; Task 5.4's blow-ups agree.
+- Two acceptable forms: (i) subtract an AB2 estimate of the barotropic Coriolis from the end-of-step barotropic
+  transports, f e_z×[(3/2+ε)Ūⁿ − (1/2+ε)Ūⁿ⁻¹] (one more stored 2-D field); or (ii) keep the Coriolis term out of
+  R̄ as in Banerjee et al. (2024, §2.1). FESOM_F's stored sums (D4) are (ii): they remove the vertically integrated
+  3-D AB2 Coriolis exactly (linfs; O(Δh·Δu) under zstar). Answer 5 was meant as a simplification, not a
+  requirement; in FESOM_F (i) costs the same storage as D4 and removes less. This points to D4 + the barotropic
+  drag (answer 3), the variant screened stable for 3000 steps at χ = 0.1 and 0.25 in Task 5.4 (Nikolay decides).
