@@ -1008,13 +1008,37 @@ M = 35 blows up at step 5 at χ = 0.1. The defaults (χ 0.1, M 50, `se_visc_ah` 
   (AB2/AB3 28/32 fields unchanged); GATE GREEN, 33 s, job 28218753. ctest unchanged (176): **Intel 176/176, GNU
   170/176 (the 6 known failures)**, job 28218753; Intel `fesom_lifecycle_native_mr` sha256 `c27836e46fd1331e…`
 
-#### Task 4.3: GATE Stage 4 — restart exactness
+#### Task 4.3: GATE Stage 4 — restart exactness ✅
 
-- [ ] `F3=<worktree> run_restart_gate_core2.sh` with SE on (default N = 4, K = 2, plus the month-boundary split):
-  linfs np 1 and np 2 → max|Δ| = 0 over the full state including the SE rings; the same for zstar
-- [ ] `run_restart_gate_multirank.sh` (np 2 → np 8 round trip) with SE: max|Δ| = 0
-- [ ] an SI checkpoint read with SE on dies with the message above (one-off; record it)
-- [ ] G0 (SE off: the registered set is unchanged, so old checkpoints still read)
+All in job 28218753 (shared, 32 cores, 10.8 min, 0.14 node-h; script and logs
+`/work/ab0995/a270088/fesom3_se_t02_jobs/t43_gate.sbatch`, `t42_*`, `t43_*`; run dirs
+`/scratch/a/a270088/se_t43/t4[23]_*_28218753`). CORE2, the gates' default lifecycle physics, `FESOM3_SSH_SE=1
+FESOM3_SE_CHECK=1`, M = 50, χ = 0.1, visc_ah = 0.01 unless stated, Intel build of commit 77988a7's tree.
+- [x] `F3=<worktree> run_restart_gate_core2.sh` with SE on (default N = 4, K = 2, plus the month-boundary split):
+  linfs np 1 and np 2 → max|Δ| = 0 over the full state including the SE rings; the same for zstar. **All GREEN,
+  max|Δ| = 0**, mid-run and month-boundary (Feb slice 2 read in both legs): checkpoint compare over all 37 stores
+  (the 10 SE stores included) and the live `FESOM_DUMP_ALL` node dumps (1 395 438 records per case):
+  - linfs np 1 218 s, linfs np 2 152 s;
+  - **zstar np 1 223 s, zstar np 2 160 s**: unlike SI-zstar (Task 4.1: the stiffness state), the SE zstar
+    restart is exact, as expected (SE skips `update_stiff_mat_ale` and the CG solve);
+  - ➕ linfs np 2 with `FESOM3_SE_VISC_AH=0` (stale eDim entries of the Ū ring in the straight run, owner values in
+    the resumed one): GREEN, 145 s;
+  - ➕ in every case the SE_CHECK (and zstar SE_CHECK_TAIL) lines of the straight run's steps 3-4 equal the
+    resumed segment's steps 1-2 token for token, without `msl=` and `fw=` (measured from each process's start, so
+    they legitimately differ: e.g. zstar np 2 step 3 msl −2.30e-18 straight vs −1.05e-17 resumed)
+
+  The N3 K2 diagnostic was not needed (no gate failed)
+- [x] `run_restart_gate_multirank.sh` (np 2 → np 8 round trip) with SE: max|Δ| = 0. **GREEN** for linfs (40 s),
+  ➕ zstar (28 s) and ➕ linfs visc_ah = 0 (30 s): C2(np 2) == C8(np 8) over all 37 stores
+- [x] an SI checkpoint read with SE on dies with the message above (one-off; record it). CORE2 np 2: SI, 2 steps
+  → checkpoint `fesom.1948.001.03600` (27 fields); the same dir resumed with `FESOM3_SSH_SE=1` stops with exit 1
+  and `[mod_io_zarr] error: restart_read: checkpoint has no split-explicit state: written with FESOM3_SSH_SE off;
+  SI<->SE restarts are not supported (…/t43_si2se_28218753//fesom.1948.001.03600)`, 20 s for both legs
+- [x] G0 (SE off: the registered set is unchanged, so old checkpoints still read). **G0 GREEN**, 265 s: linfs and
+  zstar CORE2 (99 checkpoint variables and 1 649 154 dump records max|Δ| = 0, 20 step lines equal), conserve
+  (249 lines, 26 configs). Stage 4 cost (Tasks 4.2-4.3 plus the step-0 check of the rebased branch, job 28218585:
+  ctest Intel 176/176, GNU 170/176 with the 6 known failures, `run_conserve_pi.sh` GATE OK with 36 configs, G0
+  GREEN): 0.25 node-h
 
 ### Stage 5 — Physics and performance (G3)
 *Costs node-hours: launch only after Nikolay's yes on the estimate below.*
