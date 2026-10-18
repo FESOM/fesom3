@@ -868,12 +868,60 @@ M = 35 blows up at step 5 at χ = 0.1. The defaults (χ 0.1, M 50, `se_visc_ah` 
   7.0e-19 m/s, hlaw 5.5e-12 m, spreads 0. Script `/work/ab0995/a270088/fesom3_se_t02_jobs/t31_build_ctest.sbatch` (logs `t31b_*`); debug jobs
   28218130, 28218139, 28218151, 28218161, 28218172/3
 
-#### Task 3.2: GATE Stage 3 — zstar np 1 and np > 1
+#### Task 3.2: GATE Stage 3 — zstar np 1 and np > 1 ✅
 
-- [ ] `run_conserve_pi.sh` zstar cases with SE (np 1/2/8): hard heat/salt conservation as in the existing zstar
-  cases; layer sum and w(1) at rounding
-- [ ] CORE2 zstar np 8 (480 steps) and np 1 (48 steps), SE_CHECK: all invariants and copy spreads; record the levels
-- [ ] G0
+**Files:**
+- Modify: `tools/run_conserve_pi.sh` (➕ the zstar SE block, its own `while read` list after the linfs SE block)
+
+- [x] `run_conserve_pi.sh` zstar cases with SE (np 1/2/8): hard heat/salt conservation as in the existing zstar
+  cases; layer sum and w(1) at rounding. The new block runs default np 1/2/8, vinv rvo_upwind 1 + ice np 1/8 and
+  GM + Redi + TKE + w split np 1 with `FESOM3_CONSERVE_TOL=$TOL` (heat, salt, volume) and gates the run maxima of
+  the SE_CHECK tokens (etacomp, trim, msl net of the freshwater, spreads exactly 0) and of the SE_CHECK_TAIL tokens
+  (laysum, w1, hlaw), one line of each per step. Levels over 1000 steps (job 28218186, M = 50, χ = 0.1, the six
+  configs; the 20-step gate cannot reach them): **etacomp 4.9e-15 m, trim 5.7e-13 m²/s, |msl| 6.9e-16 m, laysum
+  1.8e-11 m, w1 3.1e-18 m/s, hlaw 7.3e-12 m, spreads 0**; drift heat ≤ 6.4e-15, salt ≤ 1.6e-14, volume ≤ 4.3e-14
+  (SI zstar default np 1: 1.1e-14, 9.9e-15, 1.4e-14), ice masses ≤ 2.8e-15. Tolerances (×100): SE_Z_TOL_ETACOMP
+  5e-13, _TRIM 6e-11, _MSL 7e-14, _LAYSUM 2e-9, _W1 4e-16, _HLAW 8e-10. Final 20-step gate (job 28218430):
+  **GATE OK, 34 configs**; zstar SE: etacomp ≤ 2.5e-15 m, trim ≤ 1.7e-13 m²/s, |msl| ≤ 1.3e-16 m, laysum ≤ 4.5e-12
+  m, w1 ≤ 1.4e-18 m/s, hlaw 6.4e-12 m, spreads 0, heat/salt drift ≤ 3.2e-15 / 2.6e-14
+- [x] CORE2 zstar np 8 (480 steps) and np 1 (48 steps), SE_CHECK: all invariants and copy spreads; record the levels.
+  `prod_env 1e-5` + `FESOM3_WHICH_ALE=zstar FESOM3_SSH_SE=1 FESOM3_SE_CHECK=1 FESOM3_STEP_DIAG=1`, M = 50 (M_min 35):
+  - np 1, 48 steps, **χ = 0.1** (job 28218186, 400 s; SI 375 s): etacomp ≤ 1.8e-14 m, trim ≤ 3.4e-13 m²/s, |msl|
+    ≤ 4.5e-16 m, |fw| ≤ 5.6e-17 m, laysum ≤ 5.5e-12 m, w1 ≤ 1.1e-17 m/s, hlaw ≤ 7.3e-12 m, no NaN; max|η| 4.33 m
+    (step 31; SI 1.66 m, the linfs SE/SI picture of Task 1.5), max CFL_z 0.63 (SI 0.61), divsum ≤ 1.3e-15;
+  - np 8, 480 steps, **χ = 0.25** (job 28218429, 849 s): **etacomp ≤ 7.2e-14 m, trim ≤ 2.7e-12 m²/s, |msl| ≤ 2.1e-15
+    m, |fw| ≤ 4.9e-18 m, laysum ≤ 1.3e-11 m, w1 ≤ 4.3e-17 m/s, hlaw ≤ 8.2e-12 m, spreadU = spreadUm = 0, dUV = dAB
+    = dsig = 0**, divsum ≤ 1.1e-15; max|η| 4.67 m (step 67), 2.05 m at step 480 (SI zstar 2.03 m), max CFL_z 1.59
+    (SI 1.58), max|uv| 2.96 m/s (SI 2.96)
+  - ⚠️ **At the default χ = 0.1 the np 8 run blows up at step 331** (job 28218186; floating overflow). Not zstar:
+    linfs SE np 8 blows up at step 337-340 and zstar with M = 100 at step 187 (job 28218261), the Stage 2 finding
+    (np 8 and np 128, linfs). The invariants stay at rounding to the last step (etacomp 2.4e-14 m, laysum 1.0e-11
+    m, hlaw 7.3e-12 m, w1 1.4e-17 m/s, spreads 0), so the scheme stays consistent and the instability is
+    dynamical: a cluster of 30 m vertex columns (aux3d depth 20 m) on the Antarctic shelf near 75°W, 72°S under
+    full ice cover (m_ice ≈ 2.6 m) sits near η ≈ −2 m with grid-scale jumps of several metres between neighbours
+    and from step to step (steps 310-330), until η reaches ±17 m at step 331 (node dumps of steps 310-331, job
+    28218261, `fesom3_se_t02_jobs/py/se_eta_series.py`). As Stage 2 decided, the defaults stay (Nikolay's call,
+    Stage 5) and the 480-step gate runs at χ = 0.25 (SI zstar np 8, job 28218186, is smooth: max|η| ≤ 2.03 m)
+  - CORE2 zstar SE_CHECK thresholds (×100 of the max over both runs; spreads exactly 0):
+
+    | invariant | CORE2 zstar np 1 (48, χ 0.1) | np 8 (480, χ 0.25) | CORE2 zstar gate |
+    |---|---|---|---|
+    | etacomp [m] | 1.8e-14 | 7.2e-14 | 8e-12 |
+    | trim [m²/s] | 3.4e-13 | 2.7e-12 | 3e-10 |
+    | \|msl\| net of fw [m] | 4.5e-16 | 2.1e-15 | 3e-13 |
+    | laysum [m] | 5.5e-12 | 1.3e-11 | 2e-9 |
+    | w1 [m/s] | 1.1e-17 | 4.3e-17 | 5e-15 |
+    | hlaw [m] | 7.3e-12 | 8.2e-12 | 9e-10 |
+    | spreadU, spreadUm | 0 | 0 | 0 exactly |
+
+    |fw| stays at rounding on CORE2 because the ice-ocean coupling balances the global net freshwater into
+    water_flux (`mod_ice_oce_coupling.F90:228`): W enters η per node (etacomp and w(1) cover it) but not the global
+    mean; a nonzero global fw is covered by test_ssh_se Z4/Z5
+- [x] G0. Job 28218430: **G0 GREEN** (linfs and zstar CORE2: 99 checkpoint variables and 1 649 154 dump records
+  max|Δ| = 0, 20 step lines equal; conserve 249 lines, 26 configs), 290 s; Intel `fesom_lifecycle_native_mr` sha256
+  `79b48650d3a8bcfe…`. Scripts `/work/ab0995/a270088/fesom3_se_t02_jobs/t32_*` (gate, diag, where, core2chi,
+  final); run dirs `/scratch/a/a270088/se_t32/`, G0 `/scratch/a/a270088/g0_se/t32_28218430`. Stage 3 cost (Tasks
+  3.1-3.2, all 13 jobs, sacct AllocCPUS × elapsed): ≈ 0.6 node-h
 
 ### Stage 4 — Restart
 
