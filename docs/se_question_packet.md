@@ -269,3 +269,17 @@ under zstar lies above 0.05; a zstar year at χ = 0.1 is the next test. The defa
 - Question 8: z*. Production with SE is z*; FESOM_F's `tools/prod_env.sh` is linfs, so z* gets its own twin
   (Task 5.6).
 - Question 9: AB3–AM4, modified, the SESM above. The scheme is SESM, as implemented.
+
+**➕ Results (plan Task 5.7, 2026-10-18): the zstar blow-up at χ = 0.05 located; the zstar year at χ = 0.1.** A
+checkpoint replay (exact, line for line) put the event on one 30 m node of the Kara shelf (75.65°E 74.53°N, in the
+Ob–Yenisei plume, under 75 % ice), not in the equatorial Atlantic: a grid-scale barotropic mode at the baroclinic
+Nyquist frequency (η alternating step by step, period-2 part 5–6 cm on day 220, growing 0.5–1 %/step). From the
+day-220 checkpoint, χ 0.07 grows it slowly for 11 days, χ 0.1 decays it at −0.3 … −0.8 %/step, χ 0.25 at −3.4 %/step;
+without the drag or with M = 100 it blows up sooner. A one-mode model of the SM substeps with a force of ≈ 0.8 % of the
+restoring force frozen from the step-start elevation reproduces all six runs; switching off the ice tilt or the
+ice→ocean stress does not stop it, so the sea ice is not the drive. The likely source (an estimate, not yet tested by
+a switch) is the zstar baroclinic pressure of the stratification that the mode's layer stretching lifts, computed at
+the step start and frozen over the step (≈ 0.5 %). The zstar year at χ = 0.1 ran clean: annual-mean SSH SE − SI rms
+0.106 mm, max 1.74 mm (linfs at χ 0.05: 0.110, 2.45 mm), the largest July anomaly, near 25°W 5°N, 25 mm (40 mm at
+χ 0.05), global-mean SSH at rounding. So on CORE2 with the drag the smallest χ that passes a year under both linfs
+(0.05 passed) and zstar (0.05 failed, 0.07 marginal in the replay) is 0.1; the code default is still 0.25.

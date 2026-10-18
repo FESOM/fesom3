@@ -3050,4 +3050,45 @@ either subtract a stable AB2 estimate of the barotropic Coriolis or leave Coriol
   and a location printout of max|η| so a blow-up can be replayed from the last month for a few node-minutes.
 - A two-step period in the step diagnostics points to a mode at ωτ ≈ π (for example the AB2 computational mode of
   the 3-D step, or a barotropic mode that small χ damps too little), not to the three-step shelf mode of L74; this
-  is a hypothesis until the event is located.
+  is a hypothesis until the event is located. ➕ Located (L77): a barotropic mode at ωτ ≈ π that χ = 0.05 damps
+  too little, on a 30 m Kara-shelf node, not in the equatorial Atlantic.
+
+## L77 — A two-step blow-up sat on one shelf node far from where the monthly means pointed: replay it from a checkpoint with per-step SSH, and read the step-line "onset" as the moment a local mode overtook the global max|η|
+
+**Context.** Split-explicit plan, Task 5.7 (2026-10-18). The SE zstar year at χ = 0.05 (CORE2, production physics,
+the barotropic drag, D4, M = 50, np 128) overflowed at step 10989 (day 229). From step 10966 its max|η| alternated
+step by step; the July monthly means had their largest SE − SI anomaly at 26°W 5°N, so L76 guessed the equatorial
+Atlantic.
+
+**What happened.**
+- A cold rerun with the failed run's binary and env plus an end-of-run checkpoint reproduced its 21120 step and
+  CFL_z lines to day 220; the restart from that checkpoint reproduced steps 10561–10989 line for line, and a second
+  checkpoint at step 10944 the last 45 steps. Writing a checkpoint does not change the state.
+- Per-step SSH of the replay found the event at once: node 57847, 75.65°E 74.53°N, a 30 m Kara-shelf node (4 layers)
+  in the Ob–Yenisei plume (20 psu at the surface, 33 psu at 25 m) under a = 0.75, 1 m sea ice. η there alternated
+  step by step about −0.5 m, the five neighbours moved against it, u and v were depth-uniform: a grid-scale barotropic
+  mode at the baroclinic Nyquist frequency. Its period-2 part was already 5–6 cm on day 220 and grew 0.5–1 %/step.
+  The step-line "onset" at step 10966 was only where |η| at the node passed the global max|η| (1.93 m, elsewhere);
+  the monthly means average a period-2 mode out, and the equatorial-Atlantic anomaly was a separate χ-dependent feature.
+- From the day-220 checkpoint: χ 0.07 grew +0.1 … +0.3 %/step for 11 days and then decayed, χ 0.1 decayed
+  −0.3 … −0.8 %/step, χ 0.25 −3.4 %/step; drag off and M = 100 blew up sooner. The one-mode toy of L74 at ωτ = π (the
+  SM substeps damp such a mode by ≈ χπ²/M per step, 1 % at χ 0.05) with a force of relative size ε frozen from the
+  step-start elevation, fitted on two runs (ε = +0.8 %), predicted the four others to 0.01 %/step.
+- Unlike L74, the sea ice was not the drive: with the ice-tilt or the ice→ocean stress switched off (debug build)
+  the mode still grew +0.3 … +1 %/step. Hypothesis, not tested by a switch: the zstar baroclinic pressure. The mode
+  stretches the layers and so lifts the plume stratification at the node; the density-Jacobian PGF, computed from the
+  step-start layers and frozen over the step, pushes with the step-start restoring force (ε ≈ +0.5 % estimated from
+  the replay's own T, S, η). The zstar year at χ = 0.1 ran clean, as close to SI zstar as the linfs year at χ 0.05 is
+  to SI linfs.
+
+**How to apply.**
+- Give every long run periodic checkpoints. A replay from the last one before an event is exact and costs minutes;
+  locate with per-step 2-D output of the replay, never with means: a Nyquist mode vanishes from any time mean.
+- Step-line extrema are global: a local mode shows there only once it exceeds everything else. Before calling a
+  start time, find where the mode is and look at its history there.
+- At the baroclinic Nyquist frequency the SM damping is ≈ χπ²/M per step, about 1 % per step per 0.05 of χ at
+  M = 50, so any lagged force of a few per mille to a per cent can beat a small χ, and more substeps make it worse.
+  Pick χ in a replay window from on/off runs, and accept it only if the period-2 part decays there, not merely if the
+  run survives the window. On CORE2 with the drag that is χ = 0.1.
+- Test a suspected feedback with on/off switches before naming it; the obvious suspect here (the ice, after L74) was
+  wrong.

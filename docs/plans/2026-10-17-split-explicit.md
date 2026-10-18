@@ -131,7 +131,7 @@ GMD 17, 7051). Afterwards the 3-D velocities are trimmed to the time-mean transp
 
 | # | fork | decision |
 |---|---|---|
-| D1 | time stepping | SM AB3–AM4 as in the notes, no filtering, χ = 0.1, M per mesh with a startup CFL guard (➕ default χ = 0.25 since 2026-10-18, Task 5.0; ➕ Task 5.5: χ is mesh-dependent, use the smallest stable value per mesh; CORE2 with the drag: > 0.05 (the zstar year at 0.05 blew up, Task 5.6), the value is open; the code default stays 0.25) |
+| D1 | time stepping | SM AB3–AM4 as in the notes, no filtering, χ = 0.1, M per mesh with a startup CFL guard (➕ default χ = 0.25 since 2026-10-18, Task 5.0; ➕ Task 5.5: χ is mesh-dependent, use the smallest stable value per mesh; CORE2 with the drag: > 0.05 (the zstar year at 0.05 blew up, Task 5.6), the value is open; the code default stays 0.25; ➕ Task 5.7: 0.1 (the zstar year clean, the Kara-shelf mode decays; 0.07 marginal), the default Nikolay's call) |
 | D2 | shared elements | sync the barotropic forcing F **once per step** (one owner). Every per-substep element operator is a per-element **gather** in fixed slot order, so the copies stay bitwise equal by construction; the copy spreads of Ū and ⟨⟨Ū⟩⟩ (= 0) prove it. Per substep: `exchange_nod(η)` + `exchange_elem(Ū)`. The trim keeps update_vel's uv sync |
 | D3 | BT depth | H_e(η) = Hⁿ_e + Σ_v elem_w·c_{e,v}·(η_v − ηⁿ_v): the zstar law under the vertex bottom. c is recomputed once per step from zbar_3d_nⁿ; linfs is c ≡ 0. One depth function, no mode branch in the substep loop |
 | D4 | Coriolis in r | stored sum (port_kokkos D4): šⁿ = Σhelemⁿ·uv^{n−1/2}, r_cor = f×(a₂šⁿ + a₁š^{n−1}). Exact under linfs, second order under zstar. `compute_vel_rhs` untouched. ➕ Replaced by Task 5.4 (Sergey, Q3/Q5): r_cor = f e_z×U\*⁰, the barotropic Coriolis of the first substep; it blew up every cold CORE2 run. ➕ **Restored by Task 5.5** (commit 55f717b; the scheme's author: the first-substep form is unstable without a filter, D4 = Coriolis kept out of R̄ as in Banerjee et al. 2024) |
@@ -1050,8 +1050,9 @@ sbatch at a time or in a short chain; each wait is a background `sacct` watcher.
 below (Task 5.0).
 ➕ Stage 5 cost: Tasks 5.0 + 5.1 0.97 node-h, Tasks 5.2 + 5.3 1.61 node-h, the closure test 0.48 node-h (3.06 in all);
 ➕ Task 5.4 (Sergey's answers Q3/Q5, approved separately, ≤ 1 node-h) 0.86 node-h. ➕ Tasks 5.5 + 5.6 (D4 restored,
-minimal-χ screens, the linfs twin at χ 0.05 and the zstar twin pair; cap 3.2 node-h) 2.68 node-h. ➕ Nikolay asked
-why port_kokkos runs χ = 0.1: its BT viscosity is the flow-dependent Zenodo closure (γ0 = 10, γ1 = 2750), ≈ 2× ours in
+minimal-χ screens, the linfs twin at χ 0.05 and the zstar twin pair; cap 3.2 node-h) 2.68 node-h. ➕ Task 5.7 (the
+zstar blow-up replayed and located, χ/drag/M/ice variants, the zstar year at χ 0.1; cap 1.6 node-h) 1.58 node-h.
+➕ Nikolay asked why port_kokkos runs χ = 0.1: its BT viscosity is the flow-dependent Zenodo closure (γ0 = 10, γ1 = 2750), ≈ 2× ours in
 calm flow and ≈ 10–15× on the noisy shelf. ➕ Tested (lane C, 0.32 node-h, job 28220789, report
 `/work/ab0995/a270088/fesom3_se_ref/jobs/s5_C_report.md`): the closure as an opt-in knob, `FESOM3_SE_VISC_FLOW=1`
 (`FESOM3_SE_VISC_GAMMA0/GAMMA1`, defaults 10 / 2750), commit e534a4f on branch `se-visc-zenodo` (parent 741ddc7, not
@@ -1448,7 +1449,7 @@ Coriolis is expected to be unstable; either subtract a stable AB2 estimate of th
 Coriolis out of R̄ as in Banerjee et al. (2024), which is what D4 does; D4 + the barotropic drag is acceptable;
 use minimal dissipation; χ depends on the mesh and stays a user parameter. Orchestrated run (≤ 1.4 node-h, raised
 to 1.6 for the zstar screen and to 3.2 with Task 5.6). Commit 55f717b. ⚠️ **The 480-step and 3000-step screens
-pick χ = 0.05, but the zstar year at χ = 0.05 blew up (Task 5.6), so the CORE2 value is open.***
+pick χ = 0.05, but the zstar year at χ = 0.05 blew up (Task 5.6), so the CORE2 value is open.*** ➕ *Task 5.7: 0.1.*
 
 **Files:**
 - Modify: `src/oce/oce_ssh_se.F90` (`se_bt_forcing`, `se_init`, comments), `src/types/mod_dyn.F90`,
@@ -1542,10 +1543,11 @@ pick χ = 0.05, but the zstar year at χ = 0.05 blew up (Task 5.6), so the CORE2
   by August (7.5 mm)
 - [ ] ⚠️ the default χ: **not changed** (0.25 in code). χ = 0.05 is too small for CORE2 (Task 5.6: the zstar year
   blew up). The smallest χ clean for a year under both linfs and zstar is open: next, a zstar year at χ = 0.1
-  (and 0.07), ≈ 0.76 node-h each (Nikolay's call; commands in the HANDOFF)
+  (and 0.07), ≈ 0.76 node-h each (Nikolay's call; commands in the HANDOFF). ➕ Task 5.7: the zstar year at 0.1 is
+  clean, recommendation 0.1 (the default stays open)
 - Task 5.5 cost: **1.42 node-h** (jobs 28227204 0.14, 28227206 0.24, 28227410 0.27, 28227618 0.76, 28228028 0.004)
 
-#### ➕ Task 5.6: zstar 1-year twin pair ⚠️ (SE at χ = 0.05 blew up on day 229)
+#### ➕ Task 5.6: zstar 1-year twin pair ⚠️ (SE at χ = 0.05 blew up on day 229; ➕ located in Task 5.7: the Kara shelf)
 
 *Orchestrator, approved by Nikolay 2026-10-18: the scheme author says production with SE will be z\*; run an SI and
 an SE zstar year as the Task 5.2 twin, SE at the χ clean under both linfs and zstar (Task 5.5: 0.05). Budget for
@@ -1563,7 +1565,8 @@ Tasks 5.5 + 5.6: 3.2 node-h.*
   0.64, 1.58, 128. The linfs year at the same χ passed that date (max|η| 1.98 m at step 10989). The run has no
   location diagnostics; the monthly means point at the equatorial Atlantic: the July mean SE − SI zstar has its
   SSH maximum, +39.6 mm, at 25.4°W 4.8°N (4400 m), and temp at 85 m there is 24.77 vs 23.06 °C, the same spot and
-  month as the linfs χ 0.05 event above
+  month as the linfs χ 0.05 event above. ➕ Not the blow-up site: Task 5.7 located it on the Kara shelf (75.65°E
+  74.53°N, 30 m), a period-2 mode that monthly means average out
 - [x] partial comparison, Jan–Jul (job 28227970, `s5_F_diff.28227970.out`, `s5_F_diff_se_si_zstar_janjul.28227970.json`;
   means over the 7 common months, "drift" = Jul − Jan): SSH rms 0.134 mm, max 5.84 mm (25.4°W 4.8°N); monthly rms Jan
   0.53 → May 0.15 → Jul 0.35 mm, Jul max 39.6 mm; temp rms 0–100 / 100–1000 / 1000 m–bottom / all 5.1e-3 / 2.2e-3 /
@@ -1572,14 +1575,123 @@ Tasks 5.5 + 5.6: 3.2 node-h.*
   at rounding in both SI and SE zstar (≤ 1.1e-16 m, Jan–Jul)**: the net freshwater flux is balanced globally, so
   zstar's η carries no global drift; sea-ice area max|SE − SI| NH 0.006, SH 0.010 × 10⁶ km² (Feb); SH ice volume
   −0.14 % (Jan) → −0.07 % (Jul)
-- [ ] SE zstar year at a larger χ (0.1, then 0.07) and its full-year diff: **not run** — it would exceed the 3.2
-  node-h cap (2.68 used). Commands:
+- [x] SE zstar year at a larger χ (0.1, then 0.07) and its full-year diff: **not run** — it would exceed the 3.2
+  node-h cap (2.68 used). ➕ Done in Task 5.7 (χ 0.1, clean; 0.07 not run as a year, marginal in the replay). Commands:
   `sbatch -J s5_F_twin_se_zstar s5_F_twin.sbatch se zstar /work/ab0995/a270088/fesom3_se_ref/bin_s5f_28227204 0.1`,
   then `sbatch s5_F_diff.sbatch /scratch/a/a270088/se_s5f/twin_si_zstar_28227175 /scratch/a/a270088/se_s5f/twin_se_zstar_<jobid> SIz,SEz010 se_si_zstar_chi010`
   (in `/work/ab0995/a270088/fesom3_se_ref/jobs`). A diagnostic rerun at χ = 0.05 with monthly checkpoints and a
   location printout of max|η| would locate the blow-up (≈ 0.5 node-h to day 229)
 - Task 5.6 cost: **1.27 node-h** (28227175 0.76, 28227619 0.49, 28227970 0.015); Tasks 5.5 + 5.6 **2.68 node-h**
   (AllocCPUS/256 × elapsed)
+
+#### ➕ Task 5.7: the zstar χ = 0.05 blow-up located and replayed; the zstar year at χ = 0.1 ✅ (the default χ: Nikolay's call)
+
+*Orchestrator, 2026-10-18 (cap 1.6 node-h, no code change, the default χ stays 0.25 in code): replay the failed
+zstar year from a checkpoint, locate and characterise the two-step oscillation, test χ 0.07 / 0.1 / 0.25, drag off and
+M = 100 from the replay checkpoint, then run a zstar year at the smallest χ whose replay is clean with the period-2
+signal decaying.* The event was **not** in the equatorial Atlantic: a grid-scale barotropic mode at the baroclinic
+Nyquist frequency on the Kara-shelf (30 m) node 57847, present long before the step lines showed it. χ = 0.1 decays
+it and runs the zstar year clean.
+
+**Files (no source change):** jobs `/work/ab0995/a270088/fesom3_se_ref/jobs/s5_G_{main,twin,ana,dbg}.sbatch`, analysis
+`s5_G_{p2,col,node_p2,point,pgf,toy}.py`, the debug patch `s5_G_dbg_ice.patch` (the two env-only ice switches of
+`dbg_src_dbg1.diff`, never committed); logs `s5_G_*.<jobid>.out`; run dirs `/scratch/a/a270088/se_s5g/` (`main_28228214/
+{A,B,C,c07,c10,c25,nodrag,m100}`, `dbg_28228624/{notilt,noio}`, `twin_se_zstar_28228601`). All runs: the frozen
+`bin_s5f_28227204` (= 55f717b), CORE2 `prod_env 1e-5` + zstar, SE, drag on, D4, M 50, np 128, unless noted.
+
+- [x] **determinism and restart exactness** (job 28228214, compute, 42.0 min, 0.70 node-h; `s5_G_main.sbatch`):
+  - A: cold start with the failed run's env and namelist.io (diff of `env.txt`: only `FESOM3_NSTEPS=10560` and the four
+    restart lines), end-of-run checkpoint at step 10560 (end of day 220): **the 21120 step and CFL_z lines equal the
+    failed run's line for line**
+  - B: restart from A, χ 0.05, ssh/sst/sss every step, a checkpoint at global step 10944 (end of day 228): **its 858
+    lines equal the failed run's steps 10561–10989**, the same floating overflow at step 10989
+  - C: restart from B's checkpoint, 3-D output every step (temp, salt, w, u/v, Av): **its 90 lines equal steps
+    10945–10989**. The checkpoint writes are state-neutral (A), so `s5_G_twin.sbatch` writes monthly ones
+- [x] **location and characterisation** (B, C; `s5_G_p2.py locate`, `s5_G_col.py`, the checkpoints):
+  - node 57847 (0-based), **75.65°E 74.53°N, the Kara shelf, 30 m, 4 layers (5/5/10/10 m)**, 5 elements, 5
+    neighbours at 22–25 km; sea ice a = 0.73 / 0.75 and 1.05 / 1.01 m (days 220 / 228); the Ob–Yenisei plume: salt
+    20.1 / 26.8 / 31.4 / 32.8 psu by layer, T −1.1 … −1.7 °C, ρ − ρ0 = −14.1 / −9.3 / −4.8 / −3.6 kg/m³
+  - η at the node alternates step by step about a mean of −0.47 … −0.55 m (day 228: −1.40 / +0.47 m); the neighbours
+    move against it at −0.12 … −0.44 (mean −0.24) of its period-2 part p2 = (η_{n+1} − 2ηₙ + η_{n−1})/4; 9–11 nodes
+    within 90 km above 10 % of it: a single-node (grid-scale) pattern. **It is the global p2 maximum throughout the
+    replay**; elsewhere p2 ≤ 6 mm (Antarctic shelf 3–6 mm, equatorial Atlantic ≤ 1.7 mm)
+  - **p2 was already 5.3–6.4 cm at day 220** and grew +0.52 / +0.55 / +0.81 / +0.96 %/step (log-linear fits over
+    steps 10562–10657 / … / 10850–10945), 2.7 %/step in 10946–10984, to the overflow at 10989. The step lines'
+    "onset" at step 10966 is only where |η| at the node passed the global max|η| of 1.93 m elsewhere; the July
+    anomaly at 26°W 5°N is a separate χ-dependent feature (below)
+  - vertical structure (C, p2 per unit p2 of η at the node): u, v depth-uniform (+0.20 … +0.22 and −0.09 m/s per m
+    in all 4 layers; the surface-layer shear 2.6 % of it), w at 5 / 10 / 20 m +0.97e-4 / 1.97e-4 / 3.93e-4 m/s per m
+    (∝ depth: the zstar relative velocity d/60·∂η/∂t of a barotropic convergence, the deepest 10 m layer
+    unstretched), salt +0.06 / +0.16 / +0.10 / +0.02 psu per m, temp ≤ 0.009 °C, Av negligible; η, u, v, w and the
+    surface T/S grow at one rate (2.5–2.9 %/step), the subsurface T/S at 3.5 %/step: **one barotropic mode**, T and S
+    follow
+- [x] **variants from the day-220 checkpoint** (same job; ssh every step; `s5_G_ana.sbatch`, job 28228604, and
+  `s5_G_node_p2.py`; growth = log-linear fits of |p2| at the node over the step windows 10562–10657, 10658–10753,
+  10754–10849, 10850–10945, 10946–10988 (debug runs: 10946–11039), 10989–11100, 11101–11300, 11301–11520):
+
+  | variant | outcome (to day 240 = step 11520) | p2 growth %/step at the node | p2 at the node |
+  |---|---|---|---|
+  | χ 0.05 (B) | overflow at step 10989 | +0.52, +0.55, +0.81, +0.96, then 2.7 | 5.3 cm → 0.94 m (10945) |
+  | χ 0.07 | survives | +0.12, +0.13, +0.30, +0.16, +0.21, +0.18 (to step 11100), then −0.13, −0.27 | 5.3 → 14.4 cm (≈ 11100) → 5.3 cm |
+  | **χ 0.1** | survives | **−0.46, −0.46, −0.29, −0.44, −0.38, −0.43, −0.77, −0.78** | 5.3 cm → 1.5 mm (≈ 11500) |
+  | χ 0.25 | survives | −3.35 (to 0.2 mm in 96 steps), then noise ≤ 1.4 mm | |
+  | χ 0.05, drag off | overflow at step 10892 | +0.63, +0.70, +1.13 | |
+  | χ 0.05, M = 100 | overflow at step 10827 | +1.03, +1.22 | |
+  | χ 0.05, ice sees η = 0 (debug) | grows, 480 steps run | +0.37, +0.35, +0.60, +0.53, +0.74 | 5.3 cm → 0.67 m (11039) |
+  | χ 0.05, no ice→ocean stress (debug) | grows, 480 steps run | +0.44, +0.33, +0.60, +0.78, +0.97 | 5.3 cm → 1.47 m (11039) |
+
+  (The last two rows: job 28228624, compute, 4.2 min, 0.07 node-h, `s5_G_dbg.sbatch`, a scratch build of 55f717b +
+  `s5_G_dbg_ice.patch`, sha `6811cfa2dac31a7f`, 480 steps from the same checkpoint.) In χ 0.1 and 0.25, other Arctic
+  shelf nodes (95°E 81°N, 30 m) reach p2 = 2.4 cm in one window at both χ: forcing-driven, not χ-dependent
+- [x] **mechanism**, evidence:
+  - the one-mode toy of L74 (`dbg_toy_ice.py`: SM substeps, a force of relative size ε taken from the step-start
+    elevation and frozen over the step, an anchored drag ντ), at ωτ = π and fitted on the two χ 0.05 runs (ε = +0.81 %,
+    ντ = 0.0022), **predicts the four others: χ 0.07 +0.13 (observed +0.12), χ 0.1 −0.46 (−0.46), χ 0.25 −3.34
+    (−3.35), M 100 +1.02 (+1.03) %/step** (`s5_G_toy.py`). So the χ/M/drag dependence is that of an SM-damped mode at
+    the baroclinic Nyquist frequency (damping ≈ χπ²/M per step, 1 %/step at χ 0.05) against a lagged force of ≈ 0.8 %
+  - the sea ice is not the drive: with either ice link cut the mode still grows (+0.33 … +0.97 %/step); the ice tilt
+    adds ≈ 0.15–0.4 %/step. Unlike L74's Antarctic shelf mode (ε ≈ 3 % from the ice, period 3 steps)
+  - hypothesis, not tested by a switch: the zstar baroclinic pressure. The mode's layer stretching lifts the plume
+    stratification at the node against its neighbours; the density-Jacobian PGF (`pressure_force_4_zxxxx_shchepetkin`,
+    computed once per step from the step-start layers and density, frozen in F, without a surface-loading term) then
+    pushes with the step-start restoring force. An offline estimate from C's own T, S, η (linear EOS, the vert_vel_ale
+    geometry; `s5_G_pgf.py`) gives **ε ≈ +0.54 %**, the toy needs +0.81 %. Under linfs the PGF works on fixed levels and
+    the displacement reaches the density only through the tracer advection; whether that is why the linfs χ 0.05 year
+    survived is untested (its step lines would show the mode only above |η| ≈ 1.9 m). The growth's acceleration with
+    amplitude (0.5 → 1 → 2.7 %/step) suggests nonlinear zstar terms on top (D4's O(Δh·Δu), H(η)); untested
+- [x] **zstar year at χ = 0.1** (job 28228601, compute, 47.5 min, 0.79 node-h, `s5_G_twin.sbatch se zstar
+  bin_s5f_28227204 0.1` = `s5_F_twin.sbatch` plus monthly checkpoints, run dir `se_s5g/twin_se_zstar_28228601`): exit 0,
+  no NaN/error line; max|η| 4.775 m (step 67, cold start), after day 30 ≤ 2.13 m; max CFL_z 1.598 (300), after day 30
+  ≤ 0.857; divsum ≤ 2.4e-15; 12 monthly checkpoints. Diff against the SI zstar year (job 28229080, `s5_F_diff.sbatch`,
+  `s5_F_diff.28229080.out`, `s5_F_diff_se_si_zstar_chi010.28229080.json`; points: `s5_G_point.py`,
+  `/scratch/a/a270088/se_s5g/point_monthly.txt`):
+
+  | SE − SI | zstar, χ 0.1 + drag (new) | linfs, χ 0.05 + drag (Task 5.5) |
+  |---|---|---|
+  | annual-mean SSH rms / max [mm] | **0.106 / 1.74** (24.9°W 4.9°N, 4150 m) | 0.110 / 2.45 (25.9°W 4.7°N) |
+  | monthly SSH rms Jan / Jun / Dec; max of the monthly max [mm] | 0.52 / 0.15 / 0.31; 25.2 (Jul, 24.9°W 4.9°N) | 0.52 / 0.15 / 0.35; 34.3 (Jul) |
+  | annual-mean temp rms 0–100 / 100–1000 / 1000 m–bottom / all [°C] | 3.69e-3 / 2.68e-3 / 1.55e-4 / 1.42e-3 | 3.97e-3 / 2.48e-3 / 1.60e-4 / 1.35e-3 |
+  | annual-mean salt rms, same bands [psu] | 1.02e-3 / 4.24e-4 / 1.54e-5 / 2.61e-4 | 1.10e-3 / 4.07e-4 / 1.51e-5 / 2.63e-4 |
+  | band-mean temp drift SE − SI [°C] | +1.1e-4 / −3.5e-6 / +3.9e-6 / +4.9e-6 | +1.5e-4 / +8.4e-6 / +2.4e-6 / +7.5e-6 |
+  | band-mean salt drift SE − SI [psu] | +2.1e-6 / +2.5e-7 / −2.0e-7 / −3.6e-8 | −8.2e-6 / +2.0e-6 / −2.1e-7 / +9.3e-8 |
+  | global salt drift Dec − Jan, SI / SE [psu] | +1.073e-5 / +1.070e-5 | +2.40e-6 / +2.49e-6 |
+  | global-mean SSH, every month and the Dec − Jan drift | at rounding (0.0000 mm) in SI and SE | at rounding |
+  | sea-ice area max\|SE − SI\| NH / SH [10⁶ km²] | 0.006 (Feb) / 0.009 (Feb) | 0.006 / 0.014 |
+  | SH ice volume SE − SI Jan / Dec | −0.13 % / −0.06 % | −0.22 % / −0.07 % |
+  | July at 25.9°W 4.7°N / 25.4°W 4.8°N: SSH [mm], temp at 85 m [°C] | +8.9 / +20.4; +0.26 / +0.71 | +34.3 / +30.5; +1.37 / +1.58 |
+  | timing SE barotropic / SSH phase / loop [ms/step] | 10.89 / 13.78 / 153.35 (SI zstar: CG 5.22 / 9.49 / 149.07) | 10.82 / 13.45 / 148.27 |
+
+  The July point anomaly scales with χ: zstar χ 0.05 +26.5 / +39.6 mm and +0.92 / +1.71 °C, linfs χ 0.25 without the
+  drag −3.4 / −6.1 mm. At the Kara node the monthly SSH of SE χ 0.1 equals SI zstar to ≤ 2.4 mm (Jan) and ≤ 0.4 mm
+  from February on. **Reading:** the zstar year at χ 0.1 is as close to SI zstar as the linfs year at χ 0.05 is to SI
+  linfs, with a smaller July event
+- [ ] ⚠️ **the default χ (Nikolay's call):** the code default stays 0.25. Recommendation: **χ = 0.1 for CORE2** (the
+  smallest χ whose replay decays the Kara mode and whose zstar year is clean; 0.07 is marginal, +0.1 … +0.3 %/step for
+  11 days at the event; a linfs year at 0.1 was not run, linfs at 0.05 passed). The margin is modest: at the event
+  χ 0.1 decays the mode at −0.46 %/step against ≈ +1.6 %/step of drive (toy), χ 0.25 at −3.4 %/step. Open: test the zstar-PGF
+  hypothesis with a debug switch (the PGF on the step-start geometry without the η part), and a linfs replay at χ 0.05
+- Task 5.7 cost: **1.58 node-h** (28228214 0.70, 28228604 0.0004, 28228624 0.07, 28228601 0.79, 28229080 0.015;
+  AllocCPUS/256 × elapsed)
 
 ### Stage 6 — Verify and document
 
