@@ -134,8 +134,8 @@ GMD 17, 7051). Afterwards the 3-D velocities are trimmed to the time-mean transp
 | D1 | time stepping | SM AB3–AM4 as in the notes, no filtering, χ = 0.1, M per mesh with a startup CFL guard (➕ default χ = 0.25 since 2026-10-18, Task 5.0) |
 | D2 | shared elements | sync the barotropic forcing F **once per step** (one owner). Every per-substep element operator is a per-element **gather** in fixed slot order, so the copies stay bitwise equal by construction; the copy spreads of Ū and ⟨⟨Ū⟩⟩ (= 0) prove it. Per substep: `exchange_nod(η)` + `exchange_elem(Ū)`. The trim keeps update_vel's uv sync |
 | D3 | BT depth | H_e(η) = Hⁿ_e + Σ_v elem_w·c_{e,v}·(η_v − ηⁿ_v): the zstar law under the vertex bottom. c is recomputed once per step from zbar_3d_nⁿ; linfs is c ≡ 0. One depth function, no mode branch in the substep loop |
-| D4 | Coriolis in r | stored sum (port_kokkos D4): šⁿ = Σhelemⁿ·uv^{n−1/2}, r_cor = f×(a₂šⁿ + a₁š^{n−1}). Exact under linfs, second order under zstar. `compute_vel_rhs` untouched |
-| D5 | BT viscosity | the notes' **linear** harmonic, A_h = `se_visc_ah`·l_e (0.01 m/s; 0 = off), flux form H_edge·A_h·∇(Ū/Hⁿ) with Hⁿ frozen → V(Ūᵐ) − V(Ūⁿ) = V(Ūᵐ − Ūⁿ). BT bottom drag off |
+| D4 | Coriolis in r | stored sum (port_kokkos D4): šⁿ = Σhelemⁿ·uv^{n−1/2}, r_cor = f×(a₂šⁿ + a₁š^{n−1}). Exact under linfs, second order under zstar. `compute_vel_rhs` untouched. ➕ **Replaced by Task 5.4 (Sergey, Q3/Q5): r_cor = f e_z×U\*⁰, the barotropic Coriolis of the first substep (U\*⁰ = AB3 of the ring); š and `se_sbar_old` are gone** |
+| D5 | BT viscosity | the notes' **linear** harmonic, A_h = `se_visc_ah`·l_e (0.01 m/s; 0 = off), flux form H_edge·A_h·∇(Ū/Hⁿ) with Hⁿ frozen → V(Ūᵐ) − V(Ūⁿ) = V(Ūᵐ − Ūⁿ). BT bottom drag off (➕ on since Task 5.4: D(Ūᵐ − Ūⁿ) = −(C_d\|u_b\|/Hⁿ)(Ūᵐ − Ūⁿ), `FESOM3_SE_BOTTDRAG`, default 1) |
 | D6 | restart | strict: SE fields only when SE is on; a checkpoint without them aborts with a clear message; no SI↔SE switching; M and χ must stay fixed across a restart chain (documented) |
 | D7 | order | linfs np1 → linfs np>1 → zstar → restart → physics (G3) |
 
@@ -1048,7 +1048,8 @@ sbatch at a time or in a short chain; each wait is a background `sacct` watcher.
 
 ➕ **Approved by Nikolay on 2026-10-18** (the whole stage 3–5 node-hours), together with the decision on the default
 below (Task 5.0).
-➕ Stage 5 cost: Tasks 5.0 + 5.1 0.97 node-h, Tasks 5.2 + 5.3 1.61 node-h, the closure test 0.48 node-h (3.06 in all). ➕ Nikolay asked
+➕ Stage 5 cost: Tasks 5.0 + 5.1 0.97 node-h, Tasks 5.2 + 5.3 1.61 node-h, the closure test 0.48 node-h (3.06 in all);
+➕ Task 5.4 (Sergey's answers Q3/Q5, approved separately, ≤ 1 node-h) 0.86 node-h. ➕ Nikolay asked
 why port_kokkos runs χ = 0.1: its BT viscosity is the flow-dependent Zenodo closure (γ0 = 10, γ1 = 2750), ≈ 2× ours in
 calm flow and ≈ 10–15× on the noisy shelf. ➕ Tested (lane C, 0.32 node-h, job 28220789, report
 `/work/ab0995/a270088/fesom3_se_ref/jobs/s5_C_report.md`): the closure as an opt-in knob, `FESOM3_SE_VISC_FLOW=1`
@@ -1293,6 +1294,147 @@ is not re-run (it blows up near step 335, below).
   ms between its runs; the year-long twin gives SE +4.19 ms/step, +2.9 %, all of it in the SSH phase).
   M 50 → 48 saves 0.22–0.31 ms of SE_BT (≈ 0.11–0.16 ms per substep)
 
+#### ➕ Task 5.4: barotropic bottom drag and first-substep consistency (Sergey's answers Q3/Q5) ⚠️
+
+*Sergey Danilov, 2026-10-18 (`docs/se_question_packet.md` §6): the bottom drag belongs in the barotropic equation
+(Q3); F is reconciled with the substeps approximately, by subtracting the barotropic right-hand side of the first
+substep, for the drag and also for Coriolis, which stays in the 3-D AB2 array (Q5). Approved by Nikolay on
+2026-10-18 (≤ 1 node-h). Commit 6a76b29. ⚠️ **Measured: the drag stabilises χ = 0.1, the Coriolis consistency
+destabilises every χ (below); a decision for Nikolay.***
+
+**Files:**
+- Modify: `src/oce/oce_ssh_se.F90` (`se_bt_forcing`, `se_tendency`, knob, `se_init`), `src/types/mod_dyn.F90`,
+  `src/infra/mod_halo.F90` (rank-1 `exchange_elem_shared`), `src/io/mod_io_restart.F90`, `src/step/mod_step_oce.F90`,
+  `src/drivers/fesom_restartroundtrip.F90`, `tools/run_restartroundtrip.sh`, `test/test_ssh_se.F90`
+- Modify: IMPLEMENTATION.md §14, README.md, TESTING.md, this plan, `docs/se_question_packet.md`, LESSONS
+
+**Discretisation (as implemented in 6a76b29):**
+- **Drag.** Per element and step r_e = C_d·|uv(:, nlevels(e)−1, e)| with C_d = 0.0025, the velocity, level and C_d of
+  the explicit 3-D drag of `impl_vert_visc_ale` (`oce_dyn_ivertvisc.F90:196`; uv is not yet updated when
+  `se_bt_forcing` runs), frozen over the step. The rate kdrag_e = r_e/Hⁿ_e is formed once per step in
+  `se_bt_forcing` (owned elements) and synced from one owner with F (a division: LESSONS L71). Each substep adds
+  D(Ūᵐ − Ūⁿ) = −kdrag_e·(Ūᵐ − Ūⁿ) in `se_tendency`, Ūᵐ = ring level 0 of the substep, Ūⁿ = `se_ubtn` (the anchoring
+  of the viscosity): the 3-D drag stays in G, so F effectively gets +r·Ūⁿ/Hⁿ and the substeps −r·Ūᵐ/Hⁿ. Explicit
+  (forward): dtbt·kdrag ≤ 36 s·0.0025·|u_b|/20 m = 4.5e-3 per m/s of bottom speed on the 20 m shelf (≈ 1e-2 at
+  2 m/s), far below the forward-Euler limit 2. Local per element, so shared copies stay equal (spreads 0 below).
+  Knob `FESOM3_SE_BOTTDRAG` (0/1, default 1), parsed and value-checked like the others.
+- **Coriolis.** F = G/τ + g·Hⁿ·∇ηⁿ + f e_z×U\*⁰, U\*⁰ = (3/2+β)Ū⁰ − (1/2+2β)Ū^{−1/M} + βŪ^{−2/M} from the ring at the
+  start of the step, by the same expression as the first substep's U\*. So the first substep's net Coriolis is the
+  3-D one; substep m sees −f e_z×(U\*ᵐ − U\*⁰) on top. Chosen over f e_z×Ūⁿ because the substep's Coriolis acts on
+  U\*, not Ū (with Ūⁿ the first substep keeps f e_z×(U\*⁰ − Ūⁿ)); the Ūⁿ reading was screened too (F3 below). Cold
+  start: the ring is Σhelem·uv on all three levels, so U\*⁰ = Ūⁿ to rounding. The pressure removal g·Hⁿ·∇ηⁿ is
+  unchanged (the first substep's η^A needs η¹). The 3-D AB2 Coriolis in `compute_vel_rhs` is untouched.
+  `se_sbar_old` (D4) and `se_bt_forcing`'s `lfirst` argument are gone.
+- **Restart.** 8 SE stores (35 registered at CORE2 instead of 37). `restart_read` reads the registered fields only,
+  so a checkpoint that still carries `se_sbar_old_{u,v}` resumes (checked below).
+
+- [x] code (6a76b29): the drag, the U\*⁰ r-term, the knob, `se_kdrag` (nElemL), `se_sbar_old` removed from the state,
+  the checkpoint and the round-trip driver; `exchange_elem_shared` for real rank-1 arrays
+- [x] unit tests, Intel and GNU, np 1/2/8: C2 (`FESOM3_SE_BOTTDRAG` '2', 'on', '-1', '0.5', '' rejected; '0', ' 1'
+  accepted; default on), C4 (state, drag rate 0 until the first forcing), C6 rewritten (cold start max|F| = 7.2e-18
+  of max|fU| = 3.9e-2; a non-uniform ring F = G/τ + f e_z×U\*⁰ to 3.5e-18, off by 3.9e-2 in the Ūⁿ reading; kdrag
+  = C_d|u_b|/Hⁿ, rel. error 0; drag off: kdrag ≡ 0), C7 rewritten (a: the first substep's tendency with U\* = U\*⁰,
+  η^A = ηⁿ, Ūᵐ = Ūⁿ equals G/τ, ratio 1.4e-16; b: a uniform ring and G = 0 give tendency 0 to 5.6e-17 of 0.36
+  m²/s²), new C12 (D(0) bitwise the drag-off tendency; D(X) = −kdrag·X, D(2X) = 2D(X), D(X+Y) residuals ≤ 2.7e-20 of
+  1.0e-4 m²/s²; M = 40 with the drag: finite, differs from no drag by 5.5e-2 of 562 m²/s, η-compatibility holds),
+  new R1 (SE on: exactly the 8 SE stores, no `se_sbar_old_*`; SE off: none, the rest identical), P1 (kdrag spread
+  0 after the sync, > 0), C9 (a hashed drag rate in the M = 40 cycles); every reference to š / `se_sbar_old` updated
+- [x] GATE (job 28223030, shared, 9.4 min, 0.12 node-h; `/work/ab0995/a270088/fesom3_se_ref/jobs/s5_E_verify.sbatch`,
+  logs `s5_E_*.28223030.*`, run dirs `/scratch/a/a270088/se_s5e/s5_E_*_28223030`; working tree = 6a76b29, Intel
+  `fesom_lifecycle_native_mr` sha256 `76ceb28bf02dab4b…`, frozen in `fesom3_se_ref/bin_s5e_28223030`):
+  - **ctest Intel 176/176; GNU 170/176, exactly the 6 known failures** (`test_wimpl_tra_np1/np2`,
+    `meshdiag_mixed/quad/pi_w`, `test_shared_elem_np1`; the serial rerun fails the same 6)
+  - **G0 GREEN** (`run_g0_se.sh`: linfs, zstar 99 checkpoint variables and 1 649 154 dump records max|Δ| = 0, 20 step
+    lines equal; conserve 249 lines, 26 configs)
+  - **`run_conserve_pi.sh` GATE OK, 36 configs**: SE linfs np 1/2/8 etacomp ≤ 2.1e-15 m, trim ≤ 1.7e-13 m²/s, |msl| ≤
+    9.3e-17 m; zstar np 1/2/8 etacomp ≤ 2.1e-15, trim ≤ 1.7e-13, |msl| ≤ 1.3e-16, laysum ≤ 4.5e-12 m, w1 ≤ 1.1e-18 m/s,
+    hlaw ≤ 6.4e-12 m; spreads 0 (the Task 5.0 levels)
+  - **restart**: `run_restart_gate_core2.sh` N4 K2 **SE linfs np 2 and SE zstar np 2 GREEN** (mid-run and month
+    boundary, 35 stores, max|Δ| = 0, resumed SE_CHECK lines equal); **`run_restart_gate_multirank.sh` SE linfs np 2 → 8
+    GREEN** (max|Δ| = 0); **`run_restartroundtrip.sh` np 1 2 GATE GREEN** (AB2 28, AB3 32, SE 36 fields; the pre-check
+    aborts with the message at np 1 and 2). **Old checkpoint** (job 28223161, 0.01 node-h, `jobs/s5_E_small.sbatch`):
+    2 steps np 2 with the frozen fbbf777 binary write a checkpoint with `se_sbar_old_{u,v}` (10 SE stores); the new
+    binary resumes it ("THIS IS A RESTART RUN", 35 registered), runs 2 steps (exit 0, SE_CHECK etacomp 3.7e-15,
+    spreads 0) and writes the 8-store checkpoint
+  - CORE2 `prod_env 1e-5` np 8, 48 steps, SE + SE_CHECK at the defaults (drag on): **linfs** etacomp ≤ 1.7e-14 m, trim
+    ≤ 5.1e-13, |msl| ≤ 6.9e-16, divsum ≤ 7.3e-16, spreads 0, no NaN, **max|η| 4.381 m (step 48), max CFL_z 1.235
+    (step 19)** (s5_D: 4.191 m, 0.823 at step 24); **zstar** etacomp ≤ 1.6e-14, trim ≤ 3.4e-13, |msl| ≤ 8.5e-16, |fw|
+    ≤ 5.0e-18, laysum ≤ 5.5e-12, w1 ≤ 9.6e-18, hlaw ≤ 7.3e-12, max|η| 4.437 m (step 30), max CFL_z 0.618 (s5_D: 4.208
+    m, 0.619). The CFL_z spikes (1.07 at step 17, 1.24 at step 19) come with the drag off too (job 28223161: 1.08,
+    1.23): the Coriolis change, not the drag
+- [x] ⚠️ shelf screens, 480 steps (CORE2 `prod_env 1e-5`, np 8, cold start, M 50, `se_visc_ah` 0.01, SE_CHECK, the
+  env-only DBG_SHELF printout of a38fb99 in a scratch build, never committed; noise = DBG_SHELF grid-scale noise on
+  the Antarctic shelf, lat < −60°, H ≤ 40 m; rates as `s5_C_series.py`). Job 28223092 (`jobs/s5_E_shelf.sbatch`,
+  0.12 node-h), the committed scheme:
+
+  | case | χ | drag | Coriolis r-term | exit | noise growth %/step (window) | probe period [steps] | max\|η\| before the blow-up |
+  |---|---|---|---|---|---|---|---|
+  | E0 | 0.1 | off | f e_z×U\*⁰ | **overflow, step 109** | +1.96 (50–107) | 3.05 | 5.19 m (41–80) |
+  | E1 | 0.1 | on | f e_z×U\*⁰ | **overflow, step 171** | +0.95 (50–150), +1.0 (100–155) | 4.55 | 7.18 m (121–160) |
+  | E2 | 0.2 | on | f e_z×U\*⁰ | **overflow, step 243** | +0.79 (150–242) | 4.65 | 6.88 m (201–240) |
+  | E3 | 0.25 | on | f e_z×U\*⁰ | **overflow, step 313** | +0.40 (150–312) | 5.09 | 6.57 m (296) |
+
+  The old scheme (lane C, job 28220789): χ 0.1 +0.91 %/step, overflow at step 340; χ 0.25 −0.36 %/step, stable for
+  3000 steps (Task 5.1). E3 dies at shelf node gid 103471: the fast part |U^M − ⟨⟨Ū⟩⟩|/H rises from 2 m/s (step 310)
+  to 8.6 and 200 m/s (steps 311–312). SE_CHECK stays at rounding and the spreads 0 up to the overflow (spreadU =
+  spreadUm = 0 in every line), so the scheme is consistent; the instability is dynamical.
+  Job 28223247 (`jobs/s5_E_shelf2.sbatch`, 0.16 node-h): the same debug build plus the debug-only env switch
+  `DBG_CORI` (`jobs/s5_E_dbg_cori.py`: 1 = the old stored-sum r-term D4, 2 = f e_z×Ūⁿ); **V0 (DBG_CORI=1, drag off,
+  χ 0.25, 48 steps) reproduces the old scheme line for line** (144 step, CFL_z and SE_CHECK lines identical to s5_D):
+
+  | case | χ | drag | Coriolis r-term | exit | shelf noise [m] at 150 / 330 / 480 | noise growth %/step, 150–330 / 330–480 | cold-start peak | max CFL_z |
+  |---|---|---|---|---|---|---|---|---|
+  | G1 | 0.1 | on | D4 (stored sums) | **0, 480 steps** | 0.206 / 0.113 / 0.062 | **−0.34 / −0.51** | 4.759 m (67) | 1.604 (300) |
+  | G2 | 0.2 | on | D4 | **0, 480 steps** | 0.161 / 0.072 / 0.048 | −0.29 / −0.26 | 4.723 m (67) | 1.604 (300) |
+  | G3 | 0.25 | on | D4 | **0, 480 steps** | 0.145 / 0.066 / 0.048 | −0.30 / −0.19 | 4.703 m (67) | 1.603 (300) |
+  | F3 | 0.25 | on | f e_z×Ūⁿ | **overflow, step 336** | 0.615 / — | +0.39 (150–330) | 4.485 m (67) | — |
+
+  G1–G3: SE_CHECK etacomp ≤ 6.6e-14 m, trim ≤ 3.2e-12 m²/s, |msl| ≤ 2.1e-15 m, spreads 0, no NaN. Lane C's
+  references at χ 0.1: the flow-dependent closure Z1 −0.04 / −0.24 (noise 0.21 / 0.12 / 0.08 m); at χ 0.25: linear
+  −0.36, closure −0.32 / −0.22. **Reading:** the barotropic drag alone (Q3) turns χ = 0.1 from +0.91 %/step and a
+  blow-up at step 340 into a decay of −0.34 … −0.51 %/step, faster than the flow-dependent closure; at χ = 0.25 it
+  changes little. The first-substep Coriolis consistency (Q5) destabilises at every χ in both readings (U\*⁰, Ūⁿ),
+  with or without the drag, and changes the shelf mode's period from 3.0 to 4.5–5.2 steps. A likely mechanism (not
+  separately tested): the trimmed 3-D velocity carries the fast shelf mode (a step mean keeps ~80 % of a mode with
+  ωτ ≈ 2), the 3-D AB2 Coriolis extrapolates it badly at that frequency (|1.6 − 0.6e^{−iωτ}| ≈ 2 at ωτ = 2.1), and
+  D4 removed that term exactly while U\*⁰ (or Ūⁿ) does not, so a force of relative size ~f/ω ≈ 0.1 or more, set at the
+  start of the step, stays frozen in F: the lagged-force mechanism of L74 with ε larger than the ice's 0.03. The
+  Zenodo SE code also keeps the stored-transport Coriolis removal (`compute_BT_rhs_SE_vtransp`, `UVBT_4AB`) and uses
+  the m = 0 anchoring only for the viscosity and the drag
+- [x] 3000-step screens (job 28223394, compute node l40046, 25.8 min, 0.43 node-h, `jobs/s5_E_screen.sbatch`, run dirs
+  `/scratch/a/a270088/se_s5e/screen_28223394/core2_<case>/`). Not of the committed scheme, which blows up within 480
+  steps at every χ, but of **the drag with the D4 r-term** (the debug build of 28223247, sha `d7b2f9dd35a18628`,
+  `DBG_CORI=1`), at the smallest χ that decayed (0.1) and at χ = 0.25, plus zstar at 0.1. CORE2 `prod_env 1e-5`, np
+  128, cold start, M 50, SE_CHECK + DBG_SHELF; all exit 0, no non-finite token in 3000 SE_CHECK lines, spreads 0,
+  dUV = dAB = dsig = 0:
+
+  | case | max\|η\| (step) = cold-start peak | window max\|η\| 501–750 / 1001–1250 / 2751–3000 | max\|η\| at 3000 | max CFL_z (step) | max\|uv\| (step) | shelf noise [m] 150 / 330 / 480 / 1000 / 2000 / 3000 | SE_CHECK maxima |
+  |---|---|---|---|---|---|---|---|
+  | h1 χ 0.1 linfs | 4.756 m (67) | 2.213 / 2.189 / 1.962 | 1.934 m | 1.607 (301) | 2.976 (262) | 0.207 / 0.113 / 0.061 / 0.028 / 0.040 / 0.035 | etacomp 7.2e-14 m, trim 2.5e-12 m²/s, \|msl\| 1.9e-16 m |
+  | h3 χ 0.25 linfs | 4.700 m (67) | 2.190 / 2.189 / 1.961 | 1.934 m | 1.606 (301) | 2.975 (262) | 0.146 / 0.066 / 0.048 / 0.028 / 0.040 / 0.035 | 6.0e-14, 2.7e-12, 1.9e-16 |
+  | hz χ 0.1 zstar | 4.775 m (67) | 2.222 / 2.178 / 1.954 | 1.927 m | 1.598 (300) | 2.966 (263) | 0.386 / 0.135 / 0.066 / 0.029 / 0.043 / 0.034 | 7.3e-14, 2.7e-12, 2.1e-16, \|fw\| 2.9e-18; TAIL laysum 2.5e-11 m, w1 4.1e-17 m/s, hlaw 8.2e-12 m |
+
+  Task 5.1 references (same physics and np): SI 2.141 m (745), windows 2.141 / 2.136 / 1.930, 1.928 m at 3000, CFL_z
+  1.589; the old scheme at χ 0.25 (se_a) 4.695 m (67), 2.190 / 2.189 / 1.961, 1.934 m, 1.603; SE zstar (se_z) 4.667 m,
+  2.177 / 2.179 / 1.954, 1.928 m, 1.593. Shelf noise rates: h1 −0.34 / −0.52 %/step (150–330 / 330–480), then
+  −0.03 / +0.01 / +0.03 %/step (480–1000 / 1000–2000 / 2000–3000, i.e. flat at 0.03–0.04 m); h3 −0.30 / −0.18, then
+  +0.01 / +0.01 / +0.03; hz −0.35 / −0.48, then −0.04 / +0.01 / +0.03. **Reading:** with the drag and D4, χ = 0.1
+  runs 3000 steps under linfs and zstar; after step ~500 it is indistinguishable from χ = 0.25 (window maxima within
+  2.3 cm, max|η| at step 3000 equal to 0.1 mm), and the cold-start peak is 5.6 cm higher (χ = 0.1 damps the resolved
+  external waves less). At χ = 0.25 the drag changes nothing visible against the old scheme (window maxima equal to
+  1 mm). Lane C's χ 0.1 + flow closure (Z2): 4.730 m, 1.934 m at 3000, CFL_z 1.607 — the same.
+  **Cost of the drag** (cases c1 / c0 of the same job: χ 0.25, D4, 300 steps, no SE_CHECK, drag on / off, one pair):
+  TMR_OCE_SE_BT 10.90 / 10.59 ms/step (+0.31, +2.9 %), SSH phase 13.67 / 13.19, loop 147.65 / 147.64 ms/step
+- [ ] ⚠️ **Decision for Nikolay** (nothing changed beyond 6a76b29; the default χ stays 0.25): HEAD 6a76b29 is
+  Sergey's Q3 + Q5 as specified, and **its default (χ 0.25, drag on) blows up a cold CORE2 run at step 313** (np 8;
+  the χ 0.25 sanity runs of 48 steps pass). Options: (a) keep the drag (Q3) and restore the stored-sum Coriolis
+  r-term D4 (revert the Coriolis half of 6a76b29: `se_sbar_old` in the state and the checkpoint, 10 SE stores, the old
+  C6/C7 tests; the screened configuration above, stable at χ 0.1–0.25), possibly with χ = 0.1 as the default; (b)
+  keep 6a76b29 and ask Sergey first (packet §6 has the table and the question); (c) both D4 and the first-substep
+  form as a knob. The DBG_CORI switch exists only in the scratch builds (`jobs/s5_E_dbg_cori.py`)
+- Task 5.4 cost: **0.86 node-h** (jobs 28223030 0.12, 28223092 0.12, 28223161 0.01, 28223247 0.19, 28223394 0.43;
+  AllocCPUS/256 × elapsed)
+
 ### Stage 6 — Verify and document
 
 #### Task 6.1: Acceptance check (✅ except G3: Stage 5 pending Nikolay's yes)
@@ -1372,8 +1514,9 @@ sha256 `01e1d34f709fb0e0…`, `fesom_conserve` `1edbc30ba0f7ef18…`.
 |---|---|---|---|---|
 | `se_eta` | (nNodL, 2): η^{−1/M}, η^{−2/M} | nNodL | yes | yes |
 | `se_ubt` | (2, nElemL, 0:2): Ūⁿ, Ū^{−1/M}, Ū^{−2/M} | owned + exchanged eDim | yes | yes (halo ELEM) |
-| `se_sbar_old` | (2, nElemL): š^{n−1} | owned | yes | yes |
-| `se_ubtn` | (2, nElemL): copy of Ūⁿ for V(Ūᵐ − Ūⁿ) | owned + eDim | no | no |
+| ~~`se_sbar_old`~~ | (2, nElemL): š^{n−1}; ➕ removed by Task 5.4 | owned | yes | yes (until Task 5.4) |
+| `se_ubtn` | (2, nElemL): copy of Ūⁿ for V(Ūᵐ − Ūⁿ) and ➕ D(Ūᵐ − Ūⁿ) | owned + eDim | no | no |
+| ➕ `se_kdrag` | (nElemL): C_d·\|u_b\|/Hⁿ, the BT drag rate (Task 5.4) | owned (after the shared sync) | no | no |
 | `se_etam`, `se_etanew` | (nNodL): η^m, η^{m+1} | nNodL (after `exchange_nod`) | no | no |
 | `se_umean`, `se_force` | (2, nElemL) | owned (F: after the shared sync) | no | no |
 | `se_H` | (nElemL): Hⁿ | owned + eDim | no | no |
@@ -1381,22 +1524,23 @@ sha256 `01e1d34f709fb0e0…`, `fesom_conserve` `1edbc30ba0f7ef18…`.
 | `se_kappa` | (MAX_NV, nElemO) | owned (geometry, built once) | no | no |
 
 Scalars in `t_dyn`: `use_ssh_se`, `se_M`, `se_chi`, `se_visc_ah`, `se_check`, `se_ready`, plus the four SM
-coefficients.
+coefficients (➕ and `se_visc_flow`, `se_visc_g0/g1`, `se_bottdrag`).
 
 ### 2. One step
 ```
 predictor (unchanged)                      -> uv = u^{n-1/2}, UV_rhs = u** - u^{n-1/2}, helem^n, eta_n = eta^n
-se_bt_forcing:
-  H^n = sum_k helem^n (nElemL) ; s^n = sum_k helem^n uv ; G = sum_k helem^n UV_rhs
-  F = G/tau + g H^n grad(eta^n) + f e_z x (a2 s^n + a1 s_old)       ! = Rbar - r
-  exchange_elem_shared(F) ; s_old = s^n ; ubtn = U^n ; [zstar] c_{e,v} from zbar_3d_n^n
+se_bt_forcing:                                   (➕ Task 5.4: the U*^0 r-term and the drag rate)
+  H^n = sum_k helem^n (nElemL) ; G = sum_k helem^n UV_rhs ; U*^0 = w0 U^0 + w1 U^-1 + w2 U^-2 (ring)
+  F = G/tau + g H^n grad(eta^n) + f e_z x U*^0                      ! = Rbar - r(first substep)
+  kdrag = C_d |uv(nlevels-1)| / H^n  [FESOM3_SE_BOTTDRAG]
+  exchange_elem_shared(F, kdrag) ; ubtn = U^n ; [zstar] c_{e,v} from zbar_3d_n^n
 se_subcycle (m = 0..M-1):
   U*   = (1.5+beta) U^m - (0.5+2beta) U^{m-1} + beta U^{m-2}
   umean += U*/M
   eta^{m+1} = eta^m + dtbt * (I(U*) - [nonlinfs] W areasvol) / areasvol ; exchange_nod
   etaA = delta eta^{m+1} + (1-delta-gamma-zeta) eta^m + gamma eta^{m-1} + zeta eta^{m-2}   (nNodL)
   HA   = H^n + sum_v elem_w c (etaA - eta^n)
-  U^{m+1} = U^m + dtbt * ( -f e_z x U* - g HA grad(etaA) + F + V(U^m - ubtn) ) ; exchange_elem
+  U^{m+1} = U^m + dtbt * ( -f e_z x U* - g HA grad(etaA) + F + V(U^m - ubtn) - kdrag (U^m - ubtn) ) ; exchange_elem
   shift rings by copy
 se_trim_finish:
   uv = u** - (sum_k helem^n u** - umean) / H^n ; exchange_elem_shared(uv) ; exchange_elem(uv)
@@ -1420,6 +1564,8 @@ and halo exchange of uv. No global reductions outside SE_CHECK and the one-off C
 | `FESOM3_SE_M_FORCE` | 0 | 1 = run below the CFL-guard minimum |
 | `FESOM3_SE_CHI` | 0.25 | SM dissipation parameter (➕ Task 5.0; 0.1 until 2026-10-18) |
 | `FESOM3_SE_VISC_AH` | 0.01 | A_h = value·l_e (m/s); 0 = no BT viscosity |
+| `FESOM3_SE_VISC_FLOW` | 0 | 1 = the flow-dependent viscosity (`FESOM3_SE_VISC_GAMMA0/1`, 10 / 2750) in place of A_h |
+| `FESOM3_SE_BOTTDRAG` | 1 | ➕ Task 5.4: 1 = BT bottom drag D(Ūᵐ − Ūⁿ) in the substeps, 0 = none |
 | `FESOM3_SE_CHECK` | 0 | 1 = per-step invariant suite |
 
 ## Post-Completion

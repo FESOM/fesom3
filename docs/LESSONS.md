@@ -2986,3 +2986,34 @@ more than 300 steps; the consistency invariants will not warn. Watch grid-scale 
 shelves, and find the loop with on/off runs of each link plus a one-mode model. Remedies to weigh
 (plan Task 5.1): more χ, more barotropic viscosity, a filtered η for the ice, the SM2005 averaging
 filter. More substeps is not one.
+
+## L75 — Without a barotropic filter, "subtract the 2-D right-hand side of the first substep" is safe for the drag but not for Coriolis: the 3-D AB2 Coriolis of the unfiltered fast mode stays in F as a force frozen over the step
+
+**Context.** Split-explicit plan, Task 5.4, after Sergey Danilov's answers Q3/Q5 (2026-10-18): put the bottom
+drag into the substeps and reconcile F with the substeps approximately, by removing the barotropic right-hand
+side of the first substep, for the drag and also for Coriolis (in place of the stored-sum r-term D4).
+
+**What happened.**
+- Implemented as F = G/τ + g·Hⁿ·∇ηⁿ + f e_z×U*⁰ (U*⁰ the first substep's AB3 transport) and a drag
+  D(Ūᵐ − Ūⁿ) = −(C_d|u_b|/Hⁿ)(Ūᵐ − Ūⁿ). Every unit test, G0, the invariants, the copy spreads and the restart
+  gates passed.
+- CORE2 cold starts (np 8, 480 steps) then blew up at every χ: 0.1 at step 171 (109 without the drag), 0.2 at
+  243, 0.25 (the default, stable for 3000 steps before) at 313; f e_z×Ūⁿ in place of U*⁰ at 336. The shelf
+  mode changed its period from 3 to 4.5–5 steps. The same build with the old D4 r-term and the drag decayed
+  at every χ, and at χ = 0.1 faster (−0.34 … −0.51 %/step) than any earlier remedy; D4 without the drag
+  reproduced the old scheme line for line. So the drag stabilises and the Coriolis consistency destabilises.
+- Likely mechanism (not separately tested): the 3-D velocity is trimmed to ⟨⟨Ū⟩⟩, which keeps ~80 % of a
+  mode with ωτ ≈ 2, and the 3-D AB2 Coriolis of that mode is off by a factor ~2 at that frequency. D4 removed
+  that term exactly; U*⁰ (instantaneous, end of the previous substeps) does not match it, so a force of
+  relative size ~f/ω ≈ 0.1 or more, set at the step start, stays frozen in F: L74's lagged force with a
+  larger ε. The drag is different: for a depth-uniform fast mode C_d|u_b|·u_b ≈ (C_d|u_b|/H)·Ū, so the
+  anchored substep drag turns the frozen 3-D drag into a drag that follows Ūᵐ within the step.
+- With the SM2005 averaging filter (as in ROMS) the barotropic state handed to the next step is the filtered
+  one, so the 3-D fields carry little of the fast mode; the notes' no-filter design (plan D1) has no such
+  protection. The Zenodo SE code keeps the stored-transport Coriolis removal.
+
+**How to apply.** An "approximate consistency" of the baroclinic forcing with the barotropic operator is only
+harmless for terms whose 3-D discretisation of the fast mode matches the 2-D one. Before replacing an exact
+removal by an approximate one, ask whether the fast barotropic mode is in the 3-D fields (no filter: yes) and
+how the 3-D time scheme (here AB2 at ωτ ≈ 2) treats it. Screen with production physics for ≥ 480 steps at
+every χ of interest, and separate the changes with debug switches (one change per run) before deciding.

@@ -69,6 +69,11 @@ conservation, mesh-delta, regression and self-consistency gates take its place
   - Shchepetkin–McWilliams AB3–AM4 subcycling of the 2-D system after Sergey Danilov's notes, in place
     of the CG solve; linfs and zstar, any rank count, exact restarts. Off by default, and with it off
     the results are byte-identical to the build before it.
+  - The barotropic substeps carry their own bottom drag (on by default), and the barotropic forcing
+    is the 3-D increment minus the barotropic right-hand side of the first substep, Coriolis
+    included (since 2026-10-18, after Sergey Danilov's answers). ⚠️ With this Coriolis form a
+    cold-started CORE2 run blows up within 480 steps even at χ = 0.25; the drag with the earlier
+    Coriolis form is stable down to χ = 0.1. The choice is open (IMPLEMENTATION.md §14).
   - The default dissipation parameter is χ = 0.25 (since 2026-10-18). At χ = 0.1, the earlier
     default, a cold-started CORE2 run blows up after about 7 days (a shelf mode fed through the sea
     ice).
@@ -241,6 +246,8 @@ examples. The most common variables:
 | `FESOM3_SE_M`, `FESOM3_SE_M_FORCE` | substeps per baroclinic step (default `50`); the run stops if M is below the CFL-guard minimum printed at startup (CORE2 at 1800 s: 48 at the default χ 0.25, 40 at χ 0.1) unless `FESOM3_SE_M_FORCE=1` |
 | `FESOM3_SE_CHI` | dissipation parameter χ in [0, 0.25] (default `0.25`; at `0.1` a cold CORE2 run blows up, see "Changes since v1") |
 | `FESOM3_SE_VISC_AH` | barotropic viscosity A_h = value × edge length, the value in m/s (default `0.01`; `0` = off) |
+| `FESOM3_SE_VISC_FLOW` | `1` = the flow-dependent barotropic viscosity of the Zenodo SE code in place of A_h (`FESOM3_SE_VISC_GAMMA0`/`_GAMMA1`, default `10` / `2750`); default `0` |
+| `FESOM3_SE_BOTTDRAG` | barotropic bottom drag in the substeps, r = C_d·\|u_bottom\| frozen over the step: `1` (default) = on, `0` = off (the 3-D drag stays in the forcing either way) |
 | `FESOM3_SE_CHECK` | `1` = one `SE_CHECK` invariant line per step (η compatibility, trim, mean sea level, shared-copy spreads; zstar adds `SE_CHECK_TAIL`); default `0` |
 
 > **Configuration today vs. intent.** The production drivers are configured by these `FESOM3_*`

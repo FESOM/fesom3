@@ -10,7 +10,9 @@ Full pre-M2.12 milestone detail + the per-gate recipes live in [`HANDOFF-archive
   Sergey's notes (`FESOM3_SSH_SE=1`), linfs and zstar, any np, exact restarts; SE off byte-identical to main. At χ = 0.1
   a cold CORE2 run blows up at step ~335 (sea-ice feedback, no code defect); Nikolay approved Stage 5 on 2026-10-18 and
   chose χ = 0.25 as the default (Task 5.0 done, re-verified); the 3000-step screens run stably (Task 5.1); next the
-  1-year twin and perf → section "Split-explicit barotropic solver".
+  1-year twin and perf → section "Split-explicit barotropic solver". ⚠️ Task 5.4 (2026-10-18, commit 6a76b29,
+  Sergey's answers Q3/Q5): barotropic bottom drag (stabilises χ = 0.1) + first-substep Coriolis consistency
+  (destabilises: the default χ 0.25 now blows up a cold CORE2 run at step 313); decision for Nikolay in the plan.
 - **Shared-element velocity sync ✅ DONE (2026-10-12, plan `plans/completed/20261012-shared-element-sync.md`,
   on `bottom-at-vertices`):** a border element is owned by every rank that owns one of its vertices;
   `update_vel` now gives every such element one owner for `uv` (the highest vertex-owner rank, whose copy
@@ -357,8 +359,9 @@ no filter, trim to ⟨⟨Ū⟩⟩; replaces `update_stiff_mat_ale … update_eta
 the SI block verbatim in the `else`). Depth law H_e(η) = Hⁿ + Σ elem_w·c·(η − ηⁿ) (linfs c ≡ 0, zstar c from
 `zbar_3d_n`); F synced once per step from the shared-element owner, gather-only element operators; linear BT
 viscosity on Ūᵐ − Ūⁿ; operator-based CFL guard (power iteration ω_max, Schur–Cohn a_crit(χ), s = 0.9; CORE2 M_min
-40 / 48 at χ 0.1 / 0.25); `FESOM3_SE_CHECK` invariant lines; 10 SE stores in the checkpoint. Knobs (env only):
-`FESOM3_SSH_SE`, `FESOM3_SE_M` (50), `FESOM3_SE_M_FORCE`, `FESOM3_SE_CHI` (0.25; 0.1 until 2026-10-18), `FESOM3_SE_VISC_AH` (0.01),
+40 / 48 at χ 0.1 / 0.25); `FESOM3_SE_CHECK` invariant lines; 8 SE stores in the checkpoint (10 until Task 5.4).
+Knobs (env only): `FESOM3_SSH_SE`, `FESOM3_SE_M` (50), `FESOM3_SE_M_FORCE`, `FESOM3_SE_CHI` (0.25; 0.1 until
+2026-10-18), `FESOM3_SE_VISC_AH` (0.01), `FESOM3_SE_VISC_FLOW` (0), `FESOM3_SE_BOTTDRAG` (1, Task 5.4),
 `FESOM3_SE_CHECK`. Drivers: `fesom_lifecycle_native_mr`, `fesom_conserve`; every other driver stops with SE on.
 Side fix on the branch: zstar restarts rebuild the derived thicknesses after `restart_read` (Task 4.1, LESSONS L73;
 SI-zstar keeps the stiffness gap).

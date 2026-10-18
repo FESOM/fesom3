@@ -178,5 +178,25 @@ answer 3.
 - Consistency of F with the substeps, approximately: subtract from the integrated 3-D forcing the barotropic
   right-hand side at the first substep (the drag, and the same for Coriolis). Coriolis stays in the 3-D AB2 array
   as it is; the stored-sum r-term (š, D4) is replaced by subtracting the barotropic Coriolis at the start of the
-  step. ➕ New task (not started): change of the SE scheme, re-gate, and re-screen χ (the in-substep drag may
-  damp the shelf mode that the frozen drag fed).
+  step. ➕ Implemented and screened as plan Task 5.4 (commit 6a76b29, 2026-10-18); results below.
+
+**➕ Results of answers 3 and 5 (plan Task 5.4, CORE2 production physics, cold start, M = 50, `se_visc_ah` 0.01).**
+Implementation: the drag rate r/H = C_d|u_b|/Hⁿ from the 3-D bottom velocity, frozen over the step; each substep
+adds −(r/H)(Ūᵐ − Ūⁿ), so the 3-D drag stays in F; F = G/τ + g Hⁿ∇ηⁿ + f e_z×U*⁰ with U*⁰ the AB3 transport of the
+first substep (the stored sums š removed). All consistency tests and the restart gates pass.
+
+| r-term for Coriolis | drag | χ = 0.1 | χ = 0.2 | χ = 0.25 |
+|---|---|---|---|---|
+| stored sums š (before) | frozen in F only | +0.91 %/step, blows up at step 340 | — | −0.36 %/step, stable 3000 steps |
+| f e_z×U*⁰ (answer 5) | no | blows up at step 109 | — | — |
+| f e_z×U*⁰ (answer 5) | yes (answer 3) | blows up at step 171 | blows up at step 243 | blows up at step 313 |
+| f e_z×Ūⁿ | yes | — | — | blows up at step 336 |
+| stored sums š | yes (answer 3) | −0.34 / −0.51 %/step (steps 150–330 / 330–480); stable 3000 steps | −0.29 / −0.26 | −0.30 / −0.19 |
+
+(np 8, 480 steps, unless noted; growth of the grid-scale noise on the 20–40 m Antarctic shelf.) So the barotropic
+drag stabilises χ = 0.1, with a faster decay than the flow-dependent viscosity, and the first-substep consistency
+for Coriolis destabilises at every χ. A likely reason: without a filter, the trimmed 3-D velocity still carries the
+fast shelf mode (period 3–5 steps), whose 3-D AB2 Coriolis is far off at that frequency; the stored sums removed it
+exactly, the first-substep value does not, and the difference stays in F frozen over the step. Question for Sergey:
+is the first-substep consistency for Coriolis meant for a scheme with the averaging filter, or should another 2-D
+state (for example the averaged ⟨⟨Ū⟩⟩) enter it?

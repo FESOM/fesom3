@@ -165,10 +165,11 @@ the upwind blend on) and `test_ice_dyn_mixed` D6 (EVP/mEVP sigma copies bitwise 
 
 | Test | Ranks | Checks |
 |---|---|---|
-| `test_ssh_se` C1–C4 | 1, 2, 8 | SM coefficients against hand-computed literals; knob parsing (32 rejected, 11 accepted values); CFL guard (a_crit, the Schur–Cohn radius against numpy, A self-adjoint, ω_max on pi equal at np 1/2/8 bitwise, M_min, the real substep loop stable at 0.97 and unstable at 1.03 a_crit); `se_init` extents and cold-start rings |
-| `test_ssh_se` C5–C11 | 1, 2, 8 | F = 0 for a pure pressure and a pure Coriolis state through the real `compute_vel_rhs`; the substep tendency equals G/τ at η = ηⁿ; viscosity sums to 0 and vanishes for uniform flow; substeps: rest stays at rest, volume and η compatibility to rounding, convergence order ≥ 2 in dtbt; the trim Σhelemⁿuv = ⟨⟨Ū⟩⟩; the `SE_CHECK` values and their response to a planted perturbation and a NaN |
-| `test_ssh_se` P1–P4 | 2, 8 | F before and after the one-owner sync; copy spreads of the Ū ring, ⟨⟨Ū⟩⟩, `uv`, `uv_rhsAB` exactly 0 over 6 steps (and nonzero with the syncs off); inflow-sum ratio ≤ 1.4e-17; np 2 bitwise equal to np 1, np 8 to 7.7e-16 |
+| `test_ssh_se` C1–C4 | 1, 2, 8 | SM coefficients against hand-computed literals; knob parsing (every rejected and accepted value per knob, the defaults, incl. `FESOM3_SE_BOTTDRAG`); CFL guard (a_crit, the Schur–Cohn radius against numpy, A self-adjoint, ω_max on pi equal at np 1/2/8 bitwise, M_min, the real substep loop stable at 0.97 and unstable at 1.03 a_crit); `se_init` extents and cold-start rings |
+| `test_ssh_se` C5–C12 | 1, 2, 8 | F = 0 for a pure pressure state and for the cold-start Coriolis state through the real `compute_vel_rhs`; F = G/τ + f e_z×U\*⁰ for a non-uniform ring; the first substep's tendency equals G/τ (U\* = U\*⁰, η = ηⁿ, Ūᵐ = Ūⁿ); the bottom-drag rate C_d·\|u_b\|/Hⁿ, and D(Ūᵐ − Ūⁿ) is 0 at Ūᵐ = Ūⁿ (bitwise the drag-off tendency), −kdrag·X and linear otherwise; viscosity sums to 0 and vanishes for uniform flow; substeps: rest stays at rest, volume and η compatibility to rounding, convergence order ≥ 2 in dtbt; the trim Σhelemⁿuv = ⟨⟨Ū⟩⟩; the `SE_CHECK` values and their response to a planted perturbation and a NaN |
+| `test_ssh_se` P1–P4 | 2, 8 | F and the drag rate before and after the one-owner sync; copy spreads of the Ū ring, ⟨⟨Ū⟩⟩, `uv`, `uv_rhsAB` exactly 0 over 6 steps (and nonzero with the syncs off); inflow-sum ratio ≤ 1.4e-17; np 2 and np 8 equal to np 1 within the test's 1e-12 (before plan Task 5.4: np 2 bitwise, np 8 7.7e-16) |
 | `test_ssh_se` Z1–Z6 | 1, 2 (+8) | zstar: the depth-law weights c, H_e(ηⁿ) = Σhelemⁿ bitwise, Σhelem^{n+1} = H_e(η^{n+1}) through the real `vert_vel_ale` + `update_thickness_ale` (4.5e-12 m of 5650 m), freshwater in η, one full zstar step with every invariant; c ≡ 0 under linfs |
+| `test_ssh_se` R1 | 1, 2, 8 | the restart registry: with SE on exactly the 8 SE stores (`se_eta1/2`, `se_ubt{0,1,2}_{u,v}`), no `se_sbar_old_*`; with SE off none, the rest unchanged |
 | `fesom_conserve_se_{badswitch,badm,cfl}` | 1 | the driver stops for a bad switch, a bad M and M below the CFL-guard minimum |
 | `fesom_conserve_se_linfs`, `fesom_conserve_se_zstar` | 1; 1, 2 | 20 SE steps on pi with `FESOM3_SE_CHECK=1`: linfs invariants; zstar with the hard conservation gate (1e-12) |
 
@@ -309,10 +310,11 @@ byte diff (plan `docs/plans/2026-10-17-split-explicit.md`):
   with the hard heat/salt/volume gate). The run maxima of the `SE_CHECK` tokens are gated at about
   100 times the levels measured over 1000 steps, the spreads at exactly 0.
 - **Restart.** `run_restart_gate_core2.sh` with `FESOM3_SSH_SE=1`, linfs and zstar, np 1 and 2,
-  mid-run and month-boundary splits: the checkpoint (37 stores including the 10 SE stores) and the
+  mid-run and month-boundary splits: the checkpoint (35 stores including the 8 SE stores; 37 and 10
+  before plan Task 5.4 dropped `se_sbar_old_{u,v}`, whose old checkpoints still resume) and the
   live dumps `max|Δ| = 0`, and the resumed segment's `SE_CHECK` lines equal the straight run's
   (without `msl`, which counts from the process start). `run_restart_gate_multirank.sh` (np 2 → 8):
-  `max|Δ| = 0`. `run_restartroundtrip.sh` adds `FESOM3_RESTARTRT_SE=1` (38 fields round-trip at
+  `max|Δ| = 0`. `run_restartroundtrip.sh` adds `FESOM3_RESTARTRT_SE=1` (36 fields round-trip at
   `max|Δ| = 0`) and `FESOM3_RESTARTRT_SE=2` (a checkpoint without SE state, read with SE on, must
   stop with the message).
 - **Determinism.** The same binary at the same np is bitwise reproducible (CORE2 np 8, 480 steps:

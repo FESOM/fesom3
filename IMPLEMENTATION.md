@@ -486,17 +486,21 @@ Per baroclinic step τ the 2-D system (η, Ū = Σₖ helem·u) takes M substeps
 U*      = (3/2+β) U^m − (1/2+2β) U^{m−1} + β U^{m−2}                          (AB3)
 η^{m+1} = η^m + dtbt·(I(U*) − W·areasvol)/areasvol                          (W: zstar only)
 η^A     = δ η^{m+1} + (1−δ−γ−ζ) η^m + γ η^{m−1} + ζ η^{m−2}                     (AM4)
-U^{m+1} = U^m + dtbt·(−f e_z×U* − g H^A ∇η^A + F + V(U^m − U^n))
+U^{m+1} = U^m + dtbt·(−f e_z×U* − g H^A ∇η^A + F + V(U^m − U^n) + D(U^m − U^n))
 ⟨⟨Ū⟩⟩    = Σ_m U*·(1/M)
 β = 0.281105, ζ = 0.00976186 − 0.13451357χ, γ = 0.083445 − 0.513584χ, δ = ½ + 2ζ + γ + 2χ
 ```
 
 I is the inflow edge scatter of `compute_hbar_ale` (positive = convergence) and χ the dissipation
 parameter. There is no averaging filter: the new elevation is η^M. F is formed once per step from the
-predictor, F = G/τ + g·Hⁿ·∇ηⁿ + f e_z×(a₂šⁿ + a₁š^{n−1}) with G = Σₖ helemⁿ·UV_rhs and š = Σₖ helem·uv.
-It removes from the 3-D increment the pressure gradient and the Coriolis term that the substeps
-compute themselves. Coriolis uses the stored sums š because `compute_vel_rhs` keeps Coriolis and
-momentum advection in one AB2 array; this is exact under linfs and second order under zstar.
+predictor, F = G/τ + g·Hⁿ·∇ηⁿ + f e_z×U\*⁰ with G = Σₖ helemⁿ·UV_rhs and U\*⁰ = (3/2+β)Ū⁰ −
+(1/2+2β)Ū^{−1/M} + βŪ^{−2/M}, the AB3 transport of the first substep. F is the 3-D increment minus the
+barotropic right-hand side of the first substep (Sergey Danilov's answers of 2026-10-18), so the first
+substep is forced exactly as the 3-D predictor and later substeps add only the change of the
+barotropic terms. The 3-D AB2 Coriolis stays in `compute_vel_rhs`, mixed with momentum advection, and
+the substeps' viscosity and drag act on Ūᵐ − Ūⁿ, which is 0 at the first substep. The pressure part
+uses ηⁿ, not the first substep's η^A (which needs η¹). Until 2026-10-18 the r-term rebuilt the 3-D
+Coriolis from stored transport sums (exact under linfs); plan Task 5.4 replaced it.
 
 **What it replaces.** In `step_oce`, `se_bt_forcing → se_subcycle → se_trim_finish` take the place of
 `update_stiff_mat_ale → compute_ssh_rhs_ale → solve_ssh_ale → update_vel → compute_hbar_ale →
@@ -529,8 +533,9 @@ of 5650 m (test_ssh_se Z3); the law H0 + η (c ≡ 1) misses by 0.24–0.26 m. F
 **Shared elements.** A border element has two or three owned copies (§5). SE keeps them bitwise
 equal by construction:
 
-- F is synced once per step from the designated owner (`exchange_elem_shared`).
-- Every per-element operator of the substeps (gradient, Coriolis, viscosity, H^A) is a gather over
+- F and the bottom-drag rate are synced once per step from the designated owner
+  (`exchange_elem_shared`).
+- Every per-element operator of the substeps (gradient, Coriolis, viscosity, drag, H^A) is a gather over
   the element's own vertex and neighbour slots in fixed slot order, so equal inputs give equal
   copies of Ū and ⟨⟨Ū⟩⟩ without a per-substep sync.
 - The one scatter, I into the nodes, writes owned nodes from owned edges.
@@ -545,8 +550,16 @@ test_ssh_se P3).
 **Barotropic viscosity.** The notes' linear harmonic flux form, V_e = Σₖ κ_{e,k}·H_edge·(ΔŪ_nb/Hⁿ_nb −
 ΔŪ_e/Hⁿ_e) with κ = A_h·l/(d·A_e), A_h = `se_visc_ah`·l (l the edge length, d the centroid distance),
 applied to ΔŪ = Ūᵐ − Ūⁿ. It damps only the change within the step and leaves the slow flow alone.
-There is no flow-dependent γ₀/γ₁ term and no barotropic bottom drag (bottom drag stays in the 3-D
-predictor and so in F).
+`FESOM3_SE_VISC_FLOW=1` replaces it with the flow-dependent closure of the Zenodo SE code,
+W(Ūᵐ) − W(Ūⁿ) with ν = √(max(γ₀, γ₁|ΔŪ|/H_edge)·√(A_e + A_nb)) per edge (γ₀ = 10 m³/s², γ₁ = 2750 m²).
+
+**Barotropic bottom drag** (`FESOM3_SE_BOTTDRAG`, on by default; plan Task 5.4). Per element and step
+r_e = C_d·|u_b|, with u_b the velocity of the bottom layer `nlevels(e)−1` at the time of the 3-D
+predictor and C_d = 0.0025, the drag of `impl_vert_visc_ale`, frozen over the step. Each substep adds
+D(Ūᵐ − Ūⁿ) = −(r_e/Hⁿ_e)·(Ūᵐ − Ūⁿ), explicitly: the 3-D drag stays in F, and the substeps damp the
+change within the step (the Zenodo `se_bottdrag` in its explicit form). dtbt·r/H ≤ 4.5e-3 per m/s of
+bottom speed on CORE2's 20 m shelf, far from the explicit limit. The rate r/H is formed once per step
+and synced over the shared elements with F, so the operator is local and the copies stay equal.
 
 **CFL guard.** `se_init` estimates the fastest gravity mode of the substeps' own linear operator,
 A η = −I(Hⁿ·(−g∇η))/areasvol, by 100 power iterations (ω_max; one allreduce and one `exchange_nod` per
@@ -566,16 +579,19 @@ prints nothing when off):
 | `FESOM3_SE_M_FORCE` | 0 | 1 = run below the CFL-guard minimum (with a warning) |
 | `FESOM3_SE_CHI` | 0.25 | dissipation parameter χ, 0 ≤ χ ≤ 0.25 (0.1 until 2026-10-18) |
 | `FESOM3_SE_VISC_AH` | 0.01 | barotropic viscosity A_h = value·l [m/s]; 0 = off |
+| `FESOM3_SE_VISC_FLOW` | 0 | 1 = the flow-dependent viscosity in place of A_h (`FESOM3_SE_VISC_GAMMA0/1`, 10 / 2750) |
+| `FESOM3_SE_BOTTDRAG` | 1 | barotropic bottom drag in the substeps; 0 = none (the 3-D drag stays in F either way) |
 | `FESOM3_SE_CHECK` | 0 | 1 = per-step invariant line `SE_CHECK` (η compatibility, trim, mean sea level, copy spreads; zstar adds `SE_CHECK_TAIL`: layer sum, w(1), depth law) |
 
 The barotropic substeps have their own timer, "(of which) SE barotropic" under "dynamics ssh". At
 CORE2 np 128 SE costs 12.9 ms/step in the SSH phase against SI's 9.1 (loop 146 vs 144 ms/step); the
 planned CPU and GPU measurements are open.
 
-**Restart.** With SE on, the checkpoint carries 10 more stores: `se_eta1`, `se_eta2` (η^{−1/M},
-η^{−2/M}; node), `se_ubt{0,1,2}_{u,v}` (Ūⁿ, Ū^{−1/M}, Ū^{−2/M}; element, halo ELEM) and
-`se_sbar_old_{u,v}` (š^{n−1}; element, halo NONE). The CORE2 lifecycle registers 37 instead of 27
-fields. A resumed SE run equals the straight run (`max|Δ| = 0`, linfs and zstar, np 1 and 2, np 2 → 8
+**Restart.** With SE on, the checkpoint carries 8 more stores: `se_eta1`, `se_eta2` (η^{−1/M},
+η^{−2/M}; node) and `se_ubt{0,1,2}_{u,v}` (Ūⁿ, Ū^{−1/M}, Ū^{−2/M}; element, halo ELEM). The CORE2
+lifecycle registers 35 instead of 27 fields. Checkpoints written before plan Task 5.4 also hold
+`se_sbar_old_{u,v}`; `restart_read` reads only the registered fields, so they resume and the two
+stores are ignored. A resumed SE run equals the straight run (`max|Δ| = 0`, linfs and zstar, np 1 and 2, np 2 → 8
 round trip). Limits:
 
 - An SE run that finds no SE state in the checkpoint stops with "checkpoint has no split-explicit
@@ -602,3 +618,14 @@ needs M ≥ 48 on CORE2 at Δt = 1800 s (the CFL guard). At χ = 0.25, 3000-step
 linfs and zstar, also at M = 48 and without the barotropic viscosity) run stably, and after the cold-start
 transient max|η| stays within a few centimetres of SI's. Details: the plan's Tasks 5.0 and 5.1, LESSONS
 L74 and `docs/se_question_packet.md`.
+
+**⚠️ Task 5.4 (2026-10-18): the drag stabilises, the first-substep Coriolis consistency does not.** The code
+as described above (drag on, F with f e_z×U\*⁰) passes every consistency test and restart gate, but cold
+CORE2 runs with production physics blow up within 480 steps at every χ tested: χ = 0.1 / 0.2 / 0.25 at
+steps 171 / 243 / 313 (np 8; 109 at χ = 0.1 without the drag; f e_z×Ūⁿ in place of U\*⁰ at 336). The same
+code with the earlier stored-sum Coriolis r-term (a debug switch in a scratch build, not in the code) and
+the drag damps the shelf mode at every χ, at χ = 0.1 by 0.3–0.5 % per step where the old scheme grew by
+0.9 %, and runs 3000 steps at χ = 0.1 (linfs and zstar) and 0.25 like the χ = 0.25 screens of Task 5.1
+(max|η| 1.934 m at step 3000, cold-start peak 4.76 m at χ = 0.1). The drag costs 0.3 ms/step of the
+barotropic substeps at np 128. Which Coriolis r-term to keep is open (plan Task 5.4, LESSONS L75, question
+packet §6).
