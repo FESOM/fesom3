@@ -200,3 +200,32 @@ fast shelf mode (period 3–5 steps), whose 3-D AB2 Coriolis is far off at that 
 exactly, the first-substep value does not, and the difference stays in F frozen over the step. Question for Sergey:
 is the first-substep consistency for Coriolis meant for a scheme with the averaging filter, or should another 2-D
 state (for example the averaged ⟨⟨Ū⟩⟩) enter it?
+
+**Follow-up question 4 (what SESM is).** SESM is the AB3–AM4 scheme of Shchepetkin and McWilliams (2005), modified
+by the dissipation of Demange et al. (2019) and Banerjee et al. (2024), eqs. 9 and 10; the parameter values of those
+papers should be used. (Nikolay: the notes are Sergey's note for port_kokkos.)
+
+- SESM is the scheme FESOM_F implements. Banerjee et al. (2024, GMD 17, 7051) eqs. (9)–(10) are the AB3/AM4
+  extrapolations and the substep equations of `oce_ssh_se`. Their parameters: β = 0.281105 (largest stability
+  limit), the dissipation condition 2χ = δ − γ − 2ζ − 1/2 (eq. 26), and the set without third-order phase accuracy
+  ζ ≈ 0.010 − 0.135χ, γ = 0.083 − 0.514χ (eq. 28, the set of their Fig. 1). FESOM_F uses this set (the notes give
+  it to 8 digits). The phase-accurate set of eq. 28 (ζ ≈ −0.123χ + 0.223 − 0.169β − 0.169χ², γ = 1/3 − β − 3ζ − χ²)
+  is not used; the paper says the stability limit is much higher without that constraint.
+- The χ of the papers: Banerjee et al. run the forward–backward scheme with θ = 0.14 (Demange et al.'s value) and
+  compare the schemes in Fig. 1 at "the same dissipation χ = 0.07" (2χ = θ for that scheme, eq. 26). The notes say
+  χ ≈ 0.05–0.1. FESOM_F's default χ = 0.25 is 3.6 times 0.07. ⚠️ Demange et al. (2019, JCP 398, 108875) not read:
+  no open copy was reachable.
+
+On the mechanism proposed for the Task 5.4 blow-ups: correct, but it should not cause a problem if the 3-D
+velocities are made consistent with the barotropic ones before the next 3-D step starts.
+
+- FESOM_F trims the 3-D velocities once, to ⟨⟨Ū⟩⟩^{n+1/2} (notes eq. 4_13, Banerjee eq. 13), and carries them so
+  into the next step. ⟨⟨Ū⟩⟩ is required for the volume and tracer consistency, but it is the step average of the
+  substep transports, not the barotropic transport at n+1/2. Banerjee et al. §2.4 (footnotes 3–4) describe the
+  step FESOM_F lacks: after the tracers are advanced, re-trim the 3-D transports to the barotropic transport at
+  n+1/2 (Ū at m = M/2, or (⟨Ū⟩ⁿ + ⟨Ū⟩ⁿ⁺¹)/2). They found it redundant in practice, with the forward–backward
+  scheme and the Coriolis term omitted from R̄. Without it, the barotropic part of the 3-D velocity, which the 3-D
+  AB2 Coriolis in R acts on, carries the step-averaged fast mode, while the first-substep subtraction uses the
+  instantaneous Ū; with the stored sums (D4) the two cancel exactly whatever the 3-D velocity holds.
+- ➕ Next test (not started): re-trim the 3-D velocities to Ū^{n+1/2} after the tracers, then re-screen the
+  first-substep Coriolis of answer 5 with the drag, at χ = 0.07 (the papers' value), 0.1 and 0.25.
