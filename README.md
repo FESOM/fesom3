@@ -69,8 +69,9 @@ conservation, mesh-delta, regression and self-consistency gates take its place
   - Shchepetkin–McWilliams AB3–AM4 subcycling of the 2-D system after Sergey Danilov's notes, in place
     of the CG solve; linfs and zstar, any rank count, exact restarts. Off by default, and with it off
     the results are byte-identical to the build before it.
-  - Caveat: at the default χ = 0.1 a cold-started CORE2 run blows up after about 7 days (a shelf mode
-    fed through the sea ice); use `FESOM3_SE_CHI=0.25` until the default is decided.
+  - The default dissipation parameter is χ = 0.25 (since 2026-10-18). At χ = 0.1, the earlier
+    default, a cold-started CORE2 run blows up after about 7 days (a shelf mode fed through the sea
+    ice).
   - See [IMPLEMENTATION.md](IMPLEMENTATION.md) §14.
 
 Production runs on Levante with these changes conserve volume to roundoff: CORE2 on 512 ranks (about
@@ -237,8 +238,8 @@ examples. The most common variables:
 | `FESOM3_STEP_DIAG` | per-step global diagnostic line (max\|eta\|, max\|uv\|, ice, Tmax, Smax, and the shared-element numbers `divsum=`, `dUV=`, `dAB=`, `dsig=`); two extra collectives per step, off by default |
 | `FESOM3_SSH_SOLTOL`, `FESOM3_SSH_MAXITER` | SSH solver tolerance and iteration cap — test/diagnostic only, read in `src/oce/oce_ssh_solve.F90` (defaults `1e-5`, `2000`) |
 | `FESOM3_SSH_SE` | free surface: `0` (default) = semi-implicit CG solve, `1` = split-explicit barotropic subcycling (production driver and `fesom_conserve` only; AB2, no cavities). Read in `src/oce/oce_ssh_se.F90`, like the knobs below |
-| `FESOM3_SE_M`, `FESOM3_SE_M_FORCE` | substeps per baroclinic step (default `50`); the run stops if M is below the CFL-guard minimum printed at startup (CORE2 at 1800 s: 40 at χ 0.1, 48 at χ 0.25) unless `FESOM3_SE_M_FORCE=1` |
-| `FESOM3_SE_CHI` | dissipation parameter χ in [0, 0.25] (default `0.1`; on CORE2 use `0.25` for now, see the caveat under "Changes since v1") |
+| `FESOM3_SE_M`, `FESOM3_SE_M_FORCE` | substeps per baroclinic step (default `50`); the run stops if M is below the CFL-guard minimum printed at startup (CORE2 at 1800 s: 48 at the default χ 0.25, 40 at χ 0.1) unless `FESOM3_SE_M_FORCE=1` |
+| `FESOM3_SE_CHI` | dissipation parameter χ in [0, 0.25] (default `0.25`; at `0.1` a cold CORE2 run blows up, see "Changes since v1") |
 | `FESOM3_SE_VISC_AH` | barotropic viscosity A_h = value × edge length, the value in m/s (default `0.01`; `0` = off) |
 | `FESOM3_SE_CHECK` | `1` = one `SE_CHECK` invariant line per step (η compatibility, trim, mean sea level, shared-copy spreads; zstar adds `SE_CHECK_TAIL`); default `0` |
 

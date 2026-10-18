@@ -39,7 +39,9 @@ module oce_ssh_se
     !   FESOM3_SSH_SE      0 (default) = semi-implicit CG, 1 = split-explicit
     !   FESOM3_SE_M        substeps per baroclinic step, an integer >= 1              default 50
     !   FESOM3_SE_M_FORCE  1 = run with M below the CFL-guard minimum (0/1)           default 0
-    !   FESOM3_SE_CHI      SM dissipation parameter, 0 <= chi <= 0.25                 default 0.1
+    !   FESOM3_SE_CHI      SM dissipation parameter, 0 <= chi <= 0.25                 default 0.25
+    !                      (0.1 until 2026-10-18: a cold CORE2 run blew up at step ~335 through
+    !                      the sea ice, plan Task 5.1 note; 0.25 damps that shelf mode)
     !   FESOM3_SE_VISC_AH  BT viscosity A_h = value*l_e [m/s], >= 0; 0 = off          default 0.01
     !   FESOM3_SE_CHECK    1 = per-step invariant suite (0/1)                         default 0
     !                      one rank-0 line per step, key=value tokens (se_check_line):
@@ -156,7 +158,7 @@ contains
 
     !===========================================================================
     subroutine se_read_env(dyn, partit)
-        ! The FESOM3_SE_* knobs into dyn; an unset knob keeps its t_dyn default (M 50, chi 0.1,
+        ! The FESOM3_SE_* knobs into dyn; an unset knob keeps its t_dyn default (M 50, chi 0.25,
         ! visc_ah 0.01, check and force off). Stops on a bad value. Called by se_init.
         type(t_dyn),    intent(inout) :: dyn
         type(t_partit), intent(in)    :: partit

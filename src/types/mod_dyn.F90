@@ -145,7 +145,7 @@ module mod_dyn
         ! no ring offset is state.
         logical       :: use_ssh_se = .false.   ! FESOM3_SSH_SE=1
         integer       :: se_M       = 50        ! substeps per baroclinic step (FESOM3_SE_M)
-        real(kind=WP) :: se_chi     = 0.1_WP    ! SM dissipation parameter chi (FESOM3_SE_CHI)
+        real(kind=WP) :: se_chi     = 0.25_WP   ! SM dissipation parameter chi (FESOM3_SE_CHI)
         real(kind=WP) :: se_visc_ah = 0.01_WP   ! BT viscosity A_h = se_visc_ah*l_e [m/s]; 0 = off (FESOM3_SE_VISC_AH)
         logical       :: se_check   = .false.   ! per-step invariant suite (FESOM3_SE_CHECK)
         logical       :: se_m_force = .false.   ! run with M below the CFL-guard minimum (FESOM3_SE_M_FORCE)

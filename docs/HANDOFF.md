@@ -5,11 +5,12 @@ Full pre-M2.12 milestone detail + the per-gate recipes live in [`HANDOFF-archive
 
 ## Where we are
 
-- **Split-explicit barotropic solver — Stages 0–4 DONE, Stage 6 DONE except the G3 numbers, Stage 5 OPEN
+- **Split-explicit barotropic solver — Stages 0–4 DONE, Stage 6 DONE except the G3 numbers, Stage 5 RUNNING
   (2026-10-18, branch `split-explicit`, worktree `/work/ab0995/a270088/fesom3_se`, unpushed):** SE subcycling after
-  Sergey's notes (`FESOM3_SSH_SE=1`), linfs and zstar, any np, exact restarts; SE off byte-identical to main. Open: at the default χ = 0.1 a cold CORE2
-  run blows up at step ~335 (sea-ice feedback, no code defect); Stage 5 (default χ / `se_visc_ah` or another remedy,
-  then screens, 1-year twin, perf; ≈ 3–5 node-h) needs Nikolay's yes → section "Split-explicit barotropic solver".
+  Sergey's notes (`FESOM3_SSH_SE=1`), linfs and zstar, any np, exact restarts; SE off byte-identical to main. At χ = 0.1
+  a cold CORE2 run blows up at step ~335 (sea-ice feedback, no code defect); Nikolay approved Stage 5 on 2026-10-18 and
+  chose χ = 0.25 as the default (Task 5.0 done, re-verified); next the screens, the 1-year twin and perf → section
+  "Split-explicit barotropic solver".
 - **Shared-element velocity sync ✅ DONE (2026-10-12, plan `plans/completed/20261012-shared-element-sync.md`,
   on `bottom-at-vertices`):** a border element is owned by every rank that owns one of its vertices;
   `update_vel` now gives every such element one owner for `uv` (the highest vertex-owner rank, whose copy
@@ -357,7 +358,7 @@ the SI block verbatim in the `else`). Depth law H_e(η) = Hⁿ + Σ elem_w·c·(
 `zbar_3d_n`); F synced once per step from the shared-element owner, gather-only element operators; linear BT
 viscosity on Ūᵐ − Ūⁿ; operator-based CFL guard (power iteration ω_max, Schur–Cohn a_crit(χ), s = 0.9; CORE2 M_min
 40 / 48 at χ 0.1 / 0.25); `FESOM3_SE_CHECK` invariant lines; 10 SE stores in the checkpoint. Knobs (env only):
-`FESOM3_SSH_SE`, `FESOM3_SE_M` (50), `FESOM3_SE_M_FORCE`, `FESOM3_SE_CHI` (0.1), `FESOM3_SE_VISC_AH` (0.01),
+`FESOM3_SSH_SE`, `FESOM3_SE_M` (50), `FESOM3_SE_M_FORCE`, `FESOM3_SE_CHI` (0.25; 0.1 until 2026-10-18), `FESOM3_SE_VISC_AH` (0.01),
 `FESOM3_SE_CHECK`. Drivers: `fesom_lifecycle_native_mr`, `fesom_conserve`; every other driver stops with SE on.
 Side fix on the branch: zstar restarts rebuild the derived thicknesses after `restart_read` (Task 4.1, LESSONS L73;
 SI-zstar keeps the stiffness gap).
@@ -378,9 +379,13 @@ SI-zstar keeps the stiffness gap).
   SE at χ = 0.1 (linfs and zstar): guard line M_min = 40, invariants at the np 1 levels, spreads 0; the SE gate runs
   are bitwise equal to the Stage 4 runs of the pre-rebase tree. No fixup needed. 0.18 node-h.
 
-**Open — Stage 5, needs Nikolay's yes (estimate: CORE2 year ≈ 42 min on one node, 3000 steps ≈ 7 min; ≈ 3–5
+**Stage 5, approved by Nikolay on 2026-10-18 (estimate: CORE2 year ≈ 42 min on one node, 3000 steps ≈ 7 min; ≈ 3–5
 node-h in total).**
-1. Decide the default first: at χ = 0.1, M = 50, `se_visc_ah` 0.01 a cold CORE2 run with production physics blows
+0. ✅ Task 5.0 (job 28220536): the default χ is now 0.25 (B1 below). ctest Intel 176/176, GNU 170/176 (the 6); G0
+   GREEN; `run_conserve_pi.sh` GATE OK at χ = 0.25 (levels unchanged); SE linfs restart gate np 2 GREEN; CORE2 np 8,
+   48 steps at the defaults: guard `chi = 0.2500 … M_min = 48`, invariants at the χ = 0.1 levels, max|η| 4.19 m (linfs)
+   / 4.21 m (zstar).
+1. The decision, for the record: at χ = 0.1, M = 50, `se_visc_ah` 0.01 a cold CORE2 run with production physics blows
    up at step 331–340 (linfs and zstar, np 8 and 128). Diagnosis (plan Task 5.1 note, LESSONS L74): a 3-step-period
    grid-scale gravity mode on the 20 m Bellingshausen shelf under compact ice, +0.9 %/step, fed through the ice
    (ice reads ηⁿ, ice→ocean stress frozen in F). Measured stable: χ = 0.25, `se_visc_ah` = 0.1 (480 steps).
@@ -392,7 +397,8 @@ node-h in total).**
    the G3 numbers exist. Later: JAX port of SE (bitwise against this code), NEMO SE, storing M/χ in the checkpoint.
 
 **Gotchas.**
-- CORE2 SE gate runs longer than ~300 steps need `FESOM3_SE_CHI=0.25` until the default is decided.
+- χ = 0.1 (the default until 2026-10-18) blows up a cold CORE2 production-physics run near step 335; the default
+  is now 0.25 (Task 5.0). Runs that set `FESOM3_SE_CHI` explicitly keep their value.
 - M and χ must stay fixed across a restart chain (not stored, not checked); SE → SI is not detected.
 - The restart gate scripts default to a stale `F3`: always pass `F3=` and `BUILD=`. They `rm -rf` their run dir:
   pass a fresh one.

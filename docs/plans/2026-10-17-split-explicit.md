@@ -131,7 +131,7 @@ GMD 17, 7051). Afterwards the 3-D velocities are trimmed to the time-mean transp
 
 | # | fork | decision |
 |---|---|---|
-| D1 | time stepping | SM AB3–AM4 as in the notes, no filtering, χ = 0.1, M per mesh with a startup CFL guard |
+| D1 | time stepping | SM AB3–AM4 as in the notes, no filtering, χ = 0.1, M per mesh with a startup CFL guard (➕ default χ = 0.25 since 2026-10-18, Task 5.0) |
 | D2 | shared elements | sync the barotropic forcing F **once per step** (one owner). Every per-substep element operator is a per-element **gather** in fixed slot order, so the copies stay bitwise equal by construction; the copy spreads of Ū and ⟨⟨Ū⟩⟩ (= 0) prove it. Per substep: `exchange_nod(η)` + `exchange_elem(Ū)`. The trim keeps update_vel's uv sync |
 | D3 | BT depth | H_e(η) = Hⁿ_e + Σ_v elem_w·c_{e,v}·(η_v − ηⁿ_v): the zstar law under the vertex bottom. c is recomputed once per step from zbar_3d_nⁿ; linfs is c ≡ 0. One depth function, no mode branch in the substep loop |
 | D4 | Coriolis in r | stored sum (port_kokkos D4): šⁿ = Σhelemⁿ·uv^{n−1/2}, r_cor = f×(a₂šⁿ + a₁š^{n−1}). Exact under linfs, second order under zstar. `compute_vel_rhs` untouched |
@@ -1046,17 +1046,67 @@ FESOM3_SE_CHECK=1`, M = 50, χ = 0.1, visc_ah = 0.01 unless stated, Intel build 
 Estimate: CORE2 year ≈ 42 min on one node (SI, 144 ms/step); 3000 steps ≈ 7 min. Total ≈ 3–5 node-hours, one
 sbatch at a time or in a short chain; each wait is a background `sacct` watcher.
 
+➕ **Approved by Nikolay on 2026-10-18** (the whole stage 3–5 node-hours), together with the decision on the default
+below (Task 5.0).
+
+#### ➕ Task 5.0: default χ = 0.25 ✅
+
+*Nikolay, 2026-10-18: the default χ becomes 0.25 (remedy B1 of the Task 5.1 note); M = 50 and `se_visc_ah` = 0.01
+stay. On CORE2 at Δt 1800 s the CFL guard then gives M_min = 48, and M = 50 runs at ω_max·dtbt = 0.854 a_crit(0.25)
+(the guard admits up to 0.9; the real substeps' limit is M = 43, Task 5.1 note (A)).*
+
+**Files:**
+- Modify: `src/types/mod_dyn.F90` (`se_chi = 0.25_WP`), `src/oce/oce_ssh_se.F90` (header knob table, `se_read_env`)
+- Modify: `test/test_ssh_se.F90` (C1, C3d, C4)
+- Modify: README.md, IMPLEMENTATION.md §14, TESTING.md §6c, docs/HANDOFF.md, docs/se_question_packet.md,
+  `tools/run_conserve_pi.sh` (header), this plan (D1, Technical Details §4)
+
+- [x] the default: `t_dyn%se_chi = 0.25_WP`; the knob comments say 0.25 (and why 0.1 was dropped); the facts
+  about χ = 0.1 (a_crit 1.579, M_min 40, the blow-up) stay as facts
+- [x] tests: C3d asserts the default 0.25 and derives pi's M_min from it; C4 checks the unset knob = 0.25 and the
+  χ = 0.25 coefficients in t_dyn; C1 keeps the χ = 0.1 literals and adds the χ = 0.25 ones (β unchanged, ζ =
+  −0.0238665325, γ = −0.044951, δ = 0.907315935). pi at χ = 0.25: a_crit 1.3291, dtbt ≤ 200.027 s, **M_min = 9**
+  (8 at χ = 0.1), so the ctest M = 40 and the default 50 pass
+- [x] scripts: no tools/*.sh or ctest relied on χ = 0.1 by name. The SE ctests, the SE blocks of
+  `run_conserve_pi.sh` and the SE restart gates run at the default, so they now test χ = 0.25 (meant: they test
+  the default); none sets `FESOM3_SE_CHI`. `run_g0_se.sh` is SE off
+- [x] GATE (job 28220536, shared, 32 cores, 9.8 min, 0.12 node-h; script and logs
+  `/work/ab0995/a270088/fesom3_se_ref/jobs/s5_A_verify.sbatch`, `s5_A_*.28220536.*`; run dirs
+  `/scratch/a/a270088/se_s5a/s5_A_*_28220536`), HEAD 741ddc7 + these edits, incremental builds (Intel 43 s, GNU 43 s).
+  Intel `fesom_lifecycle_native_mr` sha256 `06e8e1080aa85da0…`, `fesom_conserve` `69db593181e9ee8c…`:
+  - **ctest Intel 176/176; GNU 170/176, exactly the 6 known failures** (`test_wimpl_tra_np1/np2`,
+    `meshdiag_mixed/quad/pi_w`, `test_shared_elem_np1`; the serial rerun fails the same 6)
+  - **G0 GREEN** (linfs, zstar: 99 checkpoint variables and 1 649 154 dump records max|Δ| = 0, 20 step lines
+    equal; conserve 249 lines, 26 configs), 393 s
+  - **`run_conserve_pi.sh` GATE OK, 36 configs**, now at χ = 0.25: SE linfs np 1/2/8 etacomp ≤ 2.1e-15 m, trim
+    ≤ 2.3e-13 m²/s, |msl| ≤ 1.3e-16 m; SE zstar np 1/2/8 etacomp ≤ 2.1e-15 m, trim ≤ 1.7e-13, |msl| ≤ 1.3e-16,
+    laysum ≤ 4.5e-12 m, w1 ≤ 1.2e-18 m/s, hlaw ≤ 6.4e-12 m, spreads 0 (the χ = 0.1 levels of Task 6.1, the
+    thresholds unchanged), 95 s
+  - **SE linfs restart gate np 2 GREEN** (`run_restart_gate_core2.sh` N4 K2, mid-run and month boundary, 37 stores,
+    checkpoint and live dump max|Δ| = 0, resumed SE_CHECK lines equal), 284 s
+  - CORE2 `prod_env 1e-5` np 8, 48 steps, SE + SE_CHECK, no `FESOM3_SE_*` but the switch and the check: the guard
+    line `M = 50, dtbt = 36.000 s, chi = 0.2500` … `omega_max = 3.1518E-02 1/s (100 power iterations, last change
+    0.0E+00), a_crit(chi) = 1.3291, s = 0.90 -> dtbt <= 37.952 s -> M_min = 48` (0.06-0.09 s), M = 50 passes;
+    **linfs: etacomp ≤ 2.0e-14 m, trim ≤ 3.4e-13 m²/s, |msl| ≤ 8.1e-16 m, divsum ≤ 7.3e-16, dUV = dAB = dsig = 0,
+    max|η| 4.19 m (step 48), max CFL_z 0.823 (step 24)** (χ = 0.1: 4.29 m at step 31, 0.868); **zstar: etacomp
+    ≤ 2.0e-14 m, trim ≤ 3.4e-13, |msl| ≤ 7.2e-16 m, |fw| ≤ 4.7e-18 m, laysum ≤ 5.5e-12 m, w1 ≤ 1.1e-17 m/s, hlaw
+    ≤ 8.2e-12 m, max|η| 4.21 m (step 31), max CFL_z 0.619** (χ = 0.1: 4.33 m, 0.626); spreads 0, no NaN; 80 s / 89 s
+
 #### Task 5.1: 3000-step screens
 
 **Files:**
 - Create: `tools/run_se_screen_core2.sbatch` (prod_env + SE knobs; `--hint=nomultithread --mem=0`)
 
+➕ **Nikolay, 2026-10-18: χ = 0.25 is the default (remedy B1 below; ➕ Task 5.0).** The screens are adapted to it:
+(a) is the new default (χ 0.25, M 50, `se_visc_ah` 0.01), (b) M_min at χ = 0.25, (c) and (d) at χ = 0.25; χ = 0.1
+is not re-run (it blows up near step 335, below).
+
 - [ ] SI baseline and SE screens, 3000 steps each, CORE2 `prod_env`:
-  - (a) χ = 0.1, M = 50;
+  - (a) χ = 0.1, M = 50 (➕ now the default χ = 0.25, M = 50);
   - (b) M = M_min from the guard (➕ the operator-based guard of Task 0.4: 40 at χ = 0.1, 48 at χ = 0.25 on CORE2
-    at Δt 1800 s);
-  - (c) `se_visc_ah = 0`;
-  - (d) zstar headline
+    at Δt 1800 s; ➕ run: M = 48 at χ = 0.25);
+  - (c) `se_visc_ah = 0` (➕ at χ = 0.25, M = 50);
+  - (d) zstar headline (➕ SE zstar at the defaults, and SI zstar as its baseline)
 - [ ] per screen, record: max|η| over time, cold-start peak, max CFL_z, max|uv|, divsum, SE_CHECK, NaN. Decide
   whether the linear viscosity suffices (⚠️ if (a) misbehaves: try the γ1 term in the same gather operator, as a
   new task)
@@ -1147,7 +1197,8 @@ sbatch at a time or in a short chain; each wait is a background `sacct` watcher.
 **Files:**
 - Modify: `tools/zarr_diff.py` (field-statistics mode) if it fits; otherwise create `tools/se_twin_diff.py`
 
-- [ ] two 1-year runs from the same cold start (SI, SE χ = 0.1 / M from 5.1), monthly means on
+- [ ] two 1-year runs from the same cold start (SI, SE χ = 0.1 / M from 5.1; ➕ SE at the default χ = 0.25 of
+  Task 5.0), monthly means on
 - [ ] annual-mean SSH difference (rms, max; port_kokkos reference 0.2 mm / 2.9 mm), global-mean SSH and salt drift,
   sea-ice area; record the numbers here
 
@@ -1280,7 +1331,7 @@ and halo exchange of uv. No global reductions outside SE_CHECK and the one-off C
 | `FESOM3_SSH_SE` | 0 | 1 = split-explicit |
 | `FESOM3_SE_M` | 50 | substeps per baroclinic step |
 | `FESOM3_SE_M_FORCE` | 0 | 1 = run below the CFL-guard minimum |
-| `FESOM3_SE_CHI` | 0.1 | SM dissipation parameter |
+| `FESOM3_SE_CHI` | 0.25 | SM dissipation parameter (➕ Task 5.0; 0.1 until 2026-10-18) |
 | `FESOM3_SE_VISC_AH` | 0.01 | A_h = value·l_e (m/s); 0 = no BT viscosity |
 | `FESOM3_SE_CHECK` | 0 | 1 = per-step invariant suite |
 

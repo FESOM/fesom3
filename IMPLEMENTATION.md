@@ -552,8 +552,8 @@ predictor and so in F).
 A η = −I(Hⁿ·(−g∇η))/areasvol, by 100 power iterations (ω_max; one allreduce and one `exchange_nod` per
 iteration). It then sets M_min = ⌈τ·ω_max/(s·a_crit(χ))⌉, where a_crit is the AB3–AM4 stability
 limit for one oscillator (Schur–Cohn test of the characteristic polynomial: 1.853 / 1.579 / 1.329
-at χ = 0 / 0.1 / 0.25) and s = 0.9. CORE2 at Δt = 1800 s: ω_max = 3.15e-2 s⁻¹, M_min = 40 at χ = 0.1
-and 48 at χ = 0.25 (0.06 s at np 8). A smaller M stops the run unless `FESOM3_SE_M_FORCE=1`. The
+at χ = 0 / 0.1 / 0.25) and s = 0.9. CORE2 at Δt = 1800 s: ω_max = 3.15e-2 s⁻¹, M_min = 48 at the default
+χ = 0.25 and 40 at χ = 0.1 (0.06 s at np 8). A smaller M stops the run unless `FESOM3_SE_M_FORCE=1`. The
 resolution estimate 0.5·res/√(gH) used before is not a stability limit (LESSONS L72).
 
 **Knobs** (environment only, value-checked; the `FESOM3_SE_*` knobs are read only with SE on, and SE
@@ -564,7 +564,7 @@ prints nothing when off):
 | `FESOM3_SSH_SE` | 0 | 1 = split-explicit, 0 = CG; any other value stops |
 | `FESOM3_SE_M` | 50 | substeps per baroclinic step (≥ the CFL-guard minimum) |
 | `FESOM3_SE_M_FORCE` | 0 | 1 = run below the CFL-guard minimum (with a warning) |
-| `FESOM3_SE_CHI` | 0.1 | dissipation parameter χ, 0 ≤ χ ≤ 0.25 |
+| `FESOM3_SE_CHI` | 0.25 | dissipation parameter χ, 0 ≤ χ ≤ 0.25 (0.1 until 2026-10-18) |
 | `FESOM3_SE_VISC_AH` | 0.01 | barotropic viscosity A_h = value·l [m/s]; 0 = off |
 | `FESOM3_SE_CHECK` | 0 | 1 = per-step invariant line `SE_CHECK` (η compatibility, trim, mean sea level, copy spreads; zstar adds `SE_CHECK_TAIL`: layer sum, w(1), depth law) |
 
@@ -590,12 +590,13 @@ round trip). Limits:
   neither dhe nor the accumulated values are in the checkpoint (the resumed run departs at its first
   SSH solve). SE does not use the matrix, so SE-zstar is exact.
 
-**Open: stability at the default χ = 0.1 on CORE2.** With the defaults (χ 0.1, M 50, `se_visc_ah`
-0.01), a cold-started CORE2 run with production physics blows up at step 331–340 (day 7), at np 8 and
-np 128, under linfs and zstar. The cause is a grid-scale gravity mode with a period of 3 baroclinic
+**Default χ = 0.25: the blow-up at χ = 0.1 on CORE2.** With χ = 0.1 (the default until 2026-10-18),
+M 50 and `se_visc_ah` 0.01, a cold-started CORE2 run with production physics blows up at step 331–340
+(day 7), at np 8 and np 128, under linfs and zstar. The cause is a grid-scale gravity mode with a period of 3 baroclinic
 steps on the 20 m Antarctic shelf near 74°W 72°S under compact sea ice; it grows by 0.9 % per step.
 The feedback runs through the sea ice: the ice reads ηⁿ, and its stress on the ocean enters F frozen
 over the step. Removing the ice–ocean stress or the ice's view of η removes the growth. SI's
 backward-Euler damping hides the same coupling. χ = 0.25 and `se_visc_ah` = 0.1 run the 480 screened
-steps stably; the default is not decided yet. Details: the plan's Task 5.1 note, LESSONS L74 and
-`docs/se_question_packet.md`. CORE2 gate runs longer than ~300 steps use `FESOM3_SE_CHI=0.25`.
+steps stably. On 2026-10-18 χ = 0.25 became the default (plan Task 5.0); it damps that shelf mode and
+needs M ≥ 48 on CORE2 at Δt = 1800 s (the CFL guard). Details: the plan's Tasks 5.0 and 5.1, LESSONS
+L74 and `docs/se_question_packet.md`.

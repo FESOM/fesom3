@@ -11,8 +11,8 @@ step block; the predictor and the ALE/tracer tail are unchanged. Off by default.
 
 - **Scheme:** the AB3–AM4 subcycling of Sergey's notes (Shchepetkin & McWilliams 2005; Banerjee et al.
   2024), β = 0.281105, ζ, γ, δ as functions of χ, M substeps of dtbt = τ/M. No averaging filter:
-  ⟨⟨Ū⟩⟩ = Σ U*/M, η^{n+1} = η^M, and `eta_n` = `hbar` = η^M at integer levels. Defaults χ = 0.1,
-  M = 50.
+  ⟨⟨Ū⟩⟩ = Σ U*/M, η^{n+1} = η^M, and `eta_n` = `hbar` = η^M at integer levels. Defaults χ = 0.25
+  (0.1 until 2026-10-18, see section 3), M = 50.
 - **Transports and forcing:** Ū = Σₖ helem·u, R = Σₖ helemⁿ·UV_rhs, where UV_rhs is the full 3-D
   predictor increment (`compute_vel_rhs` with the vector-invariant momentum advection and
   `rvo_upwind` 1, `viscosity_filter`, the implicit vertical viscosity and the explicit bottom drag).
@@ -55,7 +55,7 @@ step block; the predictor and the ALE/tracer tail are unchanged. Off by default.
 | dtbt convergence (pi, Gaussian bump) | order 2.0–2.3 |
 
 The CORE2 runs at 480 steps use χ = 0.25 (section 3). Not done yet: the 3000-step physics screens, a
-1-year SE-vs-SI twin and the timing comparison (needs a decision on the defaults first). Timing seen so
+1-year SE-vs-SI twin and the timing comparison (started on 2026-10-18 with χ = 0.25 as the new default). Timing seen so
 far (CORE2, one node, np 128): SSH phase 12.9 ms/step with SE vs 9.1 with SI, loop 146 vs 144 ms/step.
 
 **Transients.** SE resolves the cold-start external gravity waves that SI's θ = 1 damps: max|η| in the
@@ -116,8 +116,9 @@ elevation at the start of the step and frozen over it reproduces the pattern: χ
 ## 5. Questions
 
 1. **Damping.** Which remedy do you recommend: a larger χ (0.25?), the linear barotropic viscosity at
-   0.1 m/s, the γ₀/γ₁ flow-dependent viscosity, or the SM2005 averaging filter? Is χ = 0.25 acceptable
-   for production, given that it damps the resolved external waves more?
+   0.1 m/s, the γ₀/γ₁ flow-dependent viscosity, or the SM2005 averaging filter? We made χ = 0.25 the
+   default on 2026-10-18; is it acceptable for production, given that it damps the resolved external
+   waves more?
 2. **The ice coupling.** Should the sea ice see a time-filtered elevation (for example the substep mean
    of η) instead of η^M? Is there a standard choice in SE models with sea ice?
 3. **Bottom drag in F.** The explicit 3-D bottom drag enters the barotropic forcing frozen over the

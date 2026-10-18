@@ -332,8 +332,10 @@ Measured invariant levels and thresholds (pi over 1000 steps, np 1/2/8; CORE2 pr
 | hlaw [m] | — | 7.3e-12 | — / 8e-10 | — | 8.2e-12 |
 | spreadU, spreadUm | 0 | 0 | 0 exactly | 0 | 0 |
 
-The CORE2 480-step runs use χ = 0.25 because at the default χ = 0.1 a cold-started CORE2 run blows
-up near step 335 ([IMPLEMENTATION.md](IMPLEMENTATION.md) §14, open). The physics screens, the
+The CORE2 480-step runs used χ = 0.25 because at χ = 0.1, the default until 2026-10-18, a
+cold-started CORE2 run blows up near step 335 ([IMPLEMENTATION.md](IMPLEMENTATION.md) §14). χ = 0.25
+is now the default (plan Task 5.0), so the SE gates above run at χ = 0.25; the pi levels and
+thresholds in the table were measured at χ = 0.1 and still hold. The physics screens, the
 1-year SE-vs-SI twin and the SSH-phase timing (plan Stage 5) have not run yet.
 
 ### 7. Multi-rank and partition independence
