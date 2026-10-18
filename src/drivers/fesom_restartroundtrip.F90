@@ -125,7 +125,7 @@ program fesom_restartroundtrip
     allocate(ice%thermo%t_skin(nNodL))                     ! carried thermo skin temp (NODE 2-D)
     allocate(ice%work%sigma11(nElemF), ice%work%sigma12(nElemF), ice%work%sigma22(nElemF))
     ! split-explicit carried state, with se_init's shapes (node rings nNodL; element rings nElemL)
-    allocate(dyn%se_eta(nNodL, 2), dyn%se_ubt(2, nElemL, 0:2))
+    allocate(dyn%se_eta(nNodL, 2), dyn%se_ubt(2, nElemL, 0:2), dyn%se_sbar_old(2, nElemL))
 
     ! ---- zero-init the WHOLE arrays (halo + eXDim start finite at 0 = the fresh-allocate baseline) -----
     dyn%eta_n = 0; dyn%d_eta = 0; dyn%ssh_rhs_old = 0
@@ -139,7 +139,7 @@ program fesom_restartroundtrip
     end do
     ice%uice = 0; ice%vice = 0; ice%thermo%t_skin = 0
     ice%work%sigma11 = 0; ice%work%sigma12 = 0; ice%work%sigma22 = 0
-    dyn%se_eta = 0; dyn%se_ubt = 0
+    dyn%se_eta = 0; dyn%se_ubt = 0; dyn%se_sbar_old = 0
 
     ! ---- fill OWNED nodes (value = g for 2-D ; g + 0.5*L for 3-D) -------------------------------------
     do i = 1, nNodO
@@ -175,6 +175,7 @@ program fesom_restartroundtrip
             dyn%se_ubt(1,i,L) = ve + 0.125_WP + 0.25_WP*real(L, WP)
             dyn%se_ubt(2,i,L) = ve + 0.25_WP  + 0.25_WP*real(L, WP)
         end do
+        dyn%se_sbar_old(1,i) = ve + 0.0625_WP; dyn%se_sbar_old(2,i) = ve + 0.1875_WP
         do L = 1, nl-1
             v3 = ve + 0.5_WP*real(L, WP)
             dyn%uv(:,L,i)        = v3

@@ -140,9 +140,9 @@ module mod_dyn
         ! The knobs (env, se_read_env), the Shchepetkin-McWilliams (2005) AB3-AM4 coefficients
         ! and the state of docs/plans/2026-10-17-split-explicit.md (Technical Details §1). se_init
         ! sets them and allocates the arrays ONLY when SE is on; the semi-implicit path never
-        ! touches them. Not in write/read_t_dyn: the carried arrays (se_eta, se_ubt) belong to the
-        ! Zarr checkpoint (mod_io_restart). Ring levels are shifted by copying, so no ring offset
-        ! is state.
+        ! touches them. Not in write/read_t_dyn: the carried arrays (se_eta, se_ubt, se_sbar_old)
+        ! belong to the Zarr checkpoint (mod_io_restart). Ring levels are shifted by copying, so
+        ! no ring offset is state.
         logical       :: use_ssh_se = .false.   ! FESOM3_SSH_SE=1
         integer       :: se_M       = 50        ! substeps per baroclinic step (FESOM3_SE_M)
         real(kind=WP) :: se_chi     = 0.25_WP   ! SM dissipation parameter chi (FESOM3_SE_CHI)
@@ -160,6 +160,7 @@ module mod_dyn
         real(kind=WP) :: se_delta = 0.0_WP
         real(kind=WP), allocatable, dimension(:,:)   :: se_eta        ! (nNodL,2): eta^{-1/M}, eta^{-2/M}
         real(kind=WP), allocatable, dimension(:,:,:) :: se_ubt        ! (2,nElemL,0:2): U^n, U^{-1/M}, U^{-2/M}
+        real(kind=WP), allocatable, dimension(:,:)   :: se_sbar_old   ! (2,nElemL): s^{n-1} = sum_k helem*uv
         real(kind=WP), allocatable, dimension(:,:)   :: se_ubtn       ! (2,nElemL): copy of U^n for V, D(U^m - U^n)
         real(kind=WP), allocatable, dimension(:)     :: se_kdrag      ! (nElemL): BT drag rate C_d*|u_bottom|/H^n [1/s]
         real(kind=WP), allocatable, dimension(:)     :: se_etam       ! (nNodL): eta^m

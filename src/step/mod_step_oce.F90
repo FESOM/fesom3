@@ -245,7 +245,7 @@ contains
             ! and halo-exchanged), hbar/hbar_old, eta_n and ssh_rhs_old as the block below does, so
             ! the tail is unchanged. partit is present here (se_step_guard). The hbar and eta_n
             ! dumps keep their substep ids; there is no ssh_rhs / d_eta in SE.
-            call se_bt_forcing(dynamics, mesh, partit, dt)
+            call se_bt_forcing(dynamics, mesh, partit, dt, lfirst)
             call se_subcycle(dynamics, mesh, partit, dt, water_flux)
             call se_trim_finish(dynamics, mesh, partit, dt, n, water_flux)
             call dump_node_2d(DUMP_SUBSTEP_HBAR, n, 'hbar', mesh%hbar)

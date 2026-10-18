@@ -280,7 +280,7 @@ contains
     !     elem 2-D : sigma11 sigma12 sigma22
     !     split-explicit (only when dyn%use_ssh_se; FESOM_F's own, no FESOM2 counterpart):
     !       node 2-D : se_eta1 se_eta2
-    !       elem 2-D : se_ubt0_u se_ubt0_v se_ubt1_u se_ubt1_v se_ubt2_u se_ubt2_v
+    !       elem 2-D : se_ubt0_u se_ubt0_v se_ubt1_u se_ubt1_v se_ubt2_u se_ubt2_v se_sbar_old_u se_sbar_old_v
     subroutine restart_register_state(R, dyn, tracers, ice, mesh, mix_scheme)
         type(t_restart), intent(inout)      :: R
         type(t_dyn),     intent(in), target :: dyn
@@ -369,9 +369,11 @@ contains
         !                      rings shift by copying over owned + eDim) -> ELEM variant. With no viscosity the eDim entries are never
         !                      refreshed in a straight run and never read; the resumed run gets owner
         !                      values there, which nothing reads either (the restart gate covers that mode).
-        ! 8 stores. (Until plan Task 5.4, 2026-10-18, also se_sbar_old_{u,v}, the stored transport sum
-        ! of the old Coriolis r-term: restart_read reads the registered fields only, so a checkpoint
-        ! that still carries them resumes and the two stores are ignored.)
+        !   se_sbar_old_{u,v}  s^{n-1} = sum_k helem*uv: written and read on the owned elements only
+        !                      (se_bt_forcing) -> NONE; the halo keeps se_init's 0, as in a straight run.
+        ! 10 stores. (Plan Task 5.4 dropped se_sbar_old_{u,v} with the first-substep Coriolis r-term;
+        ! Task 5.5 restored both, 2026-10-18. A checkpoint of that interim code, 8 SE stores, does not
+        ! resume: restart_read aborts on the missing se_sbar_old store.)
         ! All of them are bitwise equal over the owners of a shared element (the F and uv syncs,
         ! plan 2026-10-17 Task 2.1), so the store's one copy per element restores every owner exactly.
         ! The checkpoint holds no M or chi: both must stay the same over a restart chain.
@@ -386,6 +388,10 @@ contains
                 p2 => dyn%se_ubt(2,:,j)
                 call restart_register_field(R, trim(tn)//'_v', 'm2/s', DECOMP_ELEM, p2d=p2, halo=RESTART_HALO_ELEM)
             end do
+            p2 => dyn%se_sbar_old(1,:)
+            call restart_register_field(R, 'se_sbar_old_u', 'm2/s', DECOMP_ELEM, p2d=p2, halo=RESTART_HALO_NONE)
+            p2 => dyn%se_sbar_old(2,:)
+            call restart_register_field(R, 'se_sbar_old_v', 'm2/s', DECOMP_ELEM, p2d=p2, halo=RESTART_HALO_NONE)
         end if
     end subroutine restart_register_state
 

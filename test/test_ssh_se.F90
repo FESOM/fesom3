@@ -41,33 +41,32 @@ program test_ssh_se
     !       the environment (M = 40; chi, visc_ah, bottom drag, check, force at their defaults),
     !       the coefficients in t_dyn, the state at the extents of the plan's Technical Details §1,
     !       the cold start (eta ring == eta_n bitwise; the three U levels bitwise equal and
-    !       == sum_k helem*uv on owned + eDim elements; the drag rate 0 until the first forcing)
-    !       and se_ready. eta_n and uv are hashed from the global ids, so every copy of a node or
-    !       element holds the same value.
+    !       == sum_k helem*uv on owned + eDim elements; s_old == 0; the drag rate 0 until the
+    !       first forcing) and se_ready. eta_n and uv are hashed from the global ids, so every
+    !       copy of a node or element holds the same value.
     !   C5  se_elem_depth and the PRESSURE part of the forcing (Task 1.1): H^n == sum_k helem on
     !       owned + eDim elements (bitwise, positive); with uv = 0, pgf = 0, momentum advection off
     !       and a non-trivial eta_n, the real compute_vel_rhs puts only -g grad(eta) into UV_rhs,
     !       and se_bt_forcing's g H^n grad(eta^n) must remove it: max|F| <= 1e-12 * max|H^n Fx|.
-    !   C6  the CORIOLIS part of the forcing and the drag rate (Task 5.4: F = G/tau + g H^n
-    !       grad(eta^n) + f e_z x U*^0, U*^0 the AB3 transport of the first substep): momentum
-    !       advection off, eta_n = 0, pgf = 0. Cold start (lfirst, cold uv_rhsAB, the ring = sum_k
-    !       helem*uv from se_init): the real compute_vel_rhs puts -f e_z x u into UV_rhs, and F = 0
-    !       to rounding (U*^0 = U^n, so the first substep's Coriolis equals the 3-D one). With a
-    !       non-uniform ring (levels 1, 2 hashed) F = G/tau + f e_z x U*^0 to rounding, and it
-    !       differs from the U^n reading G/tau + f e_z x U^0 (so the test sees levels 1, 2).
-    !       se_ubtn == ring level 0 (bitwise, owned + eDim). The drag rate kdrag = C_d
-    !       |uv(:, nlevels-1)|/H^n against an independent recomputation (1e-14), > 0 where the
-    !       bottom velocity is not 0, finite; with FESOM3_SE_BOTTDRAG off exactly 0. Tolerances
-    !       are relative to the largest Coriolis term max|f U|; the measured residuals are
-    !       printed.
-    !   C7  operator / r-term consistency, the first substep (Tasks 1.2, 5.4): a) the real
-    !       compute_vel_rhs with a non-trivial uv, eta_n and pgf, a non-uniform U ring (three
-    !       hashed levels), se_bt_forcing (drag on: kdrag > 0); then se_tendency with U* = U*^0
-    !       (the AB3 of the ring), eta^A = eta^n, H^A = H^n, dU = 0 and U^m = U^n equals G/tau =
-    !       sum_k helem*UV_rhs/tau to 1e-12 of the largest term. b) a uniform ring (the three
-    !       levels equal, hashed), G = 0 (UV_rhs = 0), a hashed eta_n: the first substep's
-    !       tendency is the 3-D-consistent value 0 to 1e-12 of max(|f U|, |g H grad eta|). A sign
-    !       or factor mismatch between F and the operator (Coriolis, pressure) fails this.
+    !   C6  the CORIOLIS part of the forcing, the lfirst weight (Task 1.1) and the drag rate
+    !       (Task 5.4): momentum advection off, eta_n = 0, pgf = 0, helem constant. Step 1 (lfirst,
+    !       cold uv_rhsAB, s_old = 0): the real compute_vel_rhs on uv^{n-3/2}, then F = 0 to
+    !       rounding; the same UV_rhs taken as a non-lfirst step leaves exactly (0.5+eps) f e_z x
+    !       s^n (the lfirst weight a2 = 1 matters). s_old == sum_k helem*uv^{n-3/2} afterwards
+    !       (bitwise). The drag rate kdrag = C_d |uv(:, nlevels-1)|/H^n against an independent
+    !       recomputation (1e-14), > 0 where the bottom velocity is not 0, finite; with
+    !       FESOM3_SE_BOTTDRAG off exactly 0 and F bitwise the same (the drag is not in F).
+    !       Step 2 (not lfirst): uv^{n-1/2}, compute_vel_rhs blends ab2*C(uv^{n-1/2}) +
+    !       ab1*C(uv^{n-3/2}), and F = 0 to rounding again. se_ubtn == ring level 0 (bitwise,
+    !       owned + eDim). Tolerances are relative to the largest Coriolis term max|f s|; the
+    !       measured residuals are printed. (Plan Task 5.4 had replaced the stored sums by the
+    !       first-substep Coriolis f e_z x U*^0; Task 5.5 restored them, and these checks.)
+    !   C7  operator / r-term consistency (Task 1.2): the real compute_vel_rhs twice on the SAME uv
+    !       (so s^n = s^{n-1}) with a non-trivial eta_n and pgf, se_bt_forcing after each (the
+    !       drag on: kdrag > 0); then se_tendency with U* = s^n, eta^A = eta^n, H^A = H^n, dU = 0
+    !       and U^m = U^n (so D = 0) equals G/tau = sum_k helem*UV_rhs/tau to 1e-12 of the largest
+    !       term. A sign or factor mismatch between F and the operator (Coriolis, pressure) fails
+    !       this.
     !   C12 the barotropic bottom drag D (Task 5.4) through se_tendency (U* = 0, eta = 0, no
     !       viscosity, F = 0, kdrag from se_bt_forcing on a hashed uv): with U^m = U^n the
     !       tendency is bitwise that of FESOM3_SE_BOTTDRAG off; with U^m = U^n + X it changes by
@@ -75,9 +74,9 @@ program test_ssh_se
     !       max dtbt*kdrag (pi's hashed uv; CORE2 shelf: <= 4.5e-3 per m/s of bottom speed) is
     !       printed. Then a full M = 40 substep cycle with the drag on and off: both finite, they
     !       differ (the drag acts), and the eta-compatibility of the drag run holds (1e-12).
-    !   R1  the restart registration (Task 5.4): with SE on the checkpoint carries exactly 8 SE
-    !       stores (se_eta1, se_eta2, se_ubt{0,1,2}_{u,v}), no se_sbar_old_*, R%se is set; with
-    !       SE off none, and the other stores are the same.
+    !   R1  the restart registration (Tasks 5.4, 5.5): with SE on the checkpoint carries exactly
+    !       10 SE stores (se_eta1, se_eta2, se_ubt{0,1,2}_{u,v}, se_sbar_old_{u,v}), R%se is set;
+    !       with SE off none, and the other stores are the same.
     !   C8  the viscosity (Task 1.2): kappa >= 0, kappa = 0 exactly on boundary slots and on a
     !       triangle's slot 4, > 0 on every interior slot; kappa = A_h*l/(d*A_e) against an
     !       independent recomputation from edge_len (owned edges) and the elem_center distance;
@@ -143,6 +142,7 @@ program test_ssh_se
     use mod_partitioning, only: par_init
     use mod_dyn,          only: t_dyn
     use mod_part_bounds,  only: local_dims
+    use mod_config,       only: ab_epsilon
     use mod_param_phys,   only: C_d
     use mod_constants,    only: r_earth
     use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan
@@ -573,8 +573,9 @@ contains
         call check(dyn%se_beta == b .and. dyn%se_zeta == z .and. dyn%se_gamma == gm .and. &
                    dyn%se_delta == d, 'C4 the coefficients in t_dyn', partit%mype)
         ! extents (Technical Details §1)
-        call check(allocated(dyn%se_eta) .and. allocated(dyn%se_ubt) .and. allocated(dyn%se_kdrag) &
-                   .and. allocated(dyn%se_ubtn) .and. allocated(dyn%se_etam) .and. allocated(dyn%se_etanew) &
+        call check(allocated(dyn%se_eta) .and. allocated(dyn%se_ubt) .and. allocated(dyn%se_sbar_old) &
+                   .and. allocated(dyn%se_kdrag) .and. allocated(dyn%se_ubtn) .and. allocated(dyn%se_etam) &
+                   .and. allocated(dyn%se_etanew) &
                    .and. allocated(dyn%se_umean) .and. allocated(dyn%se_force) .and. allocated(dyn%se_H) &
                    .and. allocated(dyn%se_c) .and. allocated(dyn%se_kappa), 'C4 the state is allocated', &
                    partit%mype)
@@ -582,7 +583,8 @@ contains
         call check(all(shape(dyn%se_eta) == [nNodL, 2]) .and. size(dyn%se_etam) == nNodL .and. &
                    size(dyn%se_etanew) == nNodL, 'C4 node extents nNodL', partit%mype)
         call check(all(shape(dyn%se_ubt) == [2, nElemL, 3]) .and. lbound(dyn%se_ubt, 3) == 0 .and. &
-                   size(dyn%se_kdrag) == nElemL .and. all(shape(dyn%se_ubtn) == [2, nElemL]) &
+                   all(shape(dyn%se_sbar_old) == [2, nElemL]) .and. size(dyn%se_kdrag) == nElemL &
+                   .and. all(shape(dyn%se_ubtn) == [2, nElemL]) &
                    .and. all(shape(dyn%se_umean) == [2, nElemL]) .and. all(shape(dyn%se_force) == [2, nElemL]) &
                    .and. size(dyn%se_H) == nElemL, 'C4 element extents nElemL = owned + eDim', partit%mype)
         call check(all(shape(dyn%se_c) == [MAX_NV, nElemO]) .and. all(shape(dyn%se_kappa) == [MAX_NV, nElemO]), &
@@ -603,6 +605,7 @@ contains
             err = max(err, maxval(abs(dyn%se_ubt(:, e, 0) - ub))/max(maxval(abs(ub)), 1.0_WP))
         end do
         call check(err <= 1.0e-13_WP, 'C4 U ring == sum_k helem*uv (owned + eDim)', partit%mype)
+        call check(all(dyn%se_sbar_old == 0.0_WP), 'C4 s_old == 0', partit%mype)
         call check(all(dyn%se_kdrag == 0.0_WP), 'C4 the drag rate is 0 until the first forcing', partit%mype)
         call check(maxval(abs(dyn%se_ubt(:, :, 0))) > 0.0_WP, 'C4 the U ring is non-trivial', partit%mype)
     end subroutine c4_se_init
@@ -652,7 +655,7 @@ contains
         end do
         call se_init(dyn, mesh, partit, dt)
         call compute_vel_rhs(dyn, mesh, dt, .false., partit)
-        call se_bt_forcing(dyn, mesh, partit, dt)
+        call se_bt_forcing(dyn, mesh, partit, dt, .false.)
 
         ! H^n on owned + eDim
         nbad = 0
@@ -685,27 +688,41 @@ contains
     end subroutine c5_forcing_pressure
 
     subroutine c6_forcing_coriolis()
-        type(t_dyn) :: dyn, doff
-        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, e, nz, nbad, c, nb
-        real(kind=WP) :: gb(2), us(2), f, w0, w1, w2, res1, res2, sep, scale1, scale2, kd, kerr, kmax, koff
+        type(t_dyn) :: dyn, dwrong, doff
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, e, nz, nbad, nb, nfoff
+        real(kind=WP) :: sn(2), f, res1, resw, fw, res2, scale1, scale2, aw, kd, kerr, kmax, koff
         call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
         call new_dyn(dyn)
-        call set_uv(dyn, 0)
-        call se_init(dyn, mesh, partit, dt)              ! the ring = sum_k helem*uv (three levels)
-        w0 = 1.5_WP + dyn%se_beta; w1 = -(0.5_WP + 2.0_WP*dyn%se_beta); w2 = dyn%se_beta
+        call set_uv(dyn, 0)                              ! uv^{n-3/2}
+        call se_init(dyn, mesh, partit, dt)              ! s_old = 0
+        call check(all(dyn%se_sbar_old == 0.0_WP), 'C6 s_old == 0 after se_init', partit%mype)
 
-        ! ---- cold start (lfirst): F = G/tau + f e_z x U*^0 = 0 ----
+        ! ---- step 1, lfirst ----
         call compute_vel_rhs(dyn, mesh, dt, .true., partit)
-        doff = dyn
+        dwrong = dyn
+        doff   = dyn
         doff%se_bottdrag = .false.
-        call se_bt_forcing(dyn,  mesh, partit, dt)
-        call se_bt_forcing(doff, mesh, partit, dt)
-        res1 = 0.0_WP; scale1 = 0.0_WP; kerr = 0.0_WP; kmax = 0.0_WP; nbad = 0
+        call se_bt_forcing(dwrong, mesh, partit, dt, .false.)   ! a2 = 1.5+eps on an lfirst UV_rhs
+        call se_bt_forcing(doff,   mesh, partit, dt, .true.)    ! the drag off
+        call se_bt_forcing(dyn,    mesh, partit, dt, .true.)
+        aw = 0.5_WP + ab_epsilon                         ! (1.5+eps) - 1
+        res1 = 0.0_WP; resw = 0.0_WP; fw = 0.0_WP; scale1 = 0.0_WP; nbad = 0
+        kerr = 0.0_WP; kmax = 0.0_WP
         do e = 1, nElemO
+            sn = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                sn(1) = sn(1) + mesh%helem(nz, e)*dyn%uv(1, nz, e)
+                sn(2) = sn(2) + mesh%helem(nz, e)*dyn%uv(2, nz, e)
+            end do
             f = mesh%coriolis(e)
-            scale1 = max(scale1, abs(f)*maxval(abs(dyn%se_ubt(:, e, 0))))
+            scale1 = max(scale1, abs(f)*maxval(abs(sn)))
             res1 = max(res1, maxval(abs(dyn%se_force(:, e))))
-            ! the drag rate against an independent recomputation
+            ! the wrong weight leaves (a2 - 1) f e_z x s^n = aw*f*(-sn(2), sn(1))
+            resw = max(resw, abs(dwrong%se_force(1, e) + aw*f*sn(2)), &
+                             abs(dwrong%se_force(2, e) - aw*f*sn(1)))
+            fw   = max(fw, maxval(abs(dwrong%se_force(:, e))))
+            if (any(dyn%se_sbar_old(:, e) /= sn)) nbad = nbad + 1
+            ! the drag rate (Task 5.4) against an independent recomputation
             nb = mesh%nlevels(e) - 1
             kd = C_d*sqrt(dyn%uv(1, nb, e)**2 + dyn%uv(2, nb, e)**2)/dyn%se_H(e)
             kerr = max(kerr, abs(dyn%se_kdrag(e) - kd)/max(kd, tiny(1.0_WP)))
@@ -713,61 +730,54 @@ contains
             if (.not. (dyn%se_kdrag(e) >= 0.0_WP .and. dyn%se_kdrag(e) <= huge(1.0_WP))) nbad = nbad + 1
             if (any(dyn%uv(:, nb, e) /= 0.0_WP) .and. .not. (dyn%se_kdrag(e) > 0.0_WP)) nbad = nbad + 1
         end do
-        koff = maxval(abs(doff%se_kdrag))
-        call max_all(res1, partit); call max_all(scale1, partit); call max_all(kerr, partit)
-        call max_all(kmax, partit); call max_all(koff, partit); call sum_all(nbad, partit)
+        koff  = maxval(abs(doff%se_kdrag))
+        nfoff = count(doff%se_force(:, 1:nElemL) /= dyn%se_force(:, 1:nElemL))
+        call max_all(res1, partit); call max_all(resw, partit); call max_all(fw, partit)
+        call max_all(scale1, partit); call sum_all(nbad, partit)
+        call max_all(kerr, partit); call max_all(kmax, partit); call max_all(koff, partit)
+        call sum_all(nfoff, partit)
         call check(scale1 > 0.0_WP, 'C6 the Coriolis term is non-trivial', partit%mype)
-        call check(res1 <= 1.0e-12_WP*scale1, 'C6 cold start: F = 0 (U*^0 = U^n = sum_k helem*uv)', partit%mype)
-        call check(kerr <= 1.0e-14_WP .and. kmax > 0.0_WP .and. nbad == 0, &
-                   'C6 kdrag = C_d |u_bottom|/H^n, finite, > 0 where u_bottom /= 0', partit%mype)
-        call check(koff == 0.0_WP, 'C6 FESOM3_SE_BOTTDRAG off: kdrag == 0', partit%mype)
+        call check(res1 <= 1.0e-12_WP*scale1, 'C6 lfirst: F = 0 (a2 = 1)', partit%mype)
+        call check(resw <= 1.0e-12_WP*scale1 .and. fw >= 0.5_WP*aw*scale1, &
+                   'C6 lfirst UV_rhs with a2 = 1.5+eps: F = (0.5+eps) f e_z x s^n', partit%mype)
+        call check(nbad == 0, 'C6 s_old == sum_k helem*uv after the step (bitwise); kdrag finite, '// &
+                   '> 0 where u_bottom /= 0', partit%mype)
+        call check(kerr <= 1.0e-14_WP .and. kmax > 0.0_WP, 'C6 kdrag = C_d |u_bottom|/H^n', partit%mype)
+        call check(koff == 0.0_WP .and. nfoff == 0, &
+                   'C6 FESOM3_SE_BOTTDRAG off: kdrag == 0, F bitwise the same', partit%mype)
 
-        ! ---- a non-uniform ring: F = G/tau + f e_z x U*^0, not f e_z x U^0 ----
-        do e = 1, nElemL
-            do c = 1, 2
-                dyn%se_ubt(c, e, 1) = dyn%se_ubt(c, e, 0) + dyn%se_H(e)*0.05_WP*hval(partit%myList_elem2D(e), 30 + c)
-                dyn%se_ubt(c, e, 2) = dyn%se_ubt(c, e, 0) + dyn%se_H(e)*0.05_WP*hval(partit%myList_elem2D(e), 32 + c)
-            end do
-        end do
-        call se_bt_forcing(dyn, mesh, partit, dt)
-        res2 = 0.0_WP; sep = 0.0_WP; scale2 = 0.0_WP
+        ! ---- step 2 ----
+        call set_uv(dyn, 5)                              ! uv^{n-1/2}
+        call compute_vel_rhs(dyn, mesh, dt, .false., partit)
+        call se_bt_forcing(dyn, mesh, partit, dt, .false.)
+        res2 = 0.0_WP; scale2 = 0.0_WP
         do e = 1, nElemO
-            gb = 0.0_WP
+            sn = 0.0_WP
             do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
-                gb = gb + mesh%helem(nz, e)*dyn%uv_rhs(:, nz, e)
+                sn(1) = sn(1) + mesh%helem(nz, e)*dyn%uv(1, nz, e)
+                sn(2) = sn(2) + mesh%helem(nz, e)*dyn%uv(2, nz, e)
             end do
-            us = w0*dyn%se_ubt(:, e, 0) + w1*dyn%se_ubt(:, e, 1) + w2*dyn%se_ubt(:, e, 2)
-            f = mesh%coriolis(e)
-            scale2 = max(scale2, abs(f)*maxval(abs(us)), maxval(abs(gb))/dt)
-            res2 = max(res2, abs(dyn%se_force(1, e) - (gb(1)/dt - f*us(2))), &
-                             abs(dyn%se_force(2, e) - (gb(2)/dt + f*us(1))))
-            sep  = max(sep,  abs(dyn%se_force(1, e) - (gb(1)/dt - f*dyn%se_ubt(2, e, 0))), &
-                             abs(dyn%se_force(2, e) - (gb(2)/dt + f*dyn%se_ubt(1, e, 0))))
+            scale2 = max(scale2, abs(mesh%coriolis(e))*maxval(abs(sn)))
+            res2 = max(res2, maxval(abs(dyn%se_force(:, e))))
         end do
-        call max_all(res2, partit); call max_all(sep, partit); call max_all(scale2, partit)
-        call check(res2 <= 1.0e-12_WP*scale2, 'C6 non-uniform ring: F = G/tau + f e_z x U*^0', partit%mype)
-        call check(sep >= 1.0e-3_WP*scale2, 'C6 non-uniform ring: F differs from the U^n reading '// &
-                   '(ring levels 1, 2 enter)', partit%mype)
+        call max_all(res2, partit); call max_all(scale2, partit)
+        call check(res2 <= 1.0e-12_WP*max(scale1, scale2), 'C6 step 2 (AB2 blend): F = 0', partit%mype)
         nbad = count(dyn%se_ubtn(:, 1:nElemL) /= dyn%se_ubt(:, 1:nElemL, 0))
         call sum_all(nbad, partit)
         call check(nbad == 0, 'C6 se_ubtn == U ring level 0 (bitwise, owned + eDim)', partit%mype)
-        if (partit%mype == 0) write(*,'(a,es10.3,a,es10.3,a,es10.3,a,es10.3,a,es10.3,a,es10.3,a)') &
-            'test_ssh_se: C6 Coriolis part: cold-start max|F| = ', res1, ', non-uniform ring residual ', &
-            res2, ' (U^n reading off by ', sep, ') m2/s2, max|f U| = ', max(scale1, scale2), &
-            '; kdrag max ', kmax, ' 1/s, rel. error ', kerr, ''
+        if (partit%mype == 0) write(*,'(a,es10.3,a,es10.3,a,es10.3,a,es10.3,a,es10.3,a,es10.3)') &
+            'test_ssh_se: C6 Coriolis part: lfirst max|F| = ', res1, ', AB2 step max|F| = ', res2, &
+            ' m2/s2, max|f s| = ', max(scale1, scale2), '; wrong-weight residual ', resw, &
+            '; kdrag max ', kmax, ' 1/s, rel. error ', kerr
     end subroutine c6_forcing_coriolis
 
     subroutine c7_consistency()
         type(t_dyn) :: dyn
-        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, n, e, nz, c
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, n, e, nz
         integer :: elnodes(MAX_NV)
         real(kind=WP), allocatable :: ustar(:,:), dU(:,:), tend(:,:), HA(:)
-        real(kind=WP) :: gb(2), res, scale, pre(MAX_NV), Fx, Fy, w0, w1, w2, kmax  ! gb: G (g is gravity)
-        real(kind=WP) :: resb, scaleb
+        real(kind=WP) :: gb(2), res, scale, pre(MAX_NV), Fx, Fy, kmax     ! gb: G (g is gravity)
         call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
-        allocate(ustar(2, nElemL), dU(2, nElemL), tend(2, nElemL), HA(nElemL))
-
-        ! ---- a) the real predictor, a non-uniform ring ----
         call new_dyn(dyn)
         call set_uv(dyn, 0)
         do n = 1, nNodL
@@ -780,24 +790,17 @@ contains
             end do
         end do
         call se_init(dyn, mesh, partit, dt)
-        call se_elem_depth(dyn, mesh, partit)
-        do e = 1, nElemL
-            do c = 1, 2
-                dyn%se_ubt(c, e, 0) = dyn%se_H(e)*0.1_WP*hval(partit%myList_elem2D(e), 40 + c)
-                dyn%se_ubt(c, e, 1) = dyn%se_H(e)*0.1_WP*hval(partit%myList_elem2D(e), 42 + c)
-                dyn%se_ubt(c, e, 2) = dyn%se_H(e)*0.1_WP*hval(partit%myList_elem2D(e), 44 + c)
-            end do
-        end do
-        call compute_vel_rhs(dyn, mesh, dt, .true., partit)
-        call se_bt_forcing(dyn, mesh, partit, dt)
+        call compute_vel_rhs(dyn, mesh, dt, .true., partit)       ! s_old <- s(uv)
+        call se_bt_forcing(dyn, mesh, partit, dt, .true.)
+        call compute_vel_rhs(dyn, mesh, dt, .false., partit)      ! the same uv: s^n = s^{n-1}
+        call se_bt_forcing(dyn, mesh, partit, dt, .false.)
         kmax = maxval(dyn%se_kdrag(1:nElemO))
         call max_all(kmax, partit)
-        w0 = 1.5_WP + dyn%se_beta; w1 = -(0.5_WP + 2.0_WP*dyn%se_beta); w2 = dyn%se_beta
-        do e = 1, nElemO
-            ustar(:, e) = w0*dyn%se_ubt(:, e, 0) + w1*dyn%se_ubt(:, e, 1) + w2*dyn%se_ubt(:, e, 2)
-        end do
-        dU = 0.0_WP
-        HA = dyn%se_H
+
+        allocate(ustar(2, nElemL), dU(2, nElemL), tend(2, nElemL), HA(nElemL))
+        ustar = dyn%se_sbar_old                                   ! = s^n
+        dU    = 0.0_WP                                            ! and U^m = U^n (ring level 0 = se_ubtn): D = 0
+        HA    = dyn%se_H
         call se_tendency(dyn, mesh, partit, ustar, dyn%eta_n, HA, dU, tend)
         res = 0.0_WP; scale = 0.0_WP
         do e = 1, nElemO
@@ -815,41 +818,11 @@ contains
         end do
         call max_all(res, partit); call max_all(scale, partit)
         call check(kmax > 0.0_WP, 'C7 the drag is on (kdrag > 0)', partit%mype)
-        call check(res <= 1.0e-12_WP*scale, 'C7a se_tendency(U* = U*^0, eta^A = eta^n, H^A = H^n, '// &
-                   'U^m = U^n) == G/tau', partit%mype)
-
-        ! ---- b) a uniform ring, G = 0: the first substep's tendency is 0 ----
-        do e = 1, nElemL
-            do c = 1, 2
-                dyn%se_ubt(c, e, :) = dyn%se_H(e)*0.1_WP*hval(partit%myList_elem2D(e), 46 + c)
-            end do
-        end do
-        do n = 1, nNodL
-            dyn%eta_n(n) = 0.5_WP*hval(partit%myList_nod2D(n), 4)
-        end do
-        dyn%uv_rhs = 0.0_WP
-        call se_bt_forcing(dyn, mesh, partit, dt)
-        do e = 1, nElemO
-            ustar(:, e) = w0*dyn%se_ubt(:, e, 0) + w1*dyn%se_ubt(:, e, 1) + w2*dyn%se_ubt(:, e, 2)
-        end do
-        HA = dyn%se_H
-        call se_tendency(dyn, mesh, partit, ustar, dyn%eta_n, HA, dU, tend)
-        resb = 0.0_WP; scaleb = 0.0_WP
-        do e = 1, nElemO
-            elnodes = mesh%elem2D_nodes(:, e)
-            pre = -(g*dyn%eta_n(elnodes))
-            Fx  = sum(mesh%gradient_sca(1:4, e)*pre)
-            Fy  = sum(mesh%gradient_sca(5:8, e)*pre)
-            scaleb = max(scaleb, abs(mesh%coriolis(e))*maxval(abs(dyn%se_ubt(:, e, 0))), &
-                         dyn%se_H(e)*max(abs(Fx), abs(Fy)))
-            resb = max(resb, maxval(abs(tend(:, e))))
-        end do
-        call max_all(resb, partit); call max_all(scaleb, partit)
-        call check(scaleb > 0.0_WP .and. resb <= 1.0e-12_WP*scaleb, 'C7b uniform ring, G = 0: the first '// &
-                   'substep''s tendency is 0 (= G/tau)', partit%mype)
-        if (partit%mype == 0) write(*,'(a,es10.3,a,es10.3,a,es10.3,a,es10.3,a,es10.3)') &
-            'test_ssh_se: C7 consistency: a) max|tend - G/tau| = ', res, ' m2/s2, largest term ', scale, &
-            ', ratio ', res/scale, '; b) max|tend| = ', resb, ' of ', scaleb
+        call check(res <= 1.0e-12_WP*scale, 'C7 se_tendency(U* = s^n = s_old, eta^A = eta^n, H^A = H^n, '// &
+                   'dU = 0, U^m = U^n) == G/tau', partit%mype)
+        if (partit%mype == 0) write(*,'(a,es10.3,a,es10.3,a,es10.3)') &
+            'test_ssh_se: C7 consistency: max|tend - G/tau| = ', res, ' m2/s2, largest term ', scale, &
+            ', ratio ', res/scale
         deallocate(ustar, dU, tend, HA)
     end subroutine c7_consistency
 
@@ -868,7 +841,7 @@ contains
         call set_uv(d, 3)
         call se_init(d, mesh, partit, dt)
         d%se_visc_ah = 0.0_WP                            ! D alone
-        call se_bt_forcing(d, mesh, partit, dt)          ! kdrag from the hashed uv; ubtn = ring level 0
+        call se_bt_forcing(d, mesh, partit, dt, .true.)  ! kdrag from the hashed uv; ubtn = ring level 0
         d%se_force = 0.0_WP
         ustar = 0.0_WP; dU = 0.0_WP; eta0 = 0.0_WP
         HA = d%se_H
@@ -1615,9 +1588,9 @@ contains
             ! P1: the forcing without the sync (a copy), then the real call
             doff = d
             partit%sync_shared_elem = .false.
-            call se_bt_forcing(doff, mesh, partit, dt)
+            call se_bt_forcing(doff, mesh, partit, dt, k == 1)
             partit%sync_shared_elem = .true.
-            call se_bt_forcing(d, mesh, partit, dt)
+            call se_bt_forcing(d, mesh, partit, dt, k == 1)
             partit%sync_shared_elem = sync_env
             x = shared_copy_max_elem(doff%se_force, partit)
             call max_all(x, partit)
@@ -1816,7 +1789,7 @@ contains
         wf = 0.0_WP
         call compute_vel_rhs(d, mesh, dt, k == 1, partit)
         call viscosity_filter(7, d, mesh, dt, partit)
-        call se_bt_forcing(d, mesh, partit, dt)
+        call se_bt_forcing(d, mesh, partit, dt, k == 1)
         call se_subcycle(d, mesh, partit, dt)
         call se_trim_finish(d, mesh, partit, dt, k, wf)
     end subroutine p_step
@@ -2439,12 +2412,14 @@ contains
         type(t_tracer), target :: tr
         type(t_ice),    target :: ice
         type(t_restart) :: Ron, Roff
-        character(len=9), parameter :: SE_NAMES(8) = [character(len=9) :: 'se_eta1', 'se_eta2', &
-            'se_ubt0_u', 'se_ubt0_v', 'se_ubt1_u', 'se_ubt1_v', 'se_ubt2_u', 'se_ubt2_v']
-        integer :: k, j, nse, nother, nmiss
+        character(len=13), parameter :: SE_NAMES(10) = [character(len=13) :: 'se_eta1', 'se_eta2', &
+            'se_ubt0_u', 'se_ubt0_v', 'se_ubt1_u', 'se_ubt1_v', 'se_ubt2_u', 'se_ubt2_v', &
+            'se_sbar_old_u', 'se_sbar_old_v']
+        integer :: k, j, nse, nmiss
         logical :: same
         allocate(d%eta_n(1), d%d_eta(1), d%ssh_rhs_old(1), d%uv(2, 1, 1), d%uv_rhsAB(1, 2, 1, 1))
         allocate(d%w(1, 1), d%w_e(1, 1), d%w_i(1, 1), d%se_eta(1, 2), d%se_ubt(2, 1, 0:2))
+        allocate(d%se_sbar_old(2, 1))
         d%AB_order = 2
         tr%num_tracers = 0
         allocate(ice%data(3))
@@ -2462,26 +2437,23 @@ contains
         d%use_ssh_se = .false.
         call restart_register_state(Roff, d, tr, ice, mesh)
 
-        nse = 0; nother = 0
+        nse = 0
         do k = 1, Ron%nf
-            if (Ron%f(k)%name(1:3) == 'se_') then
-                nse = nse + 1
-                if (index(Ron%f(k)%name, 'sbar') > 0) nother = nother + 1
-            end if
+            if (Ron%f(k)%name(1:3) == 'se_') nse = nse + 1
         end do
         nmiss = 0
         do j = 1, size(SE_NAMES)
             if (.not. any([(trim(Ron%f(k)%name) == trim(SE_NAMES(j)), k = 1, Ron%nf)])) nmiss = nmiss + 1
         end do
-        same = (Roff%nf == Ron%nf - 8)
+        same = (Roff%nf == Ron%nf - 10)
         if (same) then
             do k = 1, Roff%nf
                 if (trim(Roff%f(k)%name) /= trim(Ron%f(k)%name)) same = .false.
             end do
         end if
         call check(Ron%se .and. .not. Roff%se, 'R1 R%se is set with SE on only', partit%mype)
-        call check(nse == 8 .and. nmiss == 0 .and. nother == 0, 'R1 SE on: exactly the 8 SE stores '// &
-                   '(se_eta1/2, se_ubt{0,1,2}_{u,v}), no se_sbar_old_*', partit%mype)
+        call check(nse == 10 .and. nmiss == 0, 'R1 SE on: exactly the 10 SE stores '// &
+                   '(se_eta1/2, se_ubt{0,1,2}_{u,v}, se_sbar_old_{u,v})', partit%mype)
         call check(count([(Roff%f(k)%name(1:3) == 'se_', k = 1, Roff%nf)]) == 0 .and. same, &
                    'R1 SE off: no se_* store, the other stores the same and in the same order', partit%mype)
         if (partit%mype == 0) write(*,'(a,i0,a,i0,a)') 'test_ssh_se: R1 restart registry: ', Ron%nf, &
