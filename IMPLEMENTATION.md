@@ -598,5 +598,7 @@ The feedback runs through the sea ice: the ice reads ηⁿ, and its stress on th
 over the step. Removing the ice–ocean stress or the ice's view of η removes the growth. SI's
 backward-Euler damping hides the same coupling. χ = 0.25 and `se_visc_ah` = 0.1 run the 480 screened
 steps stably. On 2026-10-18 χ = 0.25 became the default (plan Task 5.0); it damps that shelf mode and
-needs M ≥ 48 on CORE2 at Δt = 1800 s (the CFL guard). Details: the plan's Tasks 5.0 and 5.1, LESSONS
+needs M ≥ 48 on CORE2 at Δt = 1800 s (the CFL guard). At χ = 0.25, 3000-step CORE2 screens (62.5 days,
+linfs and zstar, also at M = 48 and without the barotropic viscosity) run stably, and after the cold-start
+transient max|η| stays within a few centimetres of SI's. Details: the plan's Tasks 5.0 and 5.1, LESSONS
 L74 and `docs/se_question_packet.md`.

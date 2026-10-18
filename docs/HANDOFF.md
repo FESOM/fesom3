@@ -9,8 +9,8 @@ Full pre-M2.12 milestone detail + the per-gate recipes live in [`HANDOFF-archive
   (2026-10-18, branch `split-explicit`, worktree `/work/ab0995/a270088/fesom3_se`, unpushed):** SE subcycling after
   Sergey's notes (`FESOM3_SSH_SE=1`), linfs and zstar, any np, exact restarts; SE off byte-identical to main. At χ = 0.1
   a cold CORE2 run blows up at step ~335 (sea-ice feedback, no code defect); Nikolay approved Stage 5 on 2026-10-18 and
-  chose χ = 0.25 as the default (Task 5.0 done, re-verified); next the screens, the 1-year twin and perf → section
-  "Split-explicit barotropic solver".
+  chose χ = 0.25 as the default (Task 5.0 done, re-verified); the 3000-step screens run stably (Task 5.1); next the
+  1-year twin and perf → section "Split-explicit barotropic solver".
 - **Shared-element velocity sync ✅ DONE (2026-10-12, plan `plans/completed/20261012-shared-element-sync.md`,
   on `bottom-at-vertices`):** a border element is owned by every rank that owns one of its vertices;
   `update_vel` now gives every such element one owner for `uv` (the highest vertex-owner rank, whose copy
@@ -349,7 +349,7 @@ The hybrid-mesh gate migration (which FESOM2-oracle gates are retired, the round
 Design input `plans/2026-10-17-split-explicit-handoff.md`; the plan holds every measured number with its job id;
 summary for readers in `IMPLEMENTATION.md` §14 and `TESTING.md` §6c; LESSONS L71–L74; question packet (draft, not
 sent) `docs/se_question_packet.md`. G0 references and frozen pre-SE binaries: `/work/ab0995/a270088/fesom3_se_ref/`
-(`bin_main_6cd6449/`, `g0/`); job scripts and logs in its `jobs/` (`t0*`–`t22_*`, `t61_*`, `dbg_*`) and in
+(`bin_main_6cd6449/`, `g0/`); job scripts and logs in its `jobs/` (`t0*`–`t22_*`, `t61_*`, `dbg_*`, Stage 5 `s5_*`) and in
 `/work/ab0995/a270088/fesom3_se_t02_jobs/` (Stages 3–4, `t3*`, `t4*`).
 
 **What it is.** `src/oce/oce_ssh_se.F90`: SM2005 AB3–AM4 substeps of (η, Ū = Σhelem·u), M per baroclinic step,
@@ -391,8 +391,14 @@ node-h in total).**
    (ice reads ηⁿ, ice→ocean stress frozen in F). Measured stable: χ = 0.25, `se_visc_ah` = 0.1 (480 steps).
    Untested: a filtered η for the ice, the SM2005 averaging filter, the γ₀/γ₁ viscosity. Not remedies: larger M,
    χ < 0.1, no viscosity. Sergey/Dmitry's view would help (`docs/se_question_packet.md`).
-2. Then Task 5.1 screens (3000 steps: χ/M variants, `se_visc_ah` 0, zstar), Task 5.2 1-year SE-vs-SI twin (linfs),
-   Task 5.3 SSH-phase timing on one node (np 128; seen so far: SE 12.9 vs SI 9.1 ms/step in the SSH phase).
+2. ✅ Task 5.1 screens (jobs 28220614/15, 28220790; 0.85 node-h): CORE2 production physics, np 128, 3000 steps
+   each, all exit 0, no NaN: SI linfs, SE defaults (χ 0.25, M 50), M = 48, `se_visc_ah` 0, SE zstar, SI zstar.
+   Cold-start peak 4.7 m (SI 2.0 m), over by step ~500; then SE's max|η| 3–6 cm above SI's, at step 3000 within
+   6–7 mm; CFL_z 1.60 vs 1.59; SE_CHECK at rounding, spreads 0. The linear viscosity suffices at χ = 0.25 (no γ1
+   needed); without it the run is equally stable (max|η| within 1.3 mm) and the SSH phase is cheaper (11.9 vs
+   14.3 ms/step) — whether to keep `se_visc_ah` 0.01 is Nikolay's call. Frozen binaries `bin_s5a_fbbf777`.
+   Open: Task 5.2 1-year SE-vs-SI twin (linfs), Task 5.3 SSH-phase timing on one node (np 128; seen so far: SE
+   12.9 vs SI 9.1 ms/step in the SSH phase).
 3. Then Task 6.1's last box (G3 numbers), the plan to `completed/`, a tag, the memory update; send the packet once
    the G3 numbers exist. Later: JAX port of SE (bitwise against this code), NEMO SE, storing M/χ in the checkpoint.
 

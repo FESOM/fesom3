@@ -1092,7 +1092,7 @@ stay. On CORE2 at Δt 1800 s the CFL guard then gives M_min = 48, and M = 50 run
     ≤ 2.0e-14 m, trim ≤ 3.4e-13, |msl| ≤ 7.2e-16 m, |fw| ≤ 4.7e-18 m, laysum ≤ 5.5e-12 m, w1 ≤ 1.1e-17 m/s, hlaw
     ≤ 8.2e-12 m, max|η| 4.21 m (step 31), max CFL_z 0.619** (χ = 0.1: 4.33 m, 0.626); spreads 0, no NaN; 80 s / 89 s
 
-#### Task 5.1: 3000-step screens
+#### Task 5.1: 3000-step screens ✅
 
 **Files:**
 - Create: `tools/run_se_screen_core2.sbatch` (prod_env + SE knobs; `--hint=nomultithread --mem=0`)
@@ -1101,15 +1101,58 @@ stay. On CORE2 at Δt 1800 s the CFL guard then gives M_min = 48, and M = 50 run
 (a) is the new default (χ 0.25, M 50, `se_visc_ah` 0.01), (b) M_min at χ = 0.25, (c) and (d) at χ = 0.25; χ = 0.1
 is not re-run (it blows up near step 335, below).
 
-- [ ] SI baseline and SE screens, 3000 steps each, CORE2 `prod_env`:
+- [x] SI baseline and SE screens, 3000 steps each, CORE2 `prod_env`:
   - (a) χ = 0.1, M = 50 (➕ now the default χ = 0.25, M = 50);
   - (b) M = M_min from the guard (➕ the operator-based guard of Task 0.4: 40 at χ = 0.1, 48 at χ = 0.25 on CORE2
     at Δt 1800 s; ➕ run: M = 48 at χ = 0.25);
   - (c) `se_visc_ah = 0` (➕ at χ = 0.25, M = 50);
   - (d) zstar headline (➕ SE zstar at the defaults, and SI zstar as its baseline)
-- [ ] per screen, record: max|η| over time, cold-start peak, max CFL_z, max|uv|, divsum, SE_CHECK, NaN. Decide
+- [x] per screen, record: max|η| over time, cold-start peak, max CFL_z, max|uv|, divsum, SE_CHECK, NaN. Decide
   whether the linear viscosity suffices (⚠️ if (a) misbehaves: try the γ1 term in the same gather operator, as a
   new task)
+- ➕ **Screens (2026-10-18), all six run 3000 steps (62.5 days from 1958-01-01) with exit 0, no NaN.** One compute
+  node each, np 128, CORE2 `prod_env 1e-5`, cold start, STEP_DIAG on, SE cases with SE_CHECK (it costs 2.8 % of the
+  loop at np 128: 150.3 vs 146.2 ms/step in job 28218251), the frozen Intel binaries of fbbf777
+  (`/work/ab0995/a270088/fesom3_se_ref/bin_s5a_fbbf777`, `fesom_lifecycle_native_mr` sha256 `06e8e1080aa85da0…`),
+  script `tools/run_se_screen_core2.sbatch`. Jobs 28220614 (linfs: si, se_b, se_c; 26.6 min, 0.44 node-h),
+  28220615 (zstar: se_z, si_z; 16.9 min, 0.28 node-h), 28220790 (se_a; 8.0 min, 0.13 node-h); logs
+  `/work/ab0995/a270088/fesom3_se_ref/jobs/s5_A_screen_*.{28220614,28220615,28220790}.out`, run dirs
+  `/scratch/a/a270088/se_s5a/screen_{28220614,28220615,28220790}/core2_<case>/`. ⚠️ The first se_a (job 28220614,
+  node l20505) never started: `OPAL ERROR: Unreachable in file ext3x_client.c at line 112` and `An error occurred in
+  MPI_Init` on 30 ranks, exit 141 after 201 s, no step; the MPI launch, not the model (si before it and se_b/se_c
+  after it ran on the same node); rerun as job 28220790.
+
+  | case | max\|η\| (step) | cold-start peak, steps 1–96 | window max\|η\| 501–750 / 1001–1250 / 2751–3000 | max\|η\| at step 3000 | max CFL_z (step) | max\|uv\| (step) | max divsum | loop ms/step (SSH phase) | wall |
+  |---|---|---|---|---|---|---|---|---|---|
+  | si (linfs) | 2.141 m (745) | 1.956 m (68) | 2.141 / 2.136 / 1.930 | 1.928 m | 1.589 (300) | 2.972 (262) | 2.9e-15 | 144.1 (8.5) | 457 s |
+  | (a) se_a, χ 0.25, M 50 | 4.695 m (67) | 4.695 m (67) | 2.190 / 2.189 / 1.961 | 1.934 m | 1.603 (301) | 2.976 (262) | 2.0e-15 | 149.4 (14.3) | 473 s |
+  | (b) se_b, M 48 | 4.691 m (67) | 4.691 m (67) | 2.190 / 2.189 / 1.961 | 1.934 m | 1.603 (301) | 2.976 (262) | 2.1e-15 | 147.3 (13.9) | 473 s |
+  | (c) se_c, `se_visc_ah` 0 | 4.696 m (67) | 4.696 m (67) | 2.189 / 2.190 / 1.961 | 1.935 m | 1.601 (300) | 2.976 (262) | 1.7e-15 | 145.1 (11.9) | 457 s |
+  | (d) se_z, zstar | 4.667 m (67) | 4.667 m (67) | 2.177 / 2.179 / 1.954 | 1.928 m | 1.593 (300) | 2.966 (261) | 1.8e-15 | 155.4 (14.7) | 493 s |
+  | si_z (zstar) | 2.128 m (744) | 1.981 m (67) | 2.128 / 2.123 / 1.922 | 1.921 m | 1.584 (300) | 2.968 (261) | 3.2e-15 | 147.3 (9.1) | 512 s |
+
+  dUV = dAB = dsig = 0 in every step line of every case; max m_ice 3.95 m in all six. The max|η| series per 250
+  steps (window maxima, the values at the window ends and the window max|uv| / CFL_z) is in each job log.
+  SE_CHECK maxima over 3000 steps: (a) etacomp 6.3e-14 m, trim 2.3e-12 m²/s, |msl| 1.9e-16 m; (b) 7.2e-14,
+  2.7e-12, 2.6e-16; (c) 6.7e-14, 3.6e-12, 2.3e-16; (d) 6.3e-14, 2.3e-12, 2.2e-16, |fw| 3.3e-18 m, SE_CHECK_TAIL
+  laysum 2.6e-11 m, w1 4.2e-17 m/s, hlaw 8.2e-12 m; spreadU = spreadUm = 0 and no non-finite token in all 12 000
+  SE_CHECK lines.
+  - **SE vs SI:** SE's max|η| is the cold-start external-wave transient in the macrotidal gulfs (4.7 m at step 67,
+    which SI's θ = 1 damps to 2.0 m; known since Task 1.5); it is over by step ~500 (window max 3.49 m in 251–500,
+    2.19 m in 501–750). From then on SE's window maxima are 3–6 cm above SI's (2.190 vs 2.141 m in 501–750, 1.961
+    vs 1.930 m in 2751–3000; zstar 2.177 vs 2.128 and 1.954 vs 1.922 m), and at step 3000 the global max|η| differs
+    by 6 mm (linfs) and 7 mm (zstar). max CFL_z (1.60 vs 1.59 at step 300-301), max|uv| (2.976 vs 2.972 m/s at step
+    262), divsum and sea ice agree. No growth anywhere over 3000 steps: the χ = 0.1 run blew up at step 337, so the
+    screens cover 9× that time.
+  - **Decision (numbers above): the linear viscosity suffices at χ = 0.25; the γ1 term is not needed.** At χ = 0.25
+    the runs with and without the viscosity (a, c) are both stable and their window max|η| agree to 1.3 mm or better
+    (max|uv| windows differ by up to 0.1 m/s, the usual divergence of two 3-D runs), and so is M = M_min = 48 (b).
+    So over 3000 steps the stability does not rest on the viscosity: χ = 0.25 alone damps the shelf mode (the
+    margin runs of the note below: −0.3 … −0.55 %/step at χ = 0.25), and `se_visc_ah` 0.01 neither helps nor hurts
+    there. These production-binary runs carry no shelf-noise probe (that was the diagnostic build), so the shelf is
+    judged by the global max|η|, CFL_z and the absence of growth. (c) is the cheapest SE (SSH phase 11.9 vs 14.3 ms/step: one `exchange_elem` per substep less); keeping
+    0.01 as the default is Nikolay's call (no change made). Timing here is single runs with SE_CHECK on, informational;
+    Task 5.3 measures it properly
 - ➕ ⚠️ from Task 2.2 (480 steps, np 8): (a) χ = 0.1, M = 50 blows up at step 337 (grid-scale η on the 20 m
   Antarctic shelf near 74°W 72°S); (b) M = M_min = 35 blows up at step 5 at χ = 0.1 (the guard is not a stability
   limit); (c) `se_visc_ah = 0` blows up at step 298; M = 100 at step 192. χ = 0.25 and `se_visc_ah = 0.1` run 480
@@ -1239,7 +1282,8 @@ sha256 `01e1d34f709fb0e0…`, `fesom_conserve` `1edbc30ba0f7ef18…`.
     equal the straight run's, without msl/fw); `run_restart_gate_multirank.sh` np 2 → 8: **SI (27 fields, 32 s) and
     SE linfs (37 fields, 30 s) GREEN, max|Δ| = 0**; `run_restartroundtrip.sh` np 1 2: **GATE GREEN** (AB2 28, AB3 32,
     SE 38 fields max|Δ| = 0; `FESOM3_RESTARTRT_SE=2` aborts with the message at np 1 and 2), 41 s
-  - [ ] G3 numbers recorded — **Stage 5 pending Nikolay's yes**
+  - [ ] G3 numbers recorded — **Stage 5 pending Nikolay's yes** (➕ approved 2026-10-18; Tasks 5.0 and 5.1 done,
+    5.2 and 5.3 open)
 - [x] full ctest Intel + GNU, `run_g0_se.sh`, conserve_pi, restart gates, `run_tri_regression.sh` (`NEW_BIN=` this
   build). **ctest Intel 176/176** (32 s); **GNU 170/176, exactly the 6 known failures** (`test_wimpl_tra_np1/np2`,
   `meshdiag_mixed/quad/pi_w`, `test_shared_elem_np1`; the serial rerun fails the same 6, no flake this time);

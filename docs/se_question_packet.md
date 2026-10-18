@@ -54,9 +54,13 @@ step block; the predictor and the ALE/tracer tail are unchanged. Off by default.
 | restart split vs straight (linfs, zstar; np 1, 2; np 2 → 8 round trip) | max\|Δ\| = 0 |
 | dtbt convergence (pi, Gaussian bump) | order 2.0–2.3 |
 
-The CORE2 runs at 480 steps use χ = 0.25 (section 3). Not done yet: the 3000-step physics screens, a
-1-year SE-vs-SI twin and the timing comparison (started on 2026-10-18 with χ = 0.25 as the new default). Timing seen so
-far (CORE2, one node, np 128): SSH phase 12.9 ms/step with SE vs 9.1 with SI, loop 146 vs 144 ms/step.
+The CORE2 runs at 480 steps use χ = 0.25 (section 3). **3000-step screens at χ = 0.25** (2026-10-18, CORE2
+production physics, cold start, np 128; the defaults M = 50 and `se_visc_ah` 0.01, M = 48, `se_visc_ah` 0, zstar,
+each against SI): all run 62.5 days stably. The cold-start transient peaks at 4.7 m (SI 2.0 m) and is over by step
+~500; afterwards SE's max|η| stays 3–6 cm above SI's (2.19 vs 2.14 m in steps 501–750, 1.96 vs 1.93 m in
+2751–3000), max CFL_z 1.60 vs 1.59, max|uv| 2.98 vs 2.97 m/s; the runs with and without the barotropic viscosity
+agree to 1.3 mm in max|η|. Not done yet: a 1-year SE-vs-SI twin and the timing comparison. Timing seen so far
+(CORE2, one node, np 128): SSH phase 12.9 ms/step with SE vs 9.1 with SI, loop 146 vs 144 ms/step.
 
 **Transients.** SE resolves the cold-start external gravity waves that SI's θ = 1 damps: max|η| in the
 first day 4.3 m (SE, independent of Δt) vs 1.7 m (SI at Δt 1800 s), reaching 3.2 m at Δt 300 s. The
@@ -106,7 +110,7 @@ elevation at the start of the step and frozen over it reproduces the pattern: χ
 
 | option | status |
 |---|---|
-| χ = 0.25 | measured: stable over 480 steps (linfs np 8 and np 128, zstar np 8). Needs M ≥ 43 at Δt 1800 s (guard: 48), damps the resolved fast waves more (max\|η\| 4.70 vs 4.74 m at step 67) |
+| χ = 0.25 (the default since 2026-10-18) | measured: stable over 480 steps (linfs np 8 and np 128, zstar np 8) and over 3000 steps (linfs at M = 50 and 48, with and without the viscosity; zstar; np 128). Needs M ≥ 43 at Δt 1800 s (guard: 48), damps the resolved fast waves more (max\|η\| 4.70 vs 4.74 m at step 67) |
 | `se_visc_ah` = 0.1 (linear viscosity ×10) | measured: stable over 480 steps (linfs np 8; max\|η\| 4.72 m); acts only on Ūᵐ − Ūⁿ, explicit limit far away (ν·dtbt/l² ≈ 4e-3) |
 | a filtered η for the ice instead of η^M | untested; targets the loop directly (R3 removes the growth) |
 | the SM2005 averaging filter for ⟨⟨Ū⟩⟩ and the η handed to the slow components | untested (the notes use none) |

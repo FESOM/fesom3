@@ -335,8 +335,12 @@ Measured invariant levels and thresholds (pi over 1000 steps, np 1/2/8; CORE2 pr
 The CORE2 480-step runs used χ = 0.25 because at χ = 0.1, the default until 2026-10-18, a
 cold-started CORE2 run blows up near step 335 ([IMPLEMENTATION.md](IMPLEMENTATION.md) §14). χ = 0.25
 is now the default (plan Task 5.0), so the SE gates above run at χ = 0.25; the pi levels and
-thresholds in the table were measured at χ = 0.1 and still hold. The physics screens, the
-1-year SE-vs-SI twin and the SSH-phase timing (plan Stage 5) have not run yet.
+thresholds in the table were measured at χ = 0.1 and still hold. The 3000-step physics screens
+(plan Task 5.1: CORE2 production physics, np 128, the defaults, M = 48, no barotropic viscosity, zstar,
+and SI linfs/zstar baselines) all run stably; after the cold-start transient SE's max|η| stays within
+3–6 cm of SI's, and the SE_CHECK maxima over 3000 steps are etacomp ≤ 7.2e-14 m, trim ≤ 3.6e-12
+m²/s, |msl| ≤ 2.6e-16 m, laysum ≤ 2.6e-11 m, spreads 0. The 1-year SE-vs-SI twin and the SSH-phase
+timing (Tasks 5.2, 5.3) are open.
 
 ### 7. Multi-rank and partition independence
 
