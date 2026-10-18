@@ -259,3 +259,13 @@ under linfs and zstar and a full linfs year (annual-mean SSH SE − SI rms 0.110
 growing ~15 % per step, probably at 26°W 5°N in the equatorial Atlantic, where both χ = 0.05 years had a July
 anomaly of 30–40 mm and 1.6 °C at 85 m that χ = 0.25 did not have. So on CORE2 the smallest χ stable for a year
 under zstar lies above 0.05; a zstar year at χ = 0.1 is the next test. The default χ is still 0.25.
+
+**The original questions 5–9.**
+- Question 5: they take the Coriolis term from uv and do the AB interpolation on the vertically integrated
+  velocities, storing the result of the previous step. This is D4 as implemented (s = Σhelem·uv, AB2 a₂sⁿ + a₁sⁿ⁻¹, sⁿ⁻¹
+  stored in `se_sbar_old` and in the restart), restored in Task 5.5.
+- Questions 6 and 7: yes and yes. The vector-invariant momentum advection in R and the element depth H_e(η) through the
+  zstar weights under the vertex bottom are accepted.
+- Question 8: z*. Production with SE is z*; FESOM_F's `tools/prod_env.sh` is linfs, so z* gets its own twin
+  (Task 5.6).
+- Question 9: AB3–AM4, modified, the SESM above. The scheme is SESM, as implemented.
