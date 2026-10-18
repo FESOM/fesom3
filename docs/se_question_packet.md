@@ -163,3 +163,20 @@ elevation is what models with a filter use.
   an averaged elevation belongs to models with a filter. So the filtered-η-for-the-ice option is dropped: on CORE2
   the shelf mode at χ = 0.1 is the case where the damping is too weak for that, and χ = 0.25 (or 0.2, his setups)
   is the fix.
+
+**Question 3.** The bottom drag should go into the barotropic equation. The vertically integrated 3-D forcing is
+made consistent with the barotropic equation approximately, by subtracting the barotropic momentum right-hand side
+at the first substep (m = 1); the same can be done for Coriolis, which simplifies the scheme.
+
+**Question 4.** Yes (η^{n+1} = η^M at integer levels, `eta_n = hbar = η^M`, as intended).
+
+**Question 5.** It is simpler to keep the Coriolis term in r as in 3-D and make it consistent with 2-D as in
+answer 3.
+
+- Put the bottom drag into the barotropic substeps (as the Zenodo `se_bottdrag`: r_b = C_d·|u_bottom| from the
+  3-D bottom velocity, frozen over the step, term −r_b·Ū/H in each substep; there optionally semi-implicit).
+- Consistency of F with the substeps, approximately: subtract from the integrated 3-D forcing the barotropic
+  right-hand side at the first substep (the drag, and the same for Coriolis). Coriolis stays in the 3-D AB2 array
+  as it is; the stored-sum r-term (š, D4) is replaced by subtracting the barotropic Coriolis at the start of the
+  step. ➕ New task (not started): change of the SE scheme, re-gate, and re-screen χ (the in-substep drag may
+  damp the shelf mode that the frozen drag fed).
