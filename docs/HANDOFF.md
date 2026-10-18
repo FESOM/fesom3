@@ -5,10 +5,11 @@ Full pre-M2.12 milestone detail + the per-gate recipes live in [`HANDOFF-archive
 
 ## Where we are
 
-- **Split-explicit barotropic solver — STARTING (2026-10-17, branch `split-explicit`, worktree
-  `/work/ab0995/a270088/fesom3_se`):** SE subcycling after Sergey's notes, linfs first with zstar designed in, for
-  the bottom at vertices; FESOM_F first, the JAX port follows. Nothing implemented; brainstorm → plan → implement.
-  Start from `plans/2026-10-17-split-explicit-handoff.md`.
+- **Split-explicit barotropic solver — Stages 0–4 DONE, Stage 6 DONE except the G3 numbers, Stage 5 OPEN
+  (2026-10-18, branch `split-explicit`, worktree `/work/ab0995/a270088/fesom3_se`, unpushed):** SE subcycling after
+  Sergey's notes (`FESOM3_SSH_SE=1`), linfs and zstar, any np, exact restarts; SE off byte-identical to main. Open: at the default χ = 0.1 a cold CORE2
+  run blows up at step ~335 (sea-ice feedback, no code defect); Stage 5 (default χ / `se_visc_ah` or another remedy,
+  then screens, 1-year twin, perf; ≈ 3–5 node-h) needs Nikolay's yes → section "Split-explicit barotropic solver".
 - **Shared-element velocity sync ✅ DONE (2026-10-12, plan `plans/completed/20261012-shared-element-sync.md`,
   on `bottom-at-vertices`):** a border element is owned by every rank that owns one of its vertices;
   `update_vel` now gives every such element one owner for `uv` (the highest vertex-owner rank, whose copy
@@ -340,6 +341,62 @@ The live "Oracle" section above + the "M2.12 entry notes" below cover what the c
 The hybrid-mesh gate migration (which FESOM2-oracle gates are retired, the roundoff gate
 `tools/run_tri_regression.sh` that replaces them) is in "Hybrid (mixed triangle + quad) meshes" →
 "Gate migration for hybrid meshes" below.
+
+## Split-explicit barotropic solver (plan `plans/2026-10-17-split-explicit.md`, 2026-10-17/18)
+
+**Where.** Branch `split-explicit` (from main 814e5d0), worktree `/work/ab0995/a270088/fesom3_se`, not pushed.
+Design input `plans/2026-10-17-split-explicit-handoff.md`; the plan holds every measured number with its job id;
+summary for readers in `IMPLEMENTATION.md` §14 and `TESTING.md` §6c; LESSONS L71–L74; question packet (draft, not
+sent) `docs/se_question_packet.md`. G0 references and frozen pre-SE binaries: `/work/ab0995/a270088/fesom3_se_ref/`
+(`bin_main_6cd6449/`, `g0/`); job scripts and logs in its `jobs/` (`t0*`–`t22_*`, `t61_*`, `dbg_*`) and in
+`/work/ab0995/a270088/fesom3_se_t02_jobs/` (Stages 3–4, `t3*`, `t4*`).
+
+**What it is.** `src/oce/oce_ssh_se.F90`: SM2005 AB3–AM4 substeps of (η, Ū = Σhelem·u), M per baroclinic step,
+no filter, trim to ⟨⟨Ū⟩⟩; replaces `update_stiff_mat_ale … update_eta_n` in `step_oce` (`if (dynamics%use_ssh_se)`,
+the SI block verbatim in the `else`). Depth law H_e(η) = Hⁿ + Σ elem_w·c·(η − ηⁿ) (linfs c ≡ 0, zstar c from
+`zbar_3d_n`); F synced once per step from the shared-element owner, gather-only element operators; linear BT
+viscosity on Ūᵐ − Ūⁿ; operator-based CFL guard (power iteration ω_max, Schur–Cohn a_crit(χ), s = 0.9; CORE2 M_min
+40 / 48 at χ 0.1 / 0.25); `FESOM3_SE_CHECK` invariant lines; 10 SE stores in the checkpoint. Knobs (env only):
+`FESOM3_SSH_SE`, `FESOM3_SE_M` (50), `FESOM3_SE_M_FORCE`, `FESOM3_SE_CHI` (0.1), `FESOM3_SE_VISC_AH` (0.01),
+`FESOM3_SE_CHECK`. Drivers: `fesom_lifecycle_native_mr`, `fesom_conserve`; every other driver stops with SE on.
+Side fix on the branch: zstar restarts rebuild the derived thicknesses after `restart_read` (Task 4.1, LESSONS L73;
+SI-zstar keeps the stiffness gap).
+
+**Gated (Stages 0–4, Task 6.1).**
+- G0 after every stage: SE off byte-identical to the frozen main binaries (CORE2 linfs + zstar with production
+  physics: 99 checkpoint variables, 1,649,154 dump records, step lines; conserve log) — `tools/run_g0_se.sh`.
+- Invariants at rounding, linfs and zstar, pi (1000 steps) and CORE2 (np 1/8/128); copy spreads exactly 0;
+  determinism bitwise; restart split == straight `max|Δ| = 0` (linfs, zstar, np 1/2, np 2 → 8; visc_ah 0);
+  SI checkpoint read with SE on stops with a message. Levels: TESTING.md §6c.
+- ctest 176 (+9 SE tests over main's 167): Intel 176/176; GNU 170/176 with the 6 failures that main has too
+  (`test_wimpl_tra_np1/np2`, `meshdiag_mixed/quad/pi_w`, `test_shared_elem_np1`; main additionally fails the 5
+  `test_coupling_mixed` tests on GNU, fixed on this branch by 7d7ae6a).
+- Task 6.1 integration check (job 28219284, this tree after the rebase of Stages 3–4 onto the guard commit):
+  ctest Intel 176/176, GNU 170/176 (the 6); G0 GREEN;
+  `run_conserve_pi.sh` GATE OK (36 configs); restart gates GREEN max|Δ| = 0 (SI linfs, SE linfs, SE zstar at np 1
+  and 2; multirank SI and SE; round trip incl. the SE modes); `run_tri_regression.sh` 7/7; CORE2 np 8, 48 steps,
+  SE at χ = 0.1 (linfs and zstar): guard line M_min = 40, invariants at the np 1 levels, spreads 0; the SE gate runs
+  are bitwise equal to the Stage 4 runs of the pre-rebase tree. No fixup needed. 0.18 node-h.
+
+**Open — Stage 5, needs Nikolay's yes (estimate: CORE2 year ≈ 42 min on one node, 3000 steps ≈ 7 min; ≈ 3–5
+node-h in total).**
+1. Decide the default first: at χ = 0.1, M = 50, `se_visc_ah` 0.01 a cold CORE2 run with production physics blows
+   up at step 331–340 (linfs and zstar, np 8 and 128). Diagnosis (plan Task 5.1 note, LESSONS L74): a 3-step-period
+   grid-scale gravity mode on the 20 m Bellingshausen shelf under compact ice, +0.9 %/step, fed through the ice
+   (ice reads ηⁿ, ice→ocean stress frozen in F). Measured stable: χ = 0.25, `se_visc_ah` = 0.1 (480 steps).
+   Untested: a filtered η for the ice, the SM2005 averaging filter, the γ₀/γ₁ viscosity. Not remedies: larger M,
+   χ < 0.1, no viscosity. Sergey/Dmitry's view would help (`docs/se_question_packet.md`).
+2. Then Task 5.1 screens (3000 steps: χ/M variants, `se_visc_ah` 0, zstar), Task 5.2 1-year SE-vs-SI twin (linfs),
+   Task 5.3 SSH-phase timing on one node (np 128; seen so far: SE 12.9 vs SI 9.1 ms/step in the SSH phase).
+3. Then Task 6.1's last box (G3 numbers), the plan to `completed/`, a tag, the memory update; send the packet once
+   the G3 numbers exist. Later: JAX port of SE (bitwise against this code), NEMO SE, storing M/χ in the checkpoint.
+
+**Gotchas.**
+- CORE2 SE gate runs longer than ~300 steps need `FESOM3_SE_CHI=0.25` until the default is decided.
+- M and χ must stay fixed across a restart chain (not stored, not checked); SE → SI is not detected.
+- The restart gate scripts default to a stale `F3`: always pass `F3=` and `BUILD=`. They `rm -rf` their run dir:
+  pass a fresh one.
+- Under Intel `-no-prec-div` no division by a loop invariant in a per-element loop of duplicated state (L71).
 
 ## Shared elements: one owner for `uv` (plan `plans/completed/20261012-shared-element-sync.md`, 2026-10-12)
 

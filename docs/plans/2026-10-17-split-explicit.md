@@ -1158,24 +1158,70 @@ sbatch at a time or in a short chain; each wait is a background `sacct` watcher.
 
 ### Stage 6 — Verify and document
 
-#### Task 6.1: Acceptance check
+#### Task 6.1: Acceptance check (✅ except G3: Stage 5 pending Nikolay's yes)
+
+All in job 28219284 (shared, 32 cores, 14.1 min, 0.18 node-h; script and logs
+`/work/ab0995/a270088/fesom3_se_ref/jobs/t61_accept.sbatch`, `t61_*.28219284.*`; run dirs
+`/scratch/a/a270088/se_t61/t61_*_28219284`), on HEAD 68d6e48, the first build of Stages 3/4 rebased onto the guard
+commit 24c8e48. Incremental builds (Intel 27 s); no integration fixup was needed. Intel `fesom_lifecycle_native_mr`
+sha256 `01e1d34f709fb0e0…`, `fesom_conserve` `1edbc30ba0f7ef18…`.
 
 - [ ] every Overview requirement met:
-  - SE off is byte-identical to the frozen references;
-  - linfs and zstar invariants at np 1/2/8;
-  - copy spreads 0;
-  - restart max|Δ| = 0 (linfs and zstar);
-  - G3 numbers recorded
-- [ ] full ctest Intel + GNU, `run_g0_se.sh`, conserve_pi, restart gates, `run_tri_regression.sh` (`NEW_BIN=` this
-  build)
+  - [x] SE off is byte-identical to the frozen references: **G0 GREEN** (linfs, zstar: 99 checkpoint variables and
+    1 649 154 dump records max|Δ| = 0, 20 step lines equal; conserve 249 lines, 26 configs), 301 s; and
+    `run_tri_regression.sh` 7/7 (below)
+  - [x] linfs and zstar invariants at np 1/2/8: `run_conserve_pi.sh` **GATE OK, 36 configs** (SE linfs np 1/2/8:
+    etacomp ≤ 2.0e-15 m, trim ≤ 1.7e-13 m²/s, |msl| ≤ 1.0e-16 m, divsum ≤ 1.8e-16; SE zstar np 1/2/8: etacomp ≤
+    2.5e-15 m, trim ≤ 1.7e-13, |msl| ≤ 1.3e-16, laysum ≤ 4.5e-12 m, w1 ≤ 1.4e-18 m/s, hlaw 6.4e-12 m, heat/salt/volume
+    gate 1e-12 passed); ➕ CORE2 `prod_env 1e-5` np 8, 48 steps, SE + SE_CHECK at the default χ = 0.1, M = 50
+    (91 s / 88 s): the guard line `omega_max = 3.1518E-02 1/s (100 power iterations, last change 0.0E+00), a_crit(chi)
+    = 1.5788, s = 0.90 -> dtbt <= 45.084 s -> M_min = 40 (0.060 s)`; **linfs: etacomp ≤ 2.1e-14 m, trim ≤ 3.4e-13
+    m²/s, |msl| ≤ 9.3e-16 m, divsum ≤ 1.0e-15, dUV = dAB = dsig = 0**, max|η| 4.29 m (step 31), max CFL_z 0.868
+    (step 24); **zstar: etacomp ≤ 1.7e-14 m, trim ≤ 4.0e-13 m²/s, |msl| ≤ 9.3e-16 m, |fw| ≤ 3.8e-18 m, laysum ≤
+    6.4e-12 m, w1 ≤ 1.2e-17 m/s, hlaw ≤ 7.3e-12 m**, max|η| 4.33 m (step 31), max CFL_z 0.626; all inside the CORE2
+    gate columns and the same as the np 1 levels of Tasks 1.5 / 3.2 (max|η| 4.29 / 4.33 m at step 31, CFL_z 0.870 /
+    0.63); no NaN
+  - [x] copy spreads 0: spreadU = spreadUm = 0 in every SE_CHECK line above (pi np 1/2/8, CORE2 np 8)
+  - [x] restart max|Δ| = 0 (linfs and zstar): `run_restart_gate_core2.sh` N4 K2, mid-run and month boundary,
+    checkpoint + live dump: **SI linfs np 1 (214 s) / np 2 (149 s), SE linfs np 1 (225 s) / np 2 (145 s), SE zstar
+    np 1 (240 s) / np 2 (166 s) all GREEN, max|Δ| = 0** (SE: 37 stores; the resumed SE_CHECK / SE_CHECK_TAIL lines
+    equal the straight run's, without msl/fw); `run_restart_gate_multirank.sh` np 2 → 8: **SI (27 fields, 32 s) and
+    SE linfs (37 fields, 30 s) GREEN, max|Δ| = 0**; `run_restartroundtrip.sh` np 1 2: **GATE GREEN** (AB2 28, AB3 32,
+    SE 38 fields max|Δ| = 0; `FESOM3_RESTARTRT_SE=2` aborts with the message at np 1 and 2), 41 s
+  - [ ] G3 numbers recorded — **Stage 5 pending Nikolay's yes**
+- [x] full ctest Intel + GNU, `run_g0_se.sh`, conserve_pi, restart gates, `run_tri_regression.sh` (`NEW_BIN=` this
+  build). **ctest Intel 176/176** (32 s); **GNU 170/176, exactly the 6 known failures** (`test_wimpl_tra_np1/np2`,
+  `meshdiag_mixed/quad/pi_w`, `test_shared_elem_np1`; the serial rerun fails the same 6, no flake this time);
+  G0, conserve_pi and the restart gates above; **`run_tri_regression.sh` 7/7 PASS** (prod:pi:1, prod:pi:2,
+  prod:core2:8, decomp:pi_w:2, decomp:pi_w:8, conserve:pi:1, conserve:pi:2; `ROOT=` a fresh dir), 216 s
+- [x] ➕ cross-build: the integrated build reproduces the Stage 4 gate (job 28218753, se-t3 tree without the guard
+  commit) bitwise: for SE linfs and zstar, np 1 and 2, mid and boundary, the straight runs' SE_CHECK(_TAIL), step and
+  CFL_z lines are identical and their checkpoints equal (`zarr_diff.py --rel-floor 0`, 125 variables, 0 bad). So
+  the rebase onto the guard changed nothing in the SE step
 
-#### Task 6.2: Documentation
+#### Task 6.2: Documentation ✅ (except the last box, which waits for Stage 5 and Nikolay's yes)
 
-- [ ] `IMPLEMENTATION.md`: an SE section covering the scheme, the vertex-bottom depth law, the shared-element design,
-  the knobs, and restart (M and χ fixed across a chain; the SI-zstar restart gaps)
-- [ ] `TESTING.md`: the new tests and gates; fix the stale 153 → current count
-- [ ] `README.md`: the run switches; `docs/HANDOFF.md`: status and next steps; `docs/LESSONS.md` if anything was learnt
-- [ ] draft the Sergey/Dmitry question packet in `docs/` (not sent)
+- [x] `IMPLEMENTATION.md`: an SE section covering the scheme, the vertex-bottom depth law, the shared-element design,
+  the knobs, and restart (M and χ fixed across a chain; the SI-zstar restart gaps). New §14 (scheme and coefficients,
+  F and the stored-sum Coriolis, what it replaces in step_oce and leaves untouched, H_e(η) with c, the one-owner F
+  sync + gather-only operators + the reciprocal rule, the linear BT viscosity, the operator-based CFL guard, the
+  env-only knob table, restart: 10 stores and halo modes, the pre-check message, M/χ fixed, SE→SI not detected, the
+  Task 4.1 rebuild and the remaining SI-zstar stiffness gap, and the open χ = 0.1 stability issue); a row in the
+  FESOM2-vs-FESOM_F table, a pointer in §9, §12 and the §2 file counts (105 files, oce 28)
+- [x] `TESTING.md`: the new tests and gates; fix the stale 153 → current count. The SE ctests in §5 (test_ssh_se
+  C1–C11, P1–P4, Z1–Z6, the driver stops, fesom_conserve_se_*), new §6c (G0 `run_g0_se.sh`, the SE_CHECK line,
+  the run_conserve_pi SE blocks, the restart gates and round-trip SE modes, determinism, the levels/threshold
+  table); counts 153/167 → 176 at :22, :113, :159, :385, and the GNU row of the compiler matrix (was "all 21 pass",
+  now 170/176 with the 6 known failures)
+- [x] `README.md`: the run switches; `docs/HANDOFF.md`: status and next steps; `docs/LESSONS.md` if anything was learnt.
+  README: an SE bullet in "Changes since v1" with the one-line χ caveat, the `FESOM3_SSH_SE` / `FESOM3_SE_*` rows in
+  the variable table, the oce module count. HANDOFF: the "Where we are" bullet and a section "Split-explicit
+  barotropic solver" (where, what, gated, Stage 5 open with the cost estimate, gotchas). LESSONS L71 (division by a
+  loop invariant under `-no-prec-div`), L72 (res-based vs operator CFL limit), L73 (the zstar restart gap, SI-zstar
+  stiffness), L74 (the shelf-wave/sea-ice feedback)
+- [x] draft the Sergey/Dmitry question packet in `docs/` (not sent): `docs/se_question_packet.md` (what is
+  implemented, what is gated, the χ = 0.1 diagnosis with R0–R3, margins and the toy model, remedy options measured /
+  untested, 9 questions)
 - [ ] move this plan to `docs/plans/completed/`; tag and memory update after Nikolay's yes
 
 ## Technical Details
