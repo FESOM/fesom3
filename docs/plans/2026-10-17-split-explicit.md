@@ -1048,7 +1048,7 @@ sbatch at a time or in a short chain; each wait is a background `sacct` watcher.
 
 ➕ **Approved by Nikolay on 2026-10-18** (the whole stage 3–5 node-hours), together with the decision on the default
 below (Task 5.0).
-➕ Stage 5 cost so far: Tasks 5.0 + 5.1 0.97 node-h, Tasks 5.2 + 5.3 1.61 node-h (2.58 in all). ➕ Nikolay asked
+➕ Stage 5 cost: Tasks 5.0 + 5.1 0.97 node-h, Tasks 5.2 + 5.3 1.61 node-h, the closure test 0.48 node-h (3.06 in all). ➕ Nikolay asked
 why port_kokkos runs χ = 0.1: its BT viscosity is the flow-dependent Zenodo closure (γ0 = 10, γ1 = 2750), ≈ 2× ours in
 calm flow and ≈ 10–15× on the noisy shelf. ➕ Tested (lane C, 0.32 node-h, job 28220789, report
 `/work/ab0995/a270088/fesom3_se_ref/jobs/s5_C_report.md`): the closure as an opt-in knob, `FESOM3_SE_VISC_FLOW=1`
@@ -1059,8 +1059,15 @@ merged; ctest Intel 176/176, GNU the 6 known, G0 GREEN, copy spreads 0). CORE2 `
   - L1 χ = 0.1 linear (control): +0.91 %/step, floating overflow at step 340 (identical to the diagnosis run);
   - Z3 χ = 0.25 + closure: −0.32 / −0.22 %/step (χ = 0.25 linear: −0.36 %/step).
   So χ = 0.1 is stable with the closure, but with the thinnest margin of the stable setups; the closure barely touches
-  the resolved flow (4.731 vs 4.737 m). SE_BT +15–25 % at np 8 (≈ 1 % of the step). ⚠️ Open: Z2 (χ = 0.1 + closure,
-  3000 steps, np 128, ≈ 0.2 node-h, `jobs/s5_C_z2.sbatch`, not submitted) and Nikolay's choice of default.
+  the resolved flow (4.731 vs 4.737 m). SE_BT +15–25 % at np 8 (≈ 1 % of the step).
+  - Z2 χ = 0.1 + closure, 3000 steps, np 128, SE_CHECK + DBG_SHELF (job 28221912, 0.16 node-h, `jobs/s5_C_z2.sbatch`,
+    run dir `/scratch/a/a270088/se_s5c/z2_28221912`): **runs, exit 0**; shelf noise 0.21 m (step 250) → 0.03 m (step
+    750), then 0.02–0.07 m to step 3000 with no trend; the 3-step mode amplitude 0.17 → 0.005 m; max|η| 4.730 m (step
+    67), 1.934 m at step 3000 (the χ = 0.25 linear screen: 1.934 m); max CFL_z 1.607; etacomp ≤ 6.2e-14 m, trim ≤
+    3.2e-12 m²/s, spreads 0, no NaN. In the same job the linear χ = 0.1 control (300 steps) grows +0.87 %/step again.
+    TMR_OCE_SE_BT 12.25 (closure) vs 10.76 (linear) ms/step at np 128, +14 %; loop 152.4 vs 151.3 ms/step.
+  - ✅ **Decision (Nikolay 2026-10-18): default stays χ = 0.25 with the linear viscosity; the closure is kept as the
+    opt-in `FESOM3_SE_VISC_FLOW=1`** (cherry-picked onto split-explicit as 2f06053).
 
 #### ➕ Task 5.0: default χ = 0.25 ✅
 
