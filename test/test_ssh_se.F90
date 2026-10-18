@@ -11,7 +11,9 @@ program test_ssh_se
     !       AB3 and AM4 weights sum to 1.
     !   C2  knob parsing (se_parse_knob): every bad value is rejected (ok = .false., the t_dyn
     !       field unchanged, the message starts with the knob name); se_read_env and
-    !       se_env_requested stop on exactly these. Good values land in t_dyn.
+    !       se_env_requested stop on exactly these. Good values land in t_dyn. The defaults of
+    !       the flow-dependent viscosity (off, gamma0 10, gamma1 2750) and se_knob_conflict (a
+    !       set FESOM3_SE_VISC_AH with FLOW=1, a set GAMMA0/1 without it).
     !   C3  the CFL guard (plan Task 0.4; runs after C4, the operator reads helem):
     !       a) a_crit(chi) = 1.853 / 1.579 / 1.329 at chi = 0 / 0.1 / 0.25 to 1e-3 (the numpy root
     !          finder of plan Task 5.1); se_cfl_stable flips between 0.999 and 1.001 a_crit; the
@@ -65,6 +67,19 @@ program test_ssh_se
     !       sum_e A_e*V_e = 0 to 1e-12 of sum_e A_e*|V_e| for a hashed halo-valid dU (each
     !       element counted once: on the rank owning its first vertex); V of a uniform velocity is
     !       exactly 0 over a flat bottom and 0 to rounding over the real one.
+    !   C8f the flow-dependent viscosity W (se_visc_flow, FESOM3_SE_VISC_FLOW=1) on a hashed
+    !       halo-valid transport (velocity differences ~5 cm/s, so both branches of
+    !       max(gamma0, gamma1*|dU|/H) occur): zlen = sqrt(A_e + A_nb) on interior slots (1e-15),
+    !       0 on boundary slots and a triangle's slot 4, bitwise the same from both sides of an
+    !       edge; sum_e A_e*W_e = 0 to 1e-12 of sum_e A_e*|W_e| (each element once); W against an
+    !       independent edge scatter in the form of the Zenodo code (owned edges; elements whose
+    !       edges are all owned) to 1e-13 of the largest flux sum, for gamma1 = 2750 and 0; W of
+    !       a uniform transport == 0 exactly; gamma1 = 0: W(2U) == 2 W(U) bitwise and W(U + U2) =
+    !       W(U) + W(U2) to 1e-13 (linear, coefficient sqrt(gamma0*zlen) by the scatter check);
+    !       gamma0 = 0: W(4U) = 8 W(U) to 1e-13 (the flow term alone, ~|dU|^(3/2)); at npes > 1
+    !       the copy spread of W over the shared elements is 0 for all three settings (LESSONS
+    !       L71). Then one substep (M = 1) with W from U^0 = U^n: W(U^0) - W(U^n) == 0, so U^1 on
+    !       the owned elements equals the run without viscosity bitwise.
     !   C9  se_subcycle (Task 1.2):
     !       a) M = 1 on a hashed state: the rings shift by copying (eta^{-2/M} <- eta^{-1/M} <-
     !          eta_n, U levels 2 <- 1 <- 0; bitwise), and <<U>> = the AB3 transport U*, eta^1 =
@@ -96,6 +111,10 @@ program test_ssh_se
     !       no non-finite value; the line is blank-separated key=value tokens; a uv perturbed by
     !       delta on one element shows as trim = helem*delta (the other checks unchanged), and a
     !       NaN there is counted.
+    !   P5  P2 with the flow-dependent viscosity: NK = 6 SE steps through the real kernels with
+    !       FESOM3_SE_VISC_FLOW on and the shared-element sync on: the copy spreads of U (3
+    !       levels), <<U>> and uv are 0 after every step, the state is finite, and U^M differs
+    !       from the linear viscosity's (the switch acts).
     !   Z1-Z6 zstar (Task 3.1): the depth law, the freshwater term and the zstar checks through the
     !       real ALE tail; their own block at the end of this file (run last).
     ! FESOM3_MESH_DIR (default pi), FESOM3_TEST_ROTATE=1 reads it rotated (setup_test_mesh).
@@ -122,6 +141,7 @@ program test_ssh_se
                                 se_cfl_acrit, se_cfl_apply_a, se_cfl_omega_max, SE_CFL_SAFETY, &
                                 SE_CFL_OK, SE_CFL_FORCED, SE_CFL_DIE, se_bt_forcing, &
                                 se_elem_depth, se_subcycle, se_inflow, se_visc, se_tendency, &
+                                se_visc_flow, se_knob_conflict, &
                                 se_trim_finish, se_check_values, se_check_line, SE_NCHK, &
                                 SE_CHK_ETACOMP, SE_CHK_TRIM, SE_CHK_MSL, SE_CHK_SPREADU, &
                                 SE_CHK_SPREADUM, SE_CHK_MAXETA, SE_CHK_MAXU, SE_CHK_NBAD
@@ -150,9 +170,11 @@ program test_ssh_se
     call c6_forcing_coriolis()
     call c7_consistency()
     call c8_visc()
+    call c8f_visc_flow()
     call c9_subcycle()
     call c10_trim_finish()
     call p_many_ranks()
+    call p5_flow()
     call c11_check()
     call z_zstar()                ! last: it leaves the zstar thickness fields allocated
     call finish(partit, 'test_ssh_se')
@@ -204,6 +226,12 @@ contains
         call bad('FESOM3_SE_VISC_AH', '-1'); call bad('FESOM3_SE_VISC_AH', '-1e-9')
         call bad('FESOM3_SE_VISC_AH', 'NaN'); call bad('FESOM3_SE_VISC_AH', 'Infinity')
         call bad('FESOM3_SE_CHECK', '2');    call bad('FESOM3_SE_CHECK', 'on')
+        call bad('FESOM3_SE_VISC_FLOW', '2'); call bad('FESOM3_SE_VISC_FLOW', 'yes')
+        call bad('FESOM3_SE_VISC_FLOW', '')
+        call bad('FESOM3_SE_VISC_GAMMA0', '-1'); call bad('FESOM3_SE_VISC_GAMMA0', 'nan')
+        call bad('FESOM3_SE_VISC_GAMMA0', '10 20'); call bad('FESOM3_SE_VISC_GAMMA0', '')
+        call bad('FESOM3_SE_VISC_GAMMA1', '-2750'); call bad('FESOM3_SE_VISC_GAMMA1', 'Inf')
+        call bad('FESOM3_SE_VISC_GAMMA1', '2750x'); call bad('FESOM3_SE_VISC_GAMMA1', '2750,0')
         call bad('FESOM3_SE_BOGUS', '1')
         ! accepted values land in their field
         call good('FESOM3_SSH_SE', '1', d);       call check(d%use_ssh_se, 'C2 FESOM3_SSH_SE=1', partit%mype)
@@ -217,6 +245,29 @@ contains
         call good('FESOM3_SE_VISC_AH', '0', d);   call check(d%se_visc_ah == 0.0_WP, 'C2 FESOM3_SE_VISC_AH=0', partit%mype)
         call good('FESOM3_SE_VISC_AH', '0.02', d); call check(d%se_visc_ah == 0.02_WP, 'C2 FESOM3_SE_VISC_AH=0.02', partit%mype)
         call good('FESOM3_SE_CHECK', '1', d);     call check(d%se_check, 'C2 FESOM3_SE_CHECK=1', partit%mype)
+        call check(.not. d%se_visc_flow .and. d%se_visc_g0 == 10.0_WP .and. d%se_visc_g1 == 2750.0_WP, &
+                   'C2 defaults: linear viscosity, gamma0 10, gamma1 2750', partit%mype)
+        call good('FESOM3_SE_VISC_FLOW', '1', d); call check(d%se_visc_flow, 'C2 FESOM3_SE_VISC_FLOW=1', partit%mype)
+        call good('FESOM3_SE_VISC_FLOW', '0', d); call check(.not. d%se_visc_flow, 'C2 FESOM3_SE_VISC_FLOW=0', partit%mype)
+        call good('FESOM3_SE_VISC_GAMMA0', '0', d)
+        call check(d%se_visc_g0 == 0.0_WP, 'C2 FESOM3_SE_VISC_GAMMA0=0', partit%mype)
+        call good('FESOM3_SE_VISC_GAMMA0', '12.5', d)
+        call check(d%se_visc_g0 == 12.5_WP, 'C2 FESOM3_SE_VISC_GAMMA0=12.5', partit%mype)
+        call good('FESOM3_SE_VISC_GAMMA1', '2.75e3', d)
+        call check(d%se_visc_g1 == 2750.0_WP, 'C2 FESOM3_SE_VISC_GAMMA1=2.75e3', partit%mype)
+        call good('FESOM3_SE_VISC_GAMMA1', '0', d)
+        call check(d%se_visc_g1 == 0.0_WP, 'C2 FESOM3_SE_VISC_GAMMA1=0', partit%mype)
+        ! the knobs that have no effect (flow, VISC_AH set, a GAMMA set)
+        call check(len_trim(se_knob_conflict(.false., .false., .false.)) == 0 .and. &
+                   len_trim(se_knob_conflict(.false., .true., .false.)) == 0 .and. &
+                   len_trim(se_knob_conflict(.true., .false., .true.)) == 0 .and. &
+                   len_trim(se_knob_conflict(.true., .false., .false.)) == 0, &
+                   'C2 se_knob_conflict: no conflict for the meaningful combinations', partit%mype)
+        call check(index(se_knob_conflict(.true., .true., .false.), 'FESOM3_SE_VISC_AH ') == 1, &
+                   'C2 se_knob_conflict: FESOM3_SE_VISC_AH with FLOW=1', partit%mype)
+        call check(index(se_knob_conflict(.false., .false., .true.), 'FESOM3_SE_VISC_GAMMA0/1 ') == 1 .and. &
+                   index(se_knob_conflict(.false., .true., .true.), 'FESOM3_SE_VISC_GAMMA0/1 ') == 1, &
+                   'C2 se_knob_conflict: GAMMA0/1 without FLOW=1', partit%mype)
     end subroutine c2_parsing
 
     subroutine bad(name, str)
@@ -229,7 +280,9 @@ contains
         call check(index(msg, name) == 1, 'C2 '//name//'="'//str//'" message: '//trim(msg), partit%mype)
         call check((d%use_ssh_se .eqv. d0%use_ssh_se) .and. d%se_M == d0%se_M .and. &
                    d%se_chi == d0%se_chi .and. d%se_visc_ah == d0%se_visc_ah .and. &
-                   (d%se_check .eqv. d0%se_check) .and. (d%se_m_force .eqv. d0%se_m_force), &
+                   (d%se_check .eqv. d0%se_check) .and. (d%se_m_force .eqv. d0%se_m_force) .and. &
+                   (d%se_visc_flow .eqv. d0%se_visc_flow) .and. d%se_visc_g0 == d0%se_visc_g0 .and. &
+                   d%se_visc_g1 == d0%se_visc_g1, &
                    'C2 '//name//'="'//str//'" leaves t_dyn unchanged', partit%mype)
     end subroutine bad
 
@@ -804,6 +857,204 @@ contains
             'test_ssh_se: C8 uniform velocity, real bottom: max|V| = ', vmax, ' of kappa*H*u ', vscale
     end subroutine c8_visc
 
+    subroutine c8f_visc_flow()
+        ! C8f (header): the flow-dependent viscosity W of se_visc_flow
+        type(t_dyn) :: dyn, d0, d, dn
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, e, k, kb, nb, c, ed, el(2)
+        integer :: nbad, nbad_zero, nbad_sym, ncmp, nlo, nhi, ip
+        real(kind=WP), allocatable :: U(:,:), U2(:,:), W(:,:), W2(:,:), W3(:,:), acc(:,:), aacc(:,:)
+        real(kind=WP) :: ssum(2), sabs(2), res, scale, du(2), hh, nu, x, sp, wmax, zerr, gam1(2)
+        logical :: allown
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        call new_dyn(dyn)
+        call se_init(dyn, mesh, partit, dt)
+        call se_elem_depth(dyn, mesh, partit)
+        call check(.not. dyn%se_visc_flow, 'C8f the flow-dependent viscosity is off by default', partit%mype)
+        dyn%se_visc_flow = .true.
+
+        ! ---- zlen: structure, value, symmetry ----
+        nbad_zero = 0; nbad = 0; nbad_sym = 0; zerr = 0.0_WP
+        do e = 1, nElemO
+            do k = 1, MAX_NV
+                nb = mesh%elem_neighbors(k, e)
+                if (k > mesh%elem2D_nnodes(e) .or. nb == e) then
+                    if (dyn%se_zlen(k, e) /= 0.0_WP) nbad_zero = nbad_zero + 1
+                    cycle
+                end if
+                x = sqrt(mesh%elem_area(e) + mesh%elem_area(nb))
+                zerr = max(zerr, abs(dyn%se_zlen(k, e) - x)/x)
+                if (nb > nElemO) cycle
+                do kb = 1, mesh%elem2D_nnodes(nb)
+                    if (mesh%elem_neighbors(kb, nb) /= e) cycle
+                    if (dyn%se_zlen(kb, nb) /= dyn%se_zlen(k, e)) nbad_sym = nbad_sym + 1
+                    nbad = nbad + 1
+                end do
+            end do
+        end do
+        call sum_all(nbad_zero, partit); call sum_all(nbad_sym, partit); call sum_all(nbad, partit)
+        call max_all(zerr, partit)
+        call check(nbad_zero == 0, 'C8f zlen == 0 on boundary slots and triangle slot 4', partit%mype)
+        call check(zerr <= 1.0e-15_WP, 'C8f zlen = sqrt(A_e + A_nb) on interior slots', partit%mype)
+        call check(nbad > 0 .and. nbad_sym == 0, 'C8f zlen bitwise the same from both sides of an edge', &
+                   partit%mype)
+
+        ! ---- a hashed halo-valid transport, velocities ~5 cm/s ----
+        allocate(U(2, nElemL), U2(2, nElemL), W(2, nElemL), W2(2, nElemL), W3(2, nElemL))
+        allocate(acc(2, nElemL), aacc(2, nElemL))
+        do e = 1, nElemL
+            do c = 1, 2
+                U(c, e)  = dyn%se_H(e)*0.05_WP*hval(partit%myList_elem2D(e), 70 + c)
+                U2(c, e) = dyn%se_H(e)*0.05_WP*hval(partit%myList_elem2D(e), 72 + c)
+            end do
+        end do
+        W = 0.0_WP; W2 = 0.0_WP; W3 = 0.0_WP
+
+        ! both branches of max(gamma0, gamma1*|dU|/H) occur
+        nlo = 0; nhi = 0
+        do e = 1, nElemO
+            do k = 1, mesh%elem2D_nnodes(e)
+                nb = mesh%elem_neighbors(k, e)
+                if (nb == e) cycle
+                du = U(:, e) - U(:, nb)
+                hh = 0.5_WP*(dyn%se_H(e) + dyn%se_H(nb))
+                if (dyn%se_visc_g1*sqrt(du(1)**2 + du(2)**2)/hh > dyn%se_visc_g0) then
+                    nhi = nhi + 1
+                else
+                    nlo = nlo + 1
+                end if
+            end do
+        end do
+        call sum_all(nlo, partit); call sum_all(nhi, partit)
+        call check(nlo > 0 .and. nhi > 0, 'C8f both branches of max(gamma0, gamma1*|dU|/H) occur', partit%mype)
+
+        ! ---- sum_e A_e W_e = 0 ----
+        call se_visc_flow(dyn, mesh, partit, U, W)
+        ssum = 0.0_WP; sabs = 0.0_WP
+        do e = 1, nElemO
+            if (mesh%elem2D_nodes(1, e) > nNodO) cycle        ! counted on its first vertex's owner
+            ssum = ssum + mesh%elem_area(e)*W(:, e)
+            sabs = sabs + mesh%elem_area(e)*abs(W(:, e))
+        end do
+        call sum_all(ssum, partit); call sum_all(sabs, partit)
+        call check(all(sabs > 0.0_WP), 'C8f W of a hashed U is non-trivial', partit%mype)
+        call check(all(abs(ssum) <= 1.0e-12_WP*sabs), 'C8f sum_e A_e*W_e = 0', partit%mype)
+        if (partit%mype == 0) write(*,'(a,2es10.3,a,2es10.3,a,i0,a,i0,a)') &
+            'test_ssh_se: C8f flow viscosity: sum_e A_e W_e = ', ssum, ' of sum_e A_e |W_e| = ', sabs, &
+            ' (slots: ', nlo, ' at gamma0, ', nhi, ' at gamma1*|dU|/H)'
+
+        ! ---- against the edge scatter of the Zenodo code, gamma1 = 2750 and 0 ----
+        gam1 = [dyn%se_visc_g1, 0.0_WP]
+        do ip = 1, 2
+            dyn%se_visc_g1 = gam1(ip)
+            call se_visc_flow(dyn, mesh, partit, U, W)
+            acc = 0.0_WP; aacc = 0.0_WP
+            do ed = 1, nEdgeO
+                el = mesh%edge_tri(:, ed)
+                if (el(2) == el(1)) cycle                          ! boundary edge
+                hh = 0.5_WP*(dyn%se_H(el(1)) + dyn%se_H(el(2)))
+                du = U(:, el(1)) - U(:, el(2))
+                nu = sqrt(max(dyn%se_visc_g0, dyn%se_visc_g1*sqrt(du(1)**2 + du(2)**2)/hh) &
+                          *sqrt(mesh%elem_area(el(1)) + mesh%elem_area(el(2))))
+                acc(:, el(1))  = acc(:, el(1)) - du*nu
+                acc(:, el(2))  = acc(:, el(2)) + du*nu
+                aacc(:, el(1)) = aacc(:, el(1)) + abs(du*nu)
+                aacc(:, el(2)) = aacc(:, el(2)) + abs(du*nu)
+            end do
+            res = 0.0_WP; scale = 0.0_WP; ncmp = 0
+            do e = 1, nElemO
+                allown = .true.
+                do k = 1, mesh%elem2D_nnodes(e)
+                    if (mesh%elem_edges(k, e) > nEdgeO) allown = .false.
+                end do
+                if (.not. allown) cycle
+                ncmp  = ncmp + 1
+                res   = max(res, maxval(abs(W(:, e) - acc(:, e)/mesh%elem_area(e))))
+                scale = max(scale, maxval(aacc(:, e))/mesh%elem_area(e))
+            end do
+            call max_all(res, partit); call max_all(scale, partit); call sum_all(ncmp, partit)
+            call check(ncmp > 0 .and. res <= 1.0e-13_WP*scale, 'C8f W = the Zenodo edge scatter ('// &
+                       trim(merge('gamma1 = 2750', 'gamma1 = 0   ', ip == 1))//')', partit%mype)
+            if (partit%mype == 0) write(*,'(a,f6.0,a,es10.3,a,es10.3,a,i0,a)') &
+                'test_ssh_se: C8f gamma1 = ', gam1(ip), ': W vs the edge scatter ', res, ' of ', scale, &
+                ' (', ncmp, ' elements)'
+        end do
+
+        ! ---- gamma1 = 0: linear in U ----
+        ! (dyn%se_visc_g1 = 0 from the loop above)
+        call se_visc_flow(dyn, mesh, partit, U, W)
+        call se_visc_flow(dyn, mesh, partit, 2.0_WP*U, W2)
+        nbad = count(W2(:, 1:nElemO) /= 2.0_WP*W(:, 1:nElemO))
+        call sum_all(nbad, partit)
+        call check(nbad == 0, 'C8f gamma1 = 0: W(2U) == 2 W(U) (bitwise)', partit%mype)
+        call se_visc_flow(dyn, mesh, partit, U2, W2)
+        call se_visc_flow(dyn, mesh, partit, U + U2, W3)
+        res = maxval(abs(W3(:, 1:nElemO) - W(:, 1:nElemO) - W2(:, 1:nElemO)))
+        scale = max(maxval(abs(W(:, 1:nElemO))), maxval(abs(W2(:, 1:nElemO))))
+        call max_all(res, partit); call max_all(scale, partit)
+        call check(res <= 1.0e-13_WP*scale, 'C8f gamma1 = 0: W(U + U2) = W(U) + W(U2)', partit%mype)
+        sp = 0.0_WP
+        if (partit%npes > 1) sp = shared_copy_max_elem(W, partit)
+
+        ! ---- gamma0 = 0: the flow term alone, W(4U) = 8 W(U) ----
+        dyn%se_visc_g0 = 0.0_WP
+        dyn%se_visc_g1 = gam1(1)
+        call se_visc_flow(dyn, mesh, partit, U, W)
+        call se_visc_flow(dyn, mesh, partit, 4.0_WP*U, W2)
+        res = maxval(abs(W2(:, 1:nElemO) - 8.0_WP*W(:, 1:nElemO)))
+        scale = 8.0_WP*maxval(abs(W(:, 1:nElemO)))
+        call max_all(res, partit); call max_all(scale, partit)
+        call check(scale > 0.0_WP .and. res <= 1.0e-13_WP*scale, 'C8f gamma0 = 0: W(4U) = 8 W(U)', partit%mype)
+        if (partit%npes > 1) sp = max(sp, shared_copy_max_elem(W, partit))
+
+        ! ---- the defaults again: copy spread, uniform transport ----
+        dyn%se_visc_g0 = 10.0_WP
+        call se_visc_flow(dyn, mesh, partit, U, W)
+        if (partit%npes > 1) then
+            sp = max(sp, shared_copy_max_elem(W, partit))
+            call max_all(sp, partit)
+            call check(sp == 0.0_WP, 'C8f copy spread of W over the shared elements is 0', partit%mype)
+            if (partit%mype == 0) write(*,'(a,es10.3)') 'test_ssh_se: C8f max copy spread of W ', sp
+        end if
+        wmax = maxval(abs(W(:, 1:nElemO)))
+        call max_all(wmax, partit)
+        do e = 1, nElemL
+            U(:, e) = [1200.0_WP, -800.0_WP]
+        end do
+        call se_visc_flow(dyn, mesh, partit, U, W)
+        nbad = count(W(:, 1:nElemO) /= 0.0_WP)
+        call sum_all(nbad, partit)
+        call check(nbad == 0, 'C8f W(uniform transport) == 0 exactly', partit%mype)
+
+        ! ---- one substep from U^0 = U^n: W(U^0) - W(U^n) == 0 ----
+        call new_dyn(d0)
+        call se_init(d0, mesh, partit, dt)
+        call se_elem_depth(d0, mesh, partit)
+        do e = 1, nElemL
+            do c = 1, 2
+                d0%se_ubt(c, e, 0) = d0%se_H(e)*0.01_WP*hval(partit%myList_elem2D(e), 80 + c)
+                d0%se_ubt(c, e, 1) = d0%se_H(e)*0.01_WP*hval(partit%myList_elem2D(e), 82 + c)
+                d0%se_ubt(c, e, 2) = d0%se_H(e)*0.01_WP*hval(partit%myList_elem2D(e), 84 + c)
+                d0%se_force(c, e)  = 1.0e-3_WP*hval(partit%myList_elem2D(e), 86 + c)
+            end do
+            d0%se_ubtn(:, e) = d0%se_ubt(:, e, 0)
+        end do
+        d0%se_M = 1
+        d = d0
+        d%se_visc_flow = .true.
+        dn = d0
+        dn%se_visc_ah = 0.0_WP
+        call se_subcycle(d, mesh, partit, dt)
+        call se_subcycle(dn, mesh, partit, dt)
+        nbad = count(d%se_ubt(:, 1:nElemO, 0) /= dn%se_ubt(:, 1:nElemO, 0))
+        x = maxval(abs(d%se_vn(:, 1:nElemO)))
+        call sum_all(nbad, partit); call max_all(x, partit)
+        call check(nbad == 0 .and. x > 0.0_WP, 'C8f M = 1 from U^0 = U^n: U^1 equals the run '// &
+                   'without viscosity (W(U^0) - W(U^n) == 0, W(U^n) non-trivial)', partit%mype)
+        if (partit%mype == 0) write(*,'(a,es10.3,a,es10.3,a)') 'test_ssh_se: C8f max|W| (defaults, hashed U) ', &
+            wmax, ' m2/s2; max|W(U^n)| of the substep test ', x, ' m2/s2'
+        deallocate(U, U2, W, W2, W3, acc, aacc)
+    end subroutine c8f_visc_flow
+
     subroutine c9_subcycle()
         type(t_dyn) :: d0, d, dref
         integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, n, e, c, nbad, i, Mk(4)
@@ -1282,6 +1533,55 @@ contains
         call p_partition_independence(dp2, NK)
         deallocate(is_recv, infl, wf)
     end subroutine p_many_ranks
+
+    subroutine p5_flow()
+        ! P5 (header): P2's NK SE steps with the flow-dependent viscosity, the shared-element sync on
+        integer, parameter :: NK = 6
+        type(t_dyn) :: d, dl
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, e, n, nz, k, l, nbad
+        logical :: sync_env
+        real(kind=WP) :: sp(3), spmax(3), dmax, umax
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        sync_env = partit%sync_shared_elem
+        partit%sync_shared_elem = .true.
+        call p_state(d)
+        dl = d
+        d%se_visc_flow = .true.
+        spmax = 0.0_WP; nbad = 0
+        do k = 1, NK
+            call p_step(d, k)
+            call p_step(dl, k)
+            sp(1) = max(shared_copy_max_elem(d%se_ubt(:, :, 0), partit), &
+                        shared_copy_max_elem(d%se_ubt(:, :, 1), partit), &
+                        shared_copy_max_elem(d%se_ubt(:, :, 2), partit))
+            sp(2) = shared_copy_max_elem(d%se_umean, partit)
+            sp(3) = shared_copy_max_elem(d%uv, partit)
+            do l = 1, 3
+                call max_all(sp(l), partit)
+            end do
+            spmax = max(spmax, sp)
+            do n = 1, nNodO
+                if (.not. (abs(d%eta_n(n)) <= huge(1.0_WP))) nbad = nbad + 1
+            end do
+            do e = 1, nElemO
+                if (.not. all(abs(d%se_ubt(:, e, 0)) <= huge(1.0_WP))) nbad = nbad + 1
+                do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                    if (.not. all(abs(d%uv(:, nz, e)) <= huge(1.0_WP))) nbad = nbad + 1
+                end do
+            end do
+        end do
+        partit%sync_shared_elem = sync_env
+        dmax = maxval(abs(d%se_ubt(:, 1:nElemO, 0) - dl%se_ubt(:, 1:nElemO, 0)))
+        umax = maxval(abs(dl%se_ubt(:, 1:nElemO, 0)))
+        call max_all(dmax, partit); call max_all(umax, partit); call sum_all(nbad, partit)
+        call check(nbad == 0, 'P5 flow viscosity: eta, U, uv finite', partit%mype)
+        call check(all(spmax == 0.0_WP), 'P5 flow viscosity: copy spreads of U (3 levels), <<U>>, uv '// &
+                   'are 0 after every step', partit%mype)
+        call check(dmax > 0.0_WP, 'P5 flow viscosity: U^M differs from the linear viscosity''s', partit%mype)
+        if (partit%mype == 0) write(*,'(a,i0,a,3es10.3,a,es10.3,a,es10.3,a)') 'test_ssh_se: P5 ', NK, &
+            ' SE steps, flow viscosity, sync on: max spreads U/<<U>>/uv', spmax, '; max|U^M - U^M(linear)| ', &
+            dmax, ' of ', umax, ' m2/s'
+    end subroutine p5_flow
 
     subroutine p_state(d)
         ! the pre-predictor state of the P tests (block header), se_init's cold start, hbar = eta_n

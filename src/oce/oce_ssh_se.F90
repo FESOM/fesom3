@@ -13,14 +13,18 @@ module oce_ssh_se
     ! with (notes, subcycling.tex:81-91)
     !     beta = 0.281105, zeta = 0.00976186 - 0.13451357 chi, gamma = 0.083445 - 0.513584 chi,
     !     delta = 1/2 + 2 zeta + gamma + 2 chi,
-    ! chi the dissipation parameter. Afterwards the 3-D velocity is trimmed to the mean transport
-    ! <<U>>, and the existing ALE tail consumes the result through hbar/hbar_old.
+    ! chi the dissipation parameter, V the linear BT viscosity (FESOM3_SE_VISC_FLOW=1: the
+    ! flow-dependent W(U^m) - W(U^n) of se_visc_flow in its place). Afterwards the 3-D velocity
+    ! is trimmed to the mean transport <<U>>, and the existing ALE tail consumes the result
+    ! through hbar/hbar_old.
     !
     ! IN PLACE: the knobs, the state in t_dyn, se_init (coefficients, cold start, CFL guard) and
     ! the step_oce guard (Task 0.3); the element depth H^n and the barotropic forcing F
     ! (se_elem_depth, se_bt_forcing; Task 1.1); the substeps (se_subcycle) with their operators
     ! (se_inflow, se_visc, se_tendency, se_depth_at) and the viscosity coefficients (se_kappa_build,
-    ! from se_init; Task 1.2); the trim and the commit of the elevation (se_trim_finish, Task 1.3);
+    ! from se_init; Task 1.2), the opt-in flow-dependent viscosity of the Zenodo SE code
+    ! (se_visc_flow, FESOM3_SE_VISC_FLOW; plan Task 5.1 remedy B5); the trim and the commit of
+    ! the elevation (se_trim_finish, Task 1.3);
     ! the invariant suite FESOM3_SE_CHECK (se_check_core, se_check_tail; Task 1.4); zstar: the
     ! depth law c (se_elem_depth), the freshwater W in the eta equation (se_subcycle,
     ! se_trim_finish) and the zstar checks (mean sea level against the freshwater, the layer
@@ -43,6 +47,13 @@ module oce_ssh_se
     !                      (0.1 until 2026-10-18: a cold CORE2 run blew up at step ~335 through
     !                      the sea ice, plan Task 5.1 note; 0.25 damps that shelf mode)
     !   FESOM3_SE_VISC_AH  BT viscosity A_h = value*l_e [m/s], >= 0; 0 = off          default 0.01
+    !   FESOM3_SE_VISC_FLOW 1 = the flow-dependent BT viscosity W of se_visc_flow in place of
+    !                      the linear A_h (0/1)                                       default 0
+    !   FESOM3_SE_VISC_GAMMA0  its background gamma0 [m^3/s^2], a real >= 0           default 10
+    !   FESOM3_SE_VISC_GAMMA1  its flow factor gamma1 [m^2], a real >= 0              default 2750
+    !                      (the defaults of the Zenodo SE code, MOD_DYN.F90:135-136, and of
+    !                      port_kokkos). FESOM3_SE_VISC_AH has no effect with FLOW=1 and the
+    !                      GAMMAs none without it: setting a knob that has no effect stops.
     !   FESOM3_SE_CHECK    1 = per-step invariant suite (0/1)                         default 0
     !                      one rank-0 line per step, key=value tokens (se_check_line):
     !                      SE_CHECK step=<n> etacomp= trim= msl= spreadU= spreadUm= maxeta= maxU=
@@ -99,7 +110,8 @@ module oce_ssh_se
     public :: se_env_requested, se_read_env, se_parse_knob, se_init, se_step_guard
     public :: se_elem_depth, se_bt_forcing, se_subcycle, se_trim_finish
     public :: se_check_core, se_check_values, se_check_line, se_check_tail
-    public :: se_inflow, se_visc, se_tendency, se_depth_at, se_kappa_build
+    public :: se_inflow, se_visc, se_visc_flow, se_visc_on, se_tendency, se_depth_at, se_kappa_build
+    public :: se_knob_conflict
     public :: se_sm_coeffs, se_cfl_m_min, se_cfl_decision
     public :: se_cfl_stable, se_cfl_rho, se_cfl_acrit, se_cfl_apply_a, se_cfl_omega_max, &
               SE_CFL_SAFETY, SE_CFL_NIT
@@ -127,8 +139,9 @@ module oce_ssh_se
     integer, parameter :: SE_TAIL_LAYSUM = 1, SE_TAIL_W1 = 2, SE_TAIL_HLAW = 3, SE_TAIL_NBAD = 4
 
     ! the knobs se_read_env reads (FESOM3_SSH_SE itself: se_env_requested)
-    character(len=17), parameter :: SE_KNOBS(5) = [character(len=17) :: &
-        'FESOM3_SE_M', 'FESOM3_SE_M_FORCE', 'FESOM3_SE_CHI', 'FESOM3_SE_VISC_AH', 'FESOM3_SE_CHECK']
+    character(len=21), parameter :: SE_KNOBS(8) = [character(len=21) :: &
+        'FESOM3_SE_M', 'FESOM3_SE_M_FORCE', 'FESOM3_SE_CHI', 'FESOM3_SE_VISC_AH', 'FESOM3_SE_CHECK', &
+        'FESOM3_SE_VISC_FLOW', 'FESOM3_SE_VISC_GAMMA0', 'FESOM3_SE_VISC_GAMMA1']
 
 contains
 
@@ -159,20 +172,36 @@ contains
     !===========================================================================
     subroutine se_read_env(dyn, partit)
         ! The FESOM3_SE_* knobs into dyn; an unset knob keeps its t_dyn default (M 50, chi 0.25,
-        ! visc_ah 0.01, check and force off). Stops on a bad value. Called by se_init.
+        ! visc_ah 0.01, the linear viscosity, gamma0 10, gamma1 2750, check and force off). Stops
+        ! on a bad value and on a set knob that has no effect (se_knob_conflict). Called by se_init.
         type(t_dyn),    intent(inout) :: dyn
         type(t_partit), intent(in)    :: partit
         character(len=256) :: val, msg
-        logical :: is_set, ok
+        logical :: is_set, ok, set(size(SE_KNOBS))
         integer :: i
 
         do i = 1, size(SE_KNOBS)
             call get_knob(trim(SE_KNOBS(i)), val, is_set)
+            set(i) = is_set
             if (.not. is_set) cycle
             call se_parse_knob(trim(SE_KNOBS(i)), val, dyn, ok, msg)
             if (.not. ok) call se_die(trim(msg), partit)
         end do
+        msg = se_knob_conflict(dyn%se_visc_flow, set(4), set(7) .or. set(8))
+        if (len_trim(msg) > 0) call se_die(trim(msg), partit)
     end subroutine se_read_env
+
+    !===========================================================================
+    pure function se_knob_conflict(flow, ah_set, gamma_set) result(msg)
+        ! The viscosity knobs that have no effect: FESOM3_SE_VISC_AH with the flow-dependent
+        ! viscosity, FESOM3_SE_VISC_GAMMA0/1 with the linear one. '' = no conflict.
+        logical, intent(in) :: flow, ah_set, gamma_set
+        character(len=96)   :: msg
+        msg = ''
+        if (flow .and. ah_set) msg = 'FESOM3_SE_VISC_AH has no effect with FESOM3_SE_VISC_FLOW=1: unset it'
+        if (.not. flow .and. gamma_set) &
+            msg = 'FESOM3_SE_VISC_GAMMA0/1 have no effect without FESOM3_SE_VISC_FLOW=1'
+    end function se_knob_conflict
 
     !===========================================================================
     subroutine se_parse_knob(name, str, dyn, ok, msg)
@@ -220,6 +249,20 @@ contains
             need = 'must be 0 or 1'
             call parse_01(str, lv, ok)
             if (ok) dyn%se_check = lv
+        case ('FESOM3_SE_VISC_FLOW')
+            need = 'must be 0 or 1'
+            call parse_01(str, lv, ok)
+            if (ok) dyn%se_visc_flow = lv
+        case ('FESOM3_SE_VISC_GAMMA0')
+            need = 'must be a real >= 0'
+            call parse_real(str, rv, ok)
+            if (ok) ok = (rv >= 0.0_WP)
+            if (ok) dyn%se_visc_g0 = rv
+        case ('FESOM3_SE_VISC_GAMMA1')
+            need = 'must be a real >= 0'
+            call parse_real(str, rv, ok)
+            if (ok) ok = (rv >= 0.0_WP)
+            if (ok) dyn%se_visc_g1 = rv
         case default
             need = 'is not a split-explicit knob'
         end select
@@ -532,9 +575,11 @@ contains
         allocate(dyn%se_ubt(2, nElemL, 0:2), dyn%se_sbar_old(2, nElemL), dyn%se_ubtn(2, nElemL))
         allocate(dyn%se_umean(2, nElemL), dyn%se_force(2, nElemL), dyn%se_H(nElemL))
         allocate(dyn%se_c(MAX_NV, nElemO), dyn%se_kappa(MAX_NV, nElemO))
+        allocate(dyn%se_zlen(MAX_NV, nElemO), dyn%se_vn(2, nElemO))
         dyn%se_etam  = 0.0_WP; dyn%se_etanew = 0.0_WP
         dyn%se_ubtn  = 0.0_WP; dyn%se_umean  = 0.0_WP; dyn%se_force = 0.0_WP
         dyn%se_H     = 0.0_WP; dyn%se_c      = 0.0_WP; dyn%se_kappa = 0.0_WP
+        dyn%se_zlen  = 0.0_WP; dyn%se_vn     = 0.0_WP
 
         ! ---- cold start ----
         do n = 1, nNodL
@@ -566,9 +611,16 @@ contains
         twall = MPI_Wtime() - twall
         if (partit%mype == 0) then
             write(*,'(a)') 'oce_ssh_se: split-explicit barotropic solver ON (Shchepetkin-McWilliams AB3-AM4)'
-            write(*,'(a,i0,a,f0.3,a,f6.4,a,es9.2,a,l1)') 'oce_ssh_se:   M = ', dyn%se_M, &
-                ', dtbt = ', dt/real(dyn%se_M, WP), ' s, chi = ', dyn%se_chi, &
-                ', visc_ah = ', dyn%se_visc_ah, ' m/s, check = ', dyn%se_check
+            if (dyn%se_visc_flow) then
+                write(*,'(a,i0,a,f0.3,a,f6.4,a,es9.2,a,es9.2,a,l1)') 'oce_ssh_se:   M = ', dyn%se_M, &
+                    ', dtbt = ', dt/real(dyn%se_M, WP), ' s, chi = ', dyn%se_chi, &
+                    ', visc = flow (gamma0 = ', dyn%se_visc_g0, ' m3/s2, gamma1 = ', dyn%se_visc_g1, &
+                    ' m2), check = ', dyn%se_check
+            else
+                write(*,'(a,i0,a,f0.3,a,f6.4,a,es9.2,a,l1)') 'oce_ssh_se:   M = ', dyn%se_M, &
+                    ', dtbt = ', dt/real(dyn%se_M, WP), ' s, chi = ', dyn%se_chi, &
+                    ', visc_ah = ', dyn%se_visc_ah, ' m/s, check = ', dyn%se_check
+            end if
             write(*,'(a,4(a,f12.9))') 'oce_ssh_se:  ', ' beta = ', dyn%se_beta, ', zeta = ', &
                 dyn%se_zeta, ', gamma = ', dyn%se_gamma, ', delta = ', dyn%se_delta
             write(tw, '(f12.3)') twall
@@ -778,6 +830,11 @@ contains
         ! (compute_edge_geometry), so l equals edge_len for an owned edge, and l, d and H_edge
         ! come out bitwise the same seen from either element: A_e*kappa(k,e) and the neighbour's
         ! A_nb*kappa agree to rounding, which is what makes sum_e A_e*V_e = 0.
+        ! Also the length scale of the flow-dependent viscosity (se_visc_flow), on every interior
+        ! slot whichever viscosity is selected:
+        !     zlen(k,e) = sqrt(A_e + A_nb)        (0 on a boundary slot and a triangle's slot 4)
+        ! elem_area is halo-valid (exchange_elem_full in compute_geometry), and A_e + A_nb is
+        ! the same sum seen from either element, so zlen is bitwise symmetric.
         ! Collective at npes > 1 (the centroid exchange).
         type(t_dyn),    intent(inout) :: dyn
         type(t_mesh),   intent(in)    :: mesh
@@ -799,6 +856,7 @@ contains
         end if
 
         dyn%se_kappa = 0.0_WP
+        dyn%se_zlen  = 0.0_WP
         do e = 1, nElemO
             nv = mesh%elem2D_nnodes(e)
             do k = 1, nv
@@ -816,6 +874,7 @@ contains
                 b2 = cy(nb) - cy(e)
                 d  = sqrt((b1*cosm*r_earth)**2 + (b2*r_earth)**2)  ! [m]
                 dyn%se_kappa(k, e) = dyn%se_visc_ah*l*l/(d*mesh%elem_area(e))
+                dyn%se_zlen(k, e)  = sqrt(mesh%elem_area(e) + mesh%elem_area(nb))
             end do
         end do
         deallocate(cx, cy)
@@ -893,6 +952,67 @@ contains
     end subroutine se_visc
 
     !===========================================================================
+    subroutine se_visc_flow(dyn, mesh, partit, U, out)
+        ! The flow-dependent BT viscosity of the Zenodo SE code (FESOM2.5 split-explicit,
+        ! oce_ale_ssh_splitexpl_subcycl.F90:844-1003; port_kokkos fesom_ssh_se.cpp:844-875) on the
+        ! OWNED elements, a gather over the slots k = 1..elem2D_nnodes(e) in fixed order (plan D2):
+        !     W_e(U) = -(1/A_e) sum_k (U_e - U_nb)*nu_k,
+        !     nu_k   = sqrt(max(gamma0, gamma1*|U_e - U_nb|/H_edge)*zlen(k,e))       [m^2/s]
+        ! nb = elem_neighbors(k,e) (boundary slot nb == e: no flux through a coast), H_edge =
+        ! (H_e + H_nb)/2 with H = H^n (se_H, frozen over the substeps), zlen = sqrt(A_e + A_nb)
+        ! (se_kappa_build), gamma0/1 = se_visc_g0/g1. The flux -(U_e - U_nb)*nu_k through an
+        ! interior edge has nu_k bitwise the same seen from either element (|dU|, H_edge and zlen
+        ! are symmetric sums), so sum_e A_e*W_e = 0 to rounding; W of a uniform TRANSPORT is
+        ! exactly 0 (it acts on U, not on U/H as se_visc); gamma1 = 0 leaves the linear operator
+        ! with the coefficient sqrt(gamma0*zlen). The substeps use W(U^m) - W(U^n) in place of
+        ! V(U^m - U^n), with W(U^n) once per step (se_vn, se_subcycle).
+        ! Against the sources: the Zenodo edge loop scatters dt*nu*(dU/hh)*hh/A into both
+        ! elements of an interior edge, the same flux, the bracket times 1/M per substep as our
+        ! dtbt; its hh is the mean bottom depth of the two elements plus the mean hbar (eta^n) of
+        ! the edge's two nodes, port_kokkos's the mean resting depth (H0e = sum_k helem - mean
+        ! eta), ours H^n (the resting depth under linfs). Its quadratic term gamma2 (0 in its
+        ! defaults; port_kokkos drops it) is not carried.
+        ! Reads U and H at eDim neighbours: U must be halo-valid. The divisions stay inside this
+        ! element loop with its inner slot loop, which is not vectorised, as in se_visc (LESSONS
+        ! L71: a division in a vectorised loop rounds by the element's position).
+        type(t_dyn),    intent(in)  :: dyn
+        type(t_mesh),   intent(in)  :: mesh
+        type(t_partit), intent(in)  :: partit
+        real(kind=WP),  intent(in)  :: U(:,:)       ! (2, >= nElemL)
+        real(kind=WP),  intent(out) :: out(:,:)     ! (2, >= nElemO)
+        integer       :: e, k, nb
+        integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
+        real(kind=WP) :: He, dx, dy, nu, vx, vy
+
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        do e = 1, nElemO
+            He = dyn%se_H(e)
+            vx = 0.0_WP
+            vy = 0.0_WP
+            do k = 1, mesh%elem2D_nnodes(e)
+                nb = mesh%elem_neighbors(k, e)
+                if (nb == e) cycle                                   ! boundary slot
+                dx = U(1, e) - U(1, nb)
+                dy = U(2, e) - U(2, nb)
+                nu = sqrt(max(dyn%se_visc_g0, dyn%se_visc_g1*sqrt(dx*dx + dy*dy) &
+                                              /(0.5_WP*(He + dyn%se_H(nb))))*dyn%se_zlen(k, e))
+                vx = vx - dx*nu
+                vy = vy - dy*nu
+            end do
+            out(1, e) = vx/mesh%elem_area(e)
+            out(2, e) = vy/mesh%elem_area(e)
+        end do
+    end subroutine se_visc_flow
+
+    !===========================================================================
+    pure logical function se_visc_on(dyn)
+        ! The substeps carry a BT viscosity: the flow-dependent one, or the linear one with A_h > 0.
+        ! Then U is exchanged after every substep (its eDim neighbours are read).
+        type(t_dyn), intent(in) :: dyn
+        se_visc_on = dyn%se_visc_flow .or. (dyn%se_visc_ah > 0.0_WP)
+    end function se_visc_on
+
+    !===========================================================================
     subroutine se_depth_at(dyn, mesh, partit, eta, HA)
         ! H_e(eta) = H^n_e + sum_v elem_w(v,e)*c(v,e)*(eta_v - eta^n_v) on the OWNED elements:
         ! the one depth function of the substeps (plan D3), no ALE branch in the loop. Under
@@ -915,30 +1035,38 @@ contains
     end subroutine se_depth_at
 
     !===========================================================================
-    subroutine se_tendency(dyn, mesh, partit, ustar, etaA, HA, dU, tend)
+    subroutine se_tendency(dyn, mesh, partit, ustar, etaA, HA, uvis, tend)
         ! The right-hand side of the U substep on the OWNED elements (plan Technical Details §2):
-        !     tend = -f e_z x U* - g H^A grad(eta^A) + F + V(dU)
+        !     tend = -f e_z x U* - g H^A grad(eta^A) + F + V(uvis)
         ! -f e_z x U* = f*(U*_2, -U*_1), compute_vel_rhs's (v*ff, -u*ff); -g grad(eta^A) = Fx, Fy
         ! through gradient_sca exactly as in compute_vel_rhs and se_bt_forcing. So with U* = s^n
-        ! = s^{n-1}, eta^A = eta^n, H^A = H^n and dU = 0 the r-term inside F cancels and tend =
+        ! = s^{n-1}, eta^A = eta^n, H^A = H^n and uvis = 0 the r-term inside F cancels and tend =
         ! G/tau to rounding (test_ssh_se C7: the sign/factor consistency of F and the operator).
-        ! V(dU) only when se_visc_ah > 0. Reads eta^A at the element's vertices, dU at eDim
-        ! neighbours (se_visc).
+        ! The viscosity term: the linear V(uvis) of se_visc, uvis = U^m - U^n, when se_visc_ah >
+        ! 0; with se_visc_flow W(uvis) - W(U^n) of se_visc_flow, uvis = U^m and W(U^n) = se_vn
+        ! (se_subcycle); else none. Reads eta^A at the element's vertices, uvis at eDim
+        ! neighbours.
         type(t_dyn),    intent(in)  :: dyn
         type(t_mesh),   intent(in)  :: mesh
         type(t_partit), intent(in)  :: partit
         real(kind=WP),  intent(in)  :: ustar(:,:)   ! (2, >= nElemO) U*, the AB3 transport
         real(kind=WP),  intent(in)  :: etaA(:)      ! (nNodL) eta^A, the AM4 elevation
         real(kind=WP),  intent(in)  :: HA(:)        ! (>= nElemO) H^A = H_e(eta^A)
-        real(kind=WP),  intent(in)  :: dU(:,:)      ! (2, >= nElemL) U^m - U^n
+        real(kind=WP),  intent(in)  :: uvis(:,:)    ! (2, >= nElemL) U^m - U^n (linear), U^m (flow)
         real(kind=WP),  intent(out) :: tend(:,:)    ! (2, >= nElemO)
         integer       :: e, elnodes(MAX_NV)
         integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
         real(kind=WP) :: f, Fx, Fy, pre(MAX_NV)
 
         call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
-        if (dyn%se_visc_ah > 0.0_WP) then
-            call se_visc(dyn, mesh, partit, dU, tend)
+        if (dyn%se_visc_flow) then
+            call se_visc_flow(dyn, mesh, partit, uvis, tend)
+            do e = 1, nElemO
+                tend(1, e) = tend(1, e) - dyn%se_vn(1, e)
+                tend(2, e) = tend(2, e) - dyn%se_vn(2, e)
+            end do
+        else if (dyn%se_visc_ah > 0.0_WP) then
+            call se_visc(dyn, mesh, partit, uvis, tend)
         else
             do e = 1, nElemO
                 tend(:, e) = 0.0_WP
@@ -967,6 +1095,8 @@ contains
         !                 + zeta eta^{m-2}                                       owned + halo nodes
         !     H^A       = H_e(eta^A)                                             owned elements
         !     U^{m+1}   = U^m + dtbt*se_tendency(U*, eta^A, H^A, U^m - U^n)      owned elements
+        !                 (with se_visc_flow: se_tendency(U*, eta^A, H^A, U^m) and W(U^n) = se_vn
+        !                 from se_ubtn once per step, before the substeps)
         ! eta^0 = eta_n (= eta^n), U^0 = ring level 0. The rings shift BY COPYING, so no ring
         ! offset becomes restart state. With the viscosity on, exchange_elem(U^{m+1}) follows:
         ! V reads U at eDim neighbours. Without it nothing reads U off the owned elements (I reads
@@ -1016,7 +1146,7 @@ contains
         d0 =  1.0_WP - dyn%se_delta - dyn%se_gamma - dyn%se_zeta
         d1 =  dyn%se_gamma
         d2 =  dyn%se_zeta
-        visc = (dyn%se_visc_ah > 0.0_WP)
+        visc = se_visc_on(dyn)
         fw   = .false.
         if (present(water_flux)) fw = (trim(which_ALE) /= 'linfs')
 
@@ -1029,6 +1159,15 @@ contains
             dyn%se_etam(n) = dyn%eta_n(n)
         end do
         dyn%se_umean = 0.0_WP
+        ! the flow-dependent viscosity's W(U^n), frozen over the substeps (se_ubtn is halo-valid).
+        ! Into the scratch tend, then copied: se_visc_flow reads dyn, so dyn%se_vn cannot be its
+        ! output argument.
+        if (dyn%se_visc_flow) then
+            call se_visc_flow(dyn, mesh, partit, dyn%se_ubtn, tend)
+            do e = 1, nElemO
+                dyn%se_vn(:, e) = tend(:, e)
+            end do
+        end if
 
         do m = 0, M_sub - 1
             ! AB3 transport and the running mean (U*·rMinv, see above; also caught by
@@ -1061,13 +1200,17 @@ contains
             call se_depth_at(dyn, mesh, partit, etaA, HA)
 
             ! transport
-            if (visc) then
-                do e = 1, nElemL
-                    dU(1, e) = dyn%se_ubt(1, e, 0) - dyn%se_ubtn(1, e)
-                    dU(2, e) = dyn%se_ubt(2, e, 0) - dyn%se_ubtn(2, e)
-                end do
+            if (dyn%se_visc_flow) then
+                call se_tendency(dyn, mesh, partit, ustar, etaA, HA, dyn%se_ubt(:, :, 0), tend)
+            else
+                if (visc) then
+                    do e = 1, nElemL
+                        dU(1, e) = dyn%se_ubt(1, e, 0) - dyn%se_ubtn(1, e)
+                        dU(2, e) = dyn%se_ubt(2, e, 0) - dyn%se_ubtn(2, e)
+                    end do
+                end if
+                call se_tendency(dyn, mesh, partit, ustar, etaA, HA, dU, tend)
             end if
-            call se_tendency(dyn, mesh, partit, ustar, etaA, HA, dU, tend)
             do e = 1, nElemO
                 unew(1, e) = dyn%se_ubt(1, e, 0) + dtbt*tend(1, e)
                 unew(2, e) = dyn%se_ubt(2, e, 0) + dtbt*tend(2, e)

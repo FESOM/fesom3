@@ -147,6 +147,9 @@ module mod_dyn
         integer       :: se_M       = 50        ! substeps per baroclinic step (FESOM3_SE_M)
         real(kind=WP) :: se_chi     = 0.25_WP   ! SM dissipation parameter chi (FESOM3_SE_CHI)
         real(kind=WP) :: se_visc_ah = 0.01_WP   ! BT viscosity A_h = se_visc_ah*l_e [m/s]; 0 = off (FESOM3_SE_VISC_AH)
+        logical       :: se_visc_flow = .false. ! flow-dependent BT viscosity in place of A_h (FESOM3_SE_VISC_FLOW)
+        real(kind=WP) :: se_visc_g0 = 10.0_WP   ! its background gamma0 [m^3/s^2] (FESOM3_SE_VISC_GAMMA0)
+        real(kind=WP) :: se_visc_g1 = 2750.0_WP ! its flow factor gamma1 [m^2] (FESOM3_SE_VISC_GAMMA1)
         logical       :: se_check   = .false.   ! per-step invariant suite (FESOM3_SE_CHECK)
         logical       :: se_m_force = .false.   ! run with M below the CFL-guard minimum (FESOM3_SE_M_FORCE)
         logical       :: se_ready   = .false.   ! se_init done; step_oce refuses FESOM3_SSH_SE=1 otherwise
@@ -165,6 +168,8 @@ module mod_dyn
         real(kind=WP), allocatable, dimension(:)     :: se_H          ! (nElemL): H^n_e = sum_k helem^n
         real(kind=WP), allocatable, dimension(:,:)   :: se_c          ! (MAX_NV,nElemO): zstar depth-law weights c_{e,v}
         real(kind=WP), allocatable, dimension(:,:)   :: se_kappa      ! (MAX_NV,nElemO): BT viscosity A_h*l/(d*A_e)
+        real(kind=WP), allocatable, dimension(:,:)   :: se_zlen       ! (MAX_NV,nElemO): flow viscosity sqrt(A_e + A_nb)
+        real(kind=WP), allocatable, dimension(:,:)   :: se_vn         ! (2,nElemO): flow viscosity W(U^n), frozen over a step
         ! FESOM3_SE_CHECK: the area-mean elevation at the start of the run (set by the first
         ! se_check_core of this process), the reference of the mean-sea-level change, and the
         ! part of that change the freshwater explains (non-linfs; accumulated per check)

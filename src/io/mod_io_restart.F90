@@ -362,10 +362,10 @@ contains
         ! (se_kappa). se_init runs before the restart block, so a resume overwrites its cold rings.
         !   se_eta1, se_eta2   eta^{-1/M}, eta^{-2/M}: kept on owned + halo nodes, every level
         !                      exchange_nod'ed in the substeps -> NODE variant (the default).
-        !   se_ubt<k>_{u,v}    ring level k = 0, 1, 2 (U^n, U^{-1/M}, U^{-2/M}): with se_visc_ah > 0 the
-        !                      viscosity reads U at eDim neighbours, and every level is the
-        !                      exchange_elem'ed U of its substep (the rings shift by copying over owned +
-        !                      eDim) -> ELEM variant. With se_visc_ah = 0 the eDim entries are never
+        !   se_ubt<k>_{u,v}    ring level k = 0, 1, 2 (U^n, U^{-1/M}, U^{-2/M}): with a BT viscosity
+        !                      (se_visc_ah > 0 or FESOM3_SE_VISC_FLOW=1) the substeps read U at eDim
+        !                      neighbours, and every level is the exchange_elem'ed U of its substep (the
+        !                      rings shift by copying over owned + eDim) -> ELEM variant. With no viscosity the eDim entries are never
         !                      refreshed in a straight run and never read; the resumed run gets owner
         !                      values there, which nothing reads either (the restart gate covers that mode).
         !   se_sbar_old_{u,v}  s^{n-1} = sum_k helem*uv: written and read on the owned elements only
