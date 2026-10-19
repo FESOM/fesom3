@@ -2877,7 +2877,7 @@ np>1, find the duplicated state behind it before accepting it.
 
 ## L71 — Under Intel `-no-prec-div` a division by a loop invariant rounds differently in the vectorised body and in the scalar remainder: per-element results then depend on the local index, and the copies of a shared element differ by 1 ULP
 
-**Context.** Split-explicit plan (`docs/plans/2026-10-17-split-explicit.md`), Task 2.1, and Task 3.1
+**Context.** Split-explicit plan (`docs/plans/completed/2026-10-17-split-explicit.md`), Task 2.1, and Task 3.1
 on a side branch (found twice, independently). The SE design keeps the copies of a shared border
 element bitwise equal without a per-substep sync: every per-element operator is a gather in fixed slot
 order from bitwise-equal inputs (IMPLEMENTATION §14).

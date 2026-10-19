@@ -289,7 +289,7 @@ for hybrid meshes"):
 
 The split-explicit solver ([IMPLEMENTATION.md](IMPLEMENTATION.md) §14) is not bitwise to the CG
 solve, so it is gated by invariants, determinism and restart exactness, and the default CG path by a
-byte diff (plan `docs/plans/2026-10-17-split-explicit.md`):
+byte diff (plan `docs/plans/completed/2026-10-17-split-explicit.md`):
 
 - **G0, `tools/run_g0_se.sh` — SE off is byte-identical.** `NEW_BIN=<bin dir> tools/run_g0_se.sh`
   reruns three cases and compares them with references written once by the frozen pre-SE binaries

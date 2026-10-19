@@ -1,6 +1,6 @@
 module oce_ssh_se
     ! Split-explicit (SE) barotropic solver, an alternative to the semi-implicit CG SSH solve
-    ! (oce_ssh_rhs + oce_ssh_solve). Plan: docs/plans/2026-10-17-split-explicit.md. Scheme:
+    ! (oce_ssh_rhs + oce_ssh_solve). Plan: docs/plans/completed/2026-10-17-split-explicit.md. Scheme:
     ! the Shchepetkin-McWilliams (2005) AB3-AM4 barotropic subcycling of Sergey Danilov's notes
     ! (~/port_kokkos/ssh_sergey/subcycling.tex; Banerjee et al. 2024, GMD 17, 7051). Per
     ! baroclinic step tau = dt the 2-D system (eta, U = sum_k helem*u) is advanced in M substeps

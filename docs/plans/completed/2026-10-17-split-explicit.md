@@ -1775,7 +1775,7 @@ sha256 `01e1d34f709fb0e0…`, `fesom_conserve` `1edbc30ba0f7ef18…`.
   CFL_z lines are identical and their checkpoints equal (`zarr_diff.py --rel-floor 0`, 125 variables, 0 bad). So
   the rebase onto the guard changed nothing in the SE step
 
-#### Task 6.2: Documentation ✅ (except the last box, which waits for Stage 5 and Nikolay's yes)
+#### Task 6.2: Documentation ✅
 
 - [x] `IMPLEMENTATION.md`: an SE section covering the scheme, the vertex-bottom depth law, the shared-element design,
   the knobs, and restart (M and χ fixed across a chain; the SI-zstar restart gaps). New §14 (scheme and coefficients,
@@ -1798,7 +1798,8 @@ sha256 `01e1d34f709fb0e0…`, `fesom_conserve` `1edbc30ba0f7ef18…`.
 - [x] draft the Sergey/Dmitry question packet in `docs/` (not sent): `docs/se_question_packet.md` (what is
   implemented, what is gated, the χ = 0.1 diagnosis with R0–R3, margins and the toy model, remedy options measured /
   untested, 9 questions)
-- [ ] move this plan to `docs/plans/completed/`; tag and memory update after Nikolay's yes
+- [x] move this plan to `docs/plans/completed/` (Nikolay 2026-10-18: in the PR) and the memory update; ➕ a tag
+  only if Nikolay asks for one at the merge
 
 ## Technical Details
 

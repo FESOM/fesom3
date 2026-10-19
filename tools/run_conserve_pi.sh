@@ -57,7 +57,7 @@
 #   below is one line longer than before.
 #
 #   linfs + split-explicit (SE), np 1 -> the split-explicit barotropic solver (FESOM3_SSH_SE=1,
-#       docs/plans/2026-10-17-split-explicit.md, Tasks 1.3-1.5) with FESOM3_SE_CHECK=1. The driver's
+#       docs/plans/completed/2026-10-17-split-explicit.md, Tasks 1.3-1.5) with FESOM3_SE_CHECK=1. The driver's
 #       linfs invariants as above (drift reported, not gated) plus the per-step SE_CHECK line of
 #       src/oce/oce_ssh_se.F90, whose run maxima are gated: eta-compatibility (etacomp, m), trim
 #       (m^2/s) and |mean-sea-level change| (msl, m) below SE_TOL_* = the Task 1.5 levels x 100,

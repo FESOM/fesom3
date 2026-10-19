@@ -1,5 +1,5 @@
 #!/bin/bash
-# Split-explicit 3000-step physics SCREENS (docs/plans/2026-10-17-split-explicit.md, Task 5.1): CORE2 with
+# Split-explicit 3000-step physics SCREENS (docs/plans/completed/2026-10-17-split-explicit.md, Task 5.1): CORE2 with
 # the production physics of tools/prod_env.sh (prod_env 1e-5: PHC winter IC, JRA55-do from 1958-01-01, EVP,
 # TKE, GM + Redi, splines, vector-invariant momentum with rvo_upwind 1, w split, SW penetration, STEP_DIAG
 # on), Δt 1800 s, a cold start, one compute node, np 128, the cases of $CASES one after the other:

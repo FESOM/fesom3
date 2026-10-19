@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# G0 BYTE-DIFF GATE for the split-explicit SSH work (docs/plans/2026-10-17-split-explicit.md, Task 0.1).
+# G0 BYTE-DIFF GATE for the split-explicit SSH work (docs/plans/completed/2026-10-17-split-explicit.md, Task 0.1).
 # With the SE switch unset the CG path must stay BYTE-IDENTICAL to frozen main references: this script
 # reruns the reference cases with a new build and compares every output at max|Δ| = 0.
 #

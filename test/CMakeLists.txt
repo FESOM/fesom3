@@ -487,7 +487,7 @@ set_tests_properties(fesom_conserve_linfs_vinv_shsync_np2 PROPERTIES
     FAIL_REGULAR_EXPRESSION "VIOLATED"
     SKIP_REGULAR_EXPRESSION "cannot open;No such file")
 
-# Split-explicit barotropic solver (docs/plans/2026-10-17-split-explicit.md), test_ssh_se on the
+# Split-explicit barotropic solver (docs/plans/completed/2026-10-17-split-explicit.md), test_ssh_se on the
 # rotated pi: the SM coefficients against literal numbers, knob parsing, the CFL guard (M_min
 # identical on all ranks at np 2, the decision for M = 1) and se_init's cold start under
 # FESOM3_SSH_SE=1 FESOM3_SE_M=40.

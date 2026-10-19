@@ -5,7 +5,7 @@ Full pre-M2.12 milestone detail + the per-gate recipes live in [`HANDOFF-archive
 
 ## Where we are
 
-- **Split-explicit barotropic solver — Stages 0–5 DONE, Stage 6 DONE except the plan move (2026-10-18, branch `split-explicit`, worktree
+- **Split-explicit barotropic solver — Stages 0–6 DONE (2026-10-19, branch `split-explicit`, worktree
   `/work/ab0995/a270088/fesom3_se`, unpushed):** SE subcycling after Sergey's notes (SESM, `FESOM3_SSH_SE=1`), linfs
   and zstar, any np, exact restarts; SE off byte-identical to main. Task 5.4 added the barotropic bottom drag (kept);
   Task 5.5 (commit 55f717b) restored the stored-sum Coriolis (D4) with the drag. χ 0.05 passes the screens and the
@@ -14,7 +14,7 @@ Full pre-M2.12 milestone detail + the per-gate recipes live in [`HANDOFF-archive
   (SE − SI annual-mean SSH rms 0.106 mm). **Default χ = 0.1 since Task 5.8 (Nikolay 2026-10-18)**: gates GREEN (job
   28229435), the linfs year at χ 0.1 clean (SSH rms 0.111 mm). Sergey: χ must be large enough to remove the known SE
   instability (Demange et al. 2019). Open: the zstar-PGF hypothesis (debug switch), Sergey's reply on the PGF and the
-  July anomaly, plan → completed/, push/PR (Nikolay) → section "Split-explicit barotropic solver".
+  July anomaly, push/PR (Nikolay) → section "Split-explicit barotropic solver".
 - **Shared-element velocity sync ✅ DONE (2026-10-12, plan `plans/completed/20261012-shared-element-sync.md`,
   on `bottom-at-vertices`):** a border element is owned by every rank that owns one of its vertices;
   `update_vel` now gives every such element one owner for `uv` (the highest vertex-owner rank, whose copy
@@ -347,7 +347,7 @@ The hybrid-mesh gate migration (which FESOM2-oracle gates are retired, the round
 `tools/run_tri_regression.sh` that replaces them) is in "Hybrid (mixed triangle + quad) meshes" →
 "Gate migration for hybrid meshes" below.
 
-## Split-explicit barotropic solver (plan `plans/2026-10-17-split-explicit.md`, 2026-10-17/18)
+## Split-explicit barotropic solver (plan `plans/completed/2026-10-17-split-explicit.md`, 2026-10-17/19)
 
 **Where.** Branch `split-explicit` (from main 814e5d0), worktree `/work/ab0995/a270088/fesom3_se`, not pushed.
 Design input `plans/2026-10-17-split-explicit-handoff.md`; the plan holds every measured number with its job id;
@@ -415,8 +415,8 @@ node-h in total).**
    located it on one 30 m Kara-shelf node (a grid-scale mode at the baroclinic Nyquist frequency, not the equatorial
    Atlantic); χ 0.1 decays it, and the SE zstar year at χ 0.1 is clean (`se_s5g/twin_se_zstar_28228601`, SE − SI
    SSH rms 0.106 mm). ✅ Task 5.8: default χ = 0.1 (Nikolay); gates GREEN (job 28229435, frozen `bin_s5h_28229435`); the
-   linfs year at χ 0.1 is clean (`se_s5f/twin_se_linfs_28229689`, SSH rms 0.111 mm, max 1.58 mm). Then the plan to
-   `completed/`, push/PR and a tag (Nikolay's yes, exact text first). Later: the
+   linfs year at χ 0.1 is clean (`se_s5f/twin_se_linfs_28229689`, SSH rms 0.111 mm, max 1.58 mm). Plan moved to
+   `completed/`. Then push/PR and a tag (Nikolay's yes, exact text first). Later: the
    zstar-PGF debug switch, JAX port of SE (bitwise against this code), NEMO SE, storing M/χ in the checkpoint.
 
 **Gotchas.**

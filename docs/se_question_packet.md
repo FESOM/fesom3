@@ -1,6 +1,6 @@
 # Split-explicit barotropic solver in FESOM_F: status and questions for Sergey and Dmitry
 
-Written 2026-10-18; Nikolay relayed the questions to Sergey, whose answers are summarised in section 6. Branch `split-explicit`; plan `docs/plans/2026-10-17-split-explicit.md`
+Written 2026-10-18; Nikolay relayed the questions to Sergey, whose answers are summarised in section 6. Branch `split-explicit`; plan `docs/plans/completed/2026-10-17-split-explicit.md`
 (all numbers below are recorded there with job ids); design summary in `IMPLEMENTATION.md` §14.
 
 ## 1. What is implemented

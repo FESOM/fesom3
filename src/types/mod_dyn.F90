@@ -138,7 +138,7 @@ module mod_dyn
 
         ! ---- split-explicit barotropic solver (FESOM3_SSH_SE, src/oce/oce_ssh_se.F90) ----
         ! The knobs (env, se_read_env), the Shchepetkin-McWilliams (2005) AB3-AM4 coefficients
-        ! and the state of docs/plans/2026-10-17-split-explicit.md (Technical Details §1). se_init
+        ! and the state of docs/plans/completed/2026-10-17-split-explicit.md (Technical Details §1). se_init
         ! sets them and allocates the arrays ONLY when SE is on; the semi-implicit path never
         ! touches them. Not in write/read_t_dyn: the carried arrays (se_eta, se_ubt, se_sbar_old)
         ! belong to the Zarr checkpoint (mod_io_restart). Ring levels are shifted by copying, so

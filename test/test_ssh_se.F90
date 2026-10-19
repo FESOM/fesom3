@@ -1,5 +1,5 @@
 program test_ssh_se
-    ! Split-explicit barotropic solver (docs/plans/2026-10-17-split-explicit.md), Tasks 0.3-1.4: the
+    ! Split-explicit barotropic solver (docs/plans/completed/2026-10-17-split-explicit.md), Tasks 0.3-1.4: the
     ! knobs, the CFL guard, se_init, the barotropic forcing, the substeps, the trim and the
     ! invariant suite of src/oce/oce_ssh_se.F90 on the rotated pi mesh.
     !

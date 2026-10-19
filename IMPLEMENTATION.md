@@ -472,7 +472,7 @@ done — §7.)
 ### 14. Split-explicit barotropic solver
 
 An alternative to the semi-implicit CG free-surface solve, switched on with `FESOM3_SSH_SE=1`
-(module `src/oce/oce_ssh_se.F90`, plan `docs/plans/2026-10-17-split-explicit.md`). It needs no
+(module `src/oce/oce_ssh_se.F90`, plan `docs/plans/completed/2026-10-17-split-explicit.md`). It needs no
 global reduction per step (two small halo exchanges per substep), which is the point for the later
 GPU port. With the switch unset the CG path runs and its results are byte-identical to the build
 before the SE work ([TESTING.md](TESTING.md) §6c). SE is not bitwise to CG; it is gated by
