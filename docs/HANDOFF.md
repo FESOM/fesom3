@@ -11,9 +11,10 @@ Full pre-M2.12 milestone detail + the per-gate recipes live in [`HANDOFF-archive
   Task 5.5 (commit 55f717b) restored the stored-sum Coriolis (D4) with the drag. χ 0.05 passes the screens and the
   linfs year, but its zstar year blew up on day 229 (Task 5.6): a grid-scale mode on one 30 m Kara-shelf node at the
   baroclinic Nyquist frequency, located by a checkpoint replay (Task 5.7). The zstar year at χ 0.1 runs clean
-  (SE − SI annual-mean SSH rms 0.106 mm). **Default χ = 0.1 since Task 5.8 (Nikolay 2026-10-18)**; ⚠️ its gate job
-  `fesom3_se_ref/jobs/s5_H_verify.sbatch` to run. Open: the zstar-PGF hypothesis (debug switch), Sergey's reply on χ
-  and the PGF, plan → completed/, push/PR (Nikolay) → section "Split-explicit barotropic solver".
+  (SE − SI annual-mean SSH rms 0.106 mm). **Default χ = 0.1 since Task 5.8 (Nikolay 2026-10-18)**: gates GREEN (job
+  28229435), the linfs year at χ 0.1 clean (SSH rms 0.111 mm). Sergey: χ must be large enough to remove the known SE
+  instability (Demange et al. 2019). Open: the zstar-PGF hypothesis (debug switch), Sergey's reply on the PGF and the
+  July anomaly, plan → completed/, push/PR (Nikolay) → section "Split-explicit barotropic solver".
 - **Shared-element velocity sync ✅ DONE (2026-10-12, plan `plans/completed/20261012-shared-element-sync.md`,
   on `bottom-at-vertices`):** a border element is owned by every rank that owns one of its vertices;
   `update_vel` now gives every such element one owner for `uv` (the highest vertex-owner rank, whose copy
@@ -413,8 +414,9 @@ node-h in total).**
    blew up at step 10989 (2-step oscillation, ~15 %/step). ✅ Task 5.7 (3a95def, 1.58 node-h): a checkpoint replay
    located it on one 30 m Kara-shelf node (a grid-scale mode at the baroclinic Nyquist frequency, not the equatorial
    Atlantic); χ 0.1 decays it, and the SE zstar year at χ 0.1 is clean (`se_s5g/twin_se_zstar_28228601`, SE − SI
-   SSH rms 0.106 mm). ✅ Task 5.8: default χ = 0.1 (Nikolay); gate job `jobs/s5_H_verify.sbatch` (Nikolay submits).
-   Then Task 6.1's last box, the plan to `completed/`, a tag, push/PR (Nikolay's yes, exact text first). Later: the
+   SSH rms 0.106 mm). ✅ Task 5.8: default χ = 0.1 (Nikolay); gates GREEN (job 28229435, frozen `bin_s5h_28229435`); the
+   linfs year at χ 0.1 is clean (`se_s5f/twin_se_linfs_28229689`, SSH rms 0.111 mm, max 1.58 mm). Then the plan to
+   `completed/`, push/PR and a tag (Nikolay's yes, exact text first). Later: the
    zstar-PGF debug switch, JAX port of SE (bitwise against this code), NEMO SE, storing M/χ in the checkpoint.
 
 **Gotchas.**

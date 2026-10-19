@@ -657,5 +657,8 @@ per step from the step-start layers (a hypothesis, not tested by a switch). The 
 runs clean: annual-mean SSH SE − SI rms 0.106 mm, max 1.74 mm; temp rms 3.7e-3 °C in the top 100 m;
 the same global salt drift; sea-ice area within 0.009 × 10⁶ km²; the July anomaly at 25°W 5°N is
 9–20 mm (27–40 mm at χ = 0.05). Loop 153.4 vs SI zstar's 149.1 ms/step (SSH phase 13.8 vs 9.5). So
-χ = 0.1 is the default since Task 5.8; linfs has clean years at χ = 0.05 (with the drag) and 0.25
-(without). LESSONS L77; plan Tasks 5.7, 5.8.
+χ = 0.1 is the default since Task 5.8. The linfs year at χ = 0.1 with the drag is as close to SI as the
+χ = 0.25 year: SSH rms 0.111 mm, max 1.58 mm, the July anomaly at 25°W 5°N 5.8 mm (34 mm at χ = 0.05).
+The scheme's author: the theory of Demange et al. (2019) predicts an SE instability that χ removes, so χ
+must be large enough to suppress it; the semi-implicit solver's strong damping hides it. LESSONS L77;
+plan Tasks 5.7, 5.8.

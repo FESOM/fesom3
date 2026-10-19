@@ -1,6 +1,6 @@
 # Split-explicit barotropic solver in FESOM_F: status and questions for Sergey and Dmitry
 
-Draft, 2026-10-18, **not sent**. Branch `split-explicit`; plan `docs/plans/2026-10-17-split-explicit.md`
+Written 2026-10-18; Nikolay relayed the questions to Sergey, whose answers are summarised in section 6. Branch `split-explicit`; plan `docs/plans/2026-10-17-split-explicit.md`
 (all numbers below are recorded there with job ids); design summary in `IMPLEMENTATION.md` §14.
 
 ## 1. What is implemented
@@ -11,8 +11,8 @@ step block; the predictor and the ALE/tracer tail are unchanged. Off by default.
 
 - **Scheme:** the AB3–AM4 subcycling of Sergey's notes (Shchepetkin & McWilliams 2005; Banerjee et al.
   2024), β = 0.281105, ζ, γ, δ as functions of χ, M substeps of dtbt = τ/M. No averaging filter:
-  ⟨⟨Ū⟩⟩ = Σ U*/M, η^{n+1} = η^M, and `eta_n` = `hbar` = η^M at integer levels. Defaults χ = 0.25
-  (0.1 until 2026-10-18, see section 3; ➕ 0.1 again since plan Task 5.8, section 6), M = 50.
+  ⟨⟨Ū⟩⟩ = Σ U*/M, η^{n+1} = η^M, and `eta_n` = `hbar` = η^M at integer levels. Defaults χ = 0.1
+  (➕ since plan Task 5.8; 0.25 from Task 5.0 to Task 5.8 after the blow-up of section 3; see section 6), M = 50.
 - **Transports and forcing:** Ū = Σₖ helem·u, R = Σₖ helemⁿ·UV_rhs, where UV_rhs is the full 3-D
   predictor increment (`compute_vel_rhs` with the vector-invariant momentum advection and
   `rvo_upwind` 1, `viscosity_filter`, the implicit vertical viscosity and the explicit bottom drag).
@@ -282,4 +282,17 @@ a switch) is the zstar baroclinic pressure of the stratification that the mode's
 the step start and frozen over the step (≈ 0.5 %). The zstar year at χ = 0.1 ran clean: annual-mean SSH SE − SI rms
 0.106 mm, max 1.74 mm (linfs at χ 0.05: 0.110, 2.45 mm), the largest July anomaly, near 25°W 5°N, 25 mm (40 mm at
 χ 0.05), global-mean SSH at rounding. So on CORE2 with the drag the smallest χ that passes a year under both linfs
-(0.05 passed) and zstar (0.05 failed, 0.07 marginal in the replay) is 0.1; the code default is still 0.25.
+(0.05 passed) and zstar (0.05 failed, 0.07 marginal in the replay) is 0.1; ➕ the default since plan Task 5.8.
+
+**Sergey, 2026-10-18, on the Task 5.7 result** (relayed by Nikolay, summarised). The theory of Demange et al. (2019)
+shows that the split-explicit method has an instability that the choice of χ removes, so χ must be large enough that
+the instability does not occur. The semi-implicit method has strong built-in damping, and there the instability does
+not arise. This matches Task 5.7: χ = 0.1 is the smallest χ at which the Kara-shelf mode decays, and the SI years have
+no such mode. Still open from the same message: how SE models handle the baroclinic pressure frozen over the step (the
+hypothesis above), and whether the χ-dependent July anomaly near 25°W 5°N is expected.
+
+**➕ Results (plan Task 5.8, 2026-10-19): the default χ = 0.1.** The gates pass at the new default. The linfs year at
+χ = 0.1 with the drag is clean: annual-mean SSH SE − SI rms 0.111 mm, max 1.58 mm (in the Gulf of Carpentaria, where
+the χ = 0.25 year has its maximum); the July maximum near 25°W 5°N is 5.8 mm (34 mm at χ = 0.05, 6.1 mm at χ = 0.25
+without the drag, 25 mm in the zstar year at χ = 0.1); the global salt and temperature drifts equal SI's to 8e-8 psu
+and 2e-6 °C.

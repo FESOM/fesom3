@@ -1052,6 +1052,7 @@ below (Task 5.0).
 ➕ Task 5.4 (Sergey's answers Q3/Q5, approved separately, ≤ 1 node-h) 0.86 node-h. ➕ Tasks 5.5 + 5.6 (D4 restored,
 minimal-χ screens, the linfs twin at χ 0.05 and the zstar twin pair; cap 3.2 node-h) 2.68 node-h. ➕ Task 5.7 (the
 zstar blow-up replayed and located, χ/drag/M/ice variants, the zstar year at χ 0.1; cap 1.6 node-h) 1.58 node-h.
+➕ Task 5.8 (the gates at the new default and the linfs year at χ 0.1) 0.91 node-h.
 ➕ Nikolay asked why port_kokkos runs χ = 0.1: its BT viscosity is the flow-dependent Zenodo closure (γ0 = 10, γ1 = 2750), ≈ 2× ours in
 calm flow and ≈ 10–15× on the noisy shelf. ➕ Tested (lane C, 0.32 node-h, job 28220789, report
 `/work/ab0995/a270088/fesom3_se_ref/jobs/s5_C_report.md`): the closure as an opt-in knob, `FESOM3_SE_VISC_FLOW=1`
@@ -1687,13 +1688,13 @@ it and runs the zstar year clean.
   linfs, with a smaller July event
 - [x] **the default χ (Nikolay's call):** ➕ Nikolay 2026-10-18: χ = 0.1 → Task 5.8. Recommendation: **χ = 0.1 for CORE2** (the
   smallest χ whose replay decays the Kara mode and whose zstar year is clean; 0.07 is marginal, +0.1 … +0.3 %/step for
-  11 days at the event; a linfs year at 0.1 was not run, linfs at 0.05 passed). The margin is modest: at the event
+  11 days at the event; a linfs year at 0.1 was not run, linfs at 0.05 passed; ➕ run in Task 5.8, clean). The margin is modest: at the event
   χ 0.1 decays the mode at −0.46 %/step against ≈ +1.6 %/step of drive (toy), χ 0.25 at −3.4 %/step. Open: test the zstar-PGF
   hypothesis with a debug switch (the PGF on the step-start geometry without the η part), and a linfs replay at χ 0.05
 - Task 5.7 cost: **1.58 node-h** (28228214 0.70, 28228604 0.0004, 28228624 0.07, 28228601 0.79, 28229080 0.015;
   AllocCPUS/256 × elapsed)
 
-#### ➕ Task 5.8: default χ = 0.1
+#### ➕ Task 5.8: default χ = 0.1 ✅
 
 *Nikolay, 2026-10-18: "let's default χ be 0.1 for now".* The reverse of Task 5.0 at the CORE2 value of Task 5.7.
 
@@ -1702,14 +1703,34 @@ it and runs the zstar year clean.
 `tools/run_se_screen_core2.sbatch`, README, IMPLEMENTATION §14, TESTING §6c, HANDOFF, the question packet.
 
 - [x] the default χ = 0.1 in code, tests, tool comments and docs
-- [ ] verify (`/work/ab0995/a270088/fesom3_se_ref/jobs/s5_H_verify.sbatch` = the Task 5.5 set without the
+- [x] verify (`/work/ab0995/a270088/fesom3_se_ref/jobs/s5_H_verify.sbatch` = the Task 5.5 set without the
   old-checkpoint case): ctest Intel all pass, GNU only the 6 known failures; G0 GREEN; `run_conserve_pi.sh` GATE OK;
   SE restart gates linfs and zstar np 2 and multirank np 2 → 8 GREEN; round trip GREEN; CORE2 `prod_env 1e-5` np 8,
   48 steps at the defaults (linfs, zstar): the guard prints `chi = 0.1000` and `M_min = 40`, SE_CHECK at the gate levels
+  → **all GREEN, job 28229435** (shared, 32 cores, 10.7 min, 0.13 node-h; the src, test and tools trees of 6a3b7aa;
+  frozen `/work/ab0995/a270088/fesom3_se_ref/bin_s5h_28229435`): ctest Intel 176/176, GNU 170/176 (the 6 known);
+  `test_ssh_se` np 1/2/8 pass (C3: pi M_min = 8 at a_crit(0.1) = 1.5788); G0 GREEN (linfs, zstar, conserve);
+  `run_conserve_pi.sh` GATE OK, 36 configs; restart SE linfs and zstar np 2, multirank np 2 → 8 and round trip GREEN;
+  CORE2 np 8, 48 steps: guard `chi = 0.1000`, `M_min = 40`; linfs max|η| 4.40 m, etacomp ≤ 1.8e-14 m; zstar max|η|
+  4.44 m, laysum ≤ 5.5e-12 m; no NaN
+- [x] ➕ the linfs year at χ = 0.1 with the drag (the Task 5.2 twin on `bin_s5h_28229435`; job 28229689, compute,
+  45.4 min, 0.76 node-h, run dir `/scratch/a/a270088/se_s5f/twin_se_linfs_28229689`; diff job 28236295 against
+  `se_s5/twin_si_28220554`, `jobs/s5_F_diff_se_si_linfs_chi010.28236295.json`): exit 0, max|η| 4.756 m (step 67),
+  ≤ 2.13 m after the first month, max CFL_z 1.607 (step 301). Annual-mean SSH SE − SI **rms 0.111 mm, max 1.58 mm**
+  (the Gulf of Carpentaria, 70 m, where the χ 0.25 year has its maximum); the July maximum near 25°W 5°N is 5.8 mm
+  (34 mm at χ 0.05, 6.1 mm at χ 0.25 without the drag, 25 mm in the zstar year at χ 0.1); monthly rms 0.15–0.51 mm;
+  temp rms 3.8e-3 °C (0–100 m), 2.1e-3 °C (100–1000 m); SST rms 2.2e-3 °C; the global salt and temperature drifts
+  equal SI's to 8e-8 psu and 2e-6 °C; sea-ice area within 0.013 × 10⁶ km², extent equal to 0.01 × 10⁶ km² (SI's own
+  np 256 vs np 128 spread: SSH rms 0.72 mm, max 39 mm)
+- Sergey (2026-10-18, on the Task 5.7 result; packet §6): the theory of Demange et al. (2019) shows that the SE
+  method has an instability that the choice of χ removes, so χ must be large enough that it does not occur; the SI
+  method has strong built-in damping and does not get it. This matches Task 5.7: χ 0.1 is the smallest χ at which
+  the Kara-shelf mode decays
+- Task 5.8 cost: **0.91 node-h** (28229435 0.13, 28229689 0.76, 28236295 0.02)
 
 ### Stage 6 — Verify and document
 
-#### Task 6.1: Acceptance check (✅ except G3: Stage 5 pending Nikolay's yes)
+#### Task 6.1: Acceptance check ✅
 
 All in job 28219284 (shared, 32 cores, 14.1 min, 0.18 node-h; script and logs
 `/work/ab0995/a270088/fesom3_se_ref/jobs/t61_accept.sbatch`, `t61_*.28219284.*`; run dirs
@@ -1717,7 +1738,7 @@ All in job 28219284 (shared, 32 cores, 14.1 min, 0.18 node-h; script and logs
 commit 24c8e48. Incremental builds (Intel 27 s); no integration fixup was needed. Intel `fesom_lifecycle_native_mr`
 sha256 `01e1d34f709fb0e0…`, `fesom_conserve` `1edbc30ba0f7ef18…`.
 
-- [ ] every Overview requirement met:
+- [x] every Overview requirement met:
   - [x] SE off is byte-identical to the frozen references: **G0 GREEN** (linfs, zstar: 99 checkpoint variables and
     1 649 154 dump records max|Δ| = 0, 20 step lines equal; conserve 249 lines, 26 configs), 301 s; and
     `run_tri_regression.sh` 7/7 (below)
@@ -1743,7 +1764,7 @@ sha256 `01e1d34f709fb0e0…`, `fesom_conserve` `1edbc30ba0f7ef18…`.
     SSH SE − SI rms 0.110 mm, max 1.56 mm), Task 5.3 cost (SE SSH phase +3.55 ms/step at np 128, loop +2.9 %);
     ➕ Tasks 5.5/5.6 (D4 + drag): linfs year at χ 0.05 rms 0.110 mm, max 2.45 mm; ⚠️ the zstar year at χ 0.05 blew
     up on day 229, a zstar year at a larger χ is open ➕ Task 5.7: the zstar year at χ 0.1 is clean (rms 0.106 mm,
-    max 1.74 mm); Task 5.8: default χ = 0.1
+    max 1.74 mm); Task 5.8: default χ = 0.1, gates GREEN, the linfs year at χ 0.1 rms 0.111 mm, max 1.58 mm
 - [x] full ctest Intel + GNU, `run_g0_se.sh`, conserve_pi, restart gates, `run_tri_regression.sh` (`NEW_BIN=` this
   build). **ctest Intel 176/176** (32 s); **GNU 170/176, exactly the 6 known failures** (`test_wimpl_tra_np1/np2`,
   `meshdiag_mixed/quad/pi_w`, `test_shared_elem_np1`; the serial rerun fails the same 6, no flake this time);

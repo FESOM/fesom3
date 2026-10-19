@@ -343,7 +343,7 @@ measured at χ = 0.1. The 3000-step physics screens
 and SI linfs/zstar baselines) all run stably; after the cold-start transient SE's max|η| stays within
 3–6 cm of SI's, and the SE_CHECK maxima over 3000 steps are etacomp ≤ 7.2e-14 m, trim ≤ 3.6e-12
 m²/s, |msl| ≤ 2.6e-16 m, laysum ≤ 2.6e-11 m, spreads 0. The 1-year SE-vs-SI twins and the SSH-phase
-timing (plan Tasks 5.2, 5.3, 5.5–5.7) are in [IMPLEMENTATION.md](IMPLEMENTATION.md) §14.
+timing (plan Tasks 5.2, 5.3, 5.5–5.8) are in [IMPLEMENTATION.md](IMPLEMENTATION.md) §14.
 
 ### 7. Multi-rank and partition independence
 
