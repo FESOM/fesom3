@@ -797,7 +797,8 @@ contains
         ! 3. helem == kite-weighted (elem_w) mean of the vertex hnode over the FULL element
         !    range, and the element bottom depth is the derived one. Relative tolerance: the
         !    weighted sum is not exact even when all vertices agree.
-        tol = 1.0e-13_WP
+        ! (scaled to the working precision: 1e-13 in double, 64 ulp of real32 in single)
+        tol = max(1.0e-13_WP, 64.0_WP*epsilon(1.0_WP))
         do j = 1, nElemO
             if (mesh%nlevels(j) <= 0) cycle
             if (abs(real(mesh%zbar_e_bot(j), WP) - real(mesh%zbar(mesh%nlevels(j)), WP)) > 0.0_WP) then

@@ -49,6 +49,16 @@ module oce_ale_mixing_pp
     private
     public :: oce_mixing_pp, Kv0_background_qiang, Kv0_background
 
+    ! The pi of the Bryan-Lewis / Qiang background profile. FESOM2 v2.7.3 writes the literal
+    ! 3.1415926; upstream FESOM/fesom2#1007 replaced it by pi at machine precision. In single
+    ! precision the two differ by one real32 ulp (0x40490FDA vs 0x40490FDB) and FESOM_F follows
+    ! upstream; double precision keeps the v2.7.3 literal (bit-identical to main).
+#if defined(USE_SINGLE_PRECISION)
+    real(kind=WP), parameter :: PI_QIANG = 3.141592653589793238462643383279502884_WP
+#else
+    real(kind=WP), parameter :: PI_QIANG = 3.1415926_WP
+#endif
+
 contains
 
     !===========================================================================
@@ -132,7 +142,7 @@ contains
         real(kind=WP)              :: aux, ratio
 
         ! latitude/depth-dependent background diffusivity (Q. Wang FESOM1.4).
-        aux = (0.6_WP + 1.0598_WP / 3.1415926_WP * ATAN( 4.5e-3_WP * (dep - 2500.0_WP))) * 1.0e-5_WP
+        aux = (0.6_WP + 1.0598_WP / PI_QIANG * ATAN( 4.5e-3_WP * (dep - 2500.0_WP))) * 1.0e-5_WP
 
         ! latitudinal equatorial scaling.
         if (abs(lat) < 5.0_WP) then
@@ -170,9 +180,9 @@ contains
 
         ! latitudinal <70 deg vs arctic scaling.
         if (lat < 70.0_WP) then
-            aux = (0.6_WP + 1.0598_WP / 3.1415926_WP * ATAN( 4.5e-3_WP * (dep - 2500.0_WP))) * 1e-5_WP
+            aux = (0.6_WP + 1.0598_WP / PI_QIANG * ATAN( 4.5e-3_WP * (dep - 2500.0_WP))) * 1e-5_WP
         else
-            aux = (0.6_WP + 1.0598_WP / 3.1415926_WP * ATAN( 4.5e-3_WP * (dep - 2500.0_WP))) * 1.e-6_WP
+            aux = (0.6_WP + 1.0598_WP / PI_QIANG * ATAN( 4.5e-3_WP * (dep - 2500.0_WP))) * 1.e-6_WP
             ratio = 3.0_WP
             if (dep < 80.0_WP)     then
                 ratio = 1.0_WP
