@@ -105,7 +105,7 @@ prognostic field of ocean + ice + EVP stresses + `checkpoint.json`).
 | pi np 2 / CORE2 dist_512 | 2fbcc8f | 28257093 / 28257094 | identical |
 | ctest DP | 2fbcc8f | 28257095 | 167/167 pass (also 28256929 on 4a7e181) |
 | `tools/run_conserve_pi.sh` DP | 2fbcc8f | 28257096 | GATE OK |
-| pi / CORE2 / ctest DP with the salt-anomaly code (toggle off) | 507eed0 | 28257163 / 28257164 / 28257165 | identical / identical / 167/167 |
+| pi / CORE2 / ctest DP with the salt-anomaly code (toggle off) | 507eed0 | 28257163 / 28257164 / 28257165 | identical / identical / 167/167 (§4c) |
 
 ### Gate 2 — SP builds and runs
 
@@ -145,7 +145,7 @@ prognostic field of ocean + ice + EVP stresses + `checkpoint.json`).
 
   linfs (not conserving by design, reported only): SP heat −2.17e-4 / salt −1.08e-6, DP −2.17e-4 /
   −1.09e-6. The production driver itself prints no budget.
-- **ctest SP:** see §4a.
+- **ctest SP:** see §4b.
 
 ### Gate 3 — SP vs DP after one month (CORE2, Jan 1958, production physics)
 
@@ -167,7 +167,7 @@ SSH max 2.7e-3 m, rms 1.1e-4 m; a_ice max 0.067, rms 4.7e-4. (A 46.5-day pair, j
 gave the same picture: SST mean +4e-6, SSS +3e-6, ice area ±4e-4, SSH rms +5e-6.) No FP64 noise
 envelope was run, so these numbers carry no verdict.
 
-### 4c. One model year (CORE2 dist_512, 1958, production physics; jobs 28257317 DP, 28257318 SP)
+### 4a. One model year (CORE2 dist_512, 1958, production physics; jobs 28257317 DP, 28257318 SP)
 
 Both runs complete the year (17520 steps) with finite fields. Loop time per step DP 41.88 ms, SP 35.05
 ms (**0.837**; ocean step 26.48 → 20.12 ms, SSH solve 6.52 → 6.39, ice 8.12 → 7.81, forcing 6.14 → 6.32);
@@ -189,7 +189,7 @@ Pointwise: SST max|Δ| 0.83 °C, area-rms 0.014 °C; SSS max 0.30 psu, rms 7.8e-
 year, so the real32 closure of the linfs divergence (open problem 1) does not accumulate into a mean
 sea-level drift on this time scale (the freshwater balancing integral is WP_full).
 
-### 4a. ctest in SP
+### 4b. ctest in SP
 
 Job 28257224 (`ctest -j 32 --timeout 300` in `build_intel_sp`, commit 507eed0): **80 of 167 pass,
 87 fail**; all failures are DP-only by construction, none is a defect of the SP model:
@@ -215,7 +215,7 @@ What passes in SP includes the halo/partition/decomp/IO tests, the Zarr/restart 
 tests, the clock test, the meshes' read tests and `test_bottom`. Making the unit tests precision-aware
 (tolerances in units of `epsilon(1.0_WP)`, `MPI_WP` in the test reductions) is open item 7.
 
-### 4b. Salt anomaly runs (FESOM3_SALT_ANOMALY=1, commit 507eed0)
+### 4c. Salt anomaly runs (FESOM3_SALT_ANOMALY=1, commit 507eed0)
 
 - DP with the anomaly code and the toggle off: pi and CORE2 checkpoints identical to main (jobs
   28257163, 28257164), ctest DP 167/167 (28257165).
@@ -255,7 +255,7 @@ tests, the clock test, the meshes' read tests and `test_bottom`. Making the unit
    `S_ref = 0`. No guard refuses unsupported combinations (upstream refuses cavities, icebergs, transient
    tracers, DVD/cmor diagnostics — none exist in FESOM_F; the KPP non-local `rsss` is corrected
    instead of refused).
-7. **ctest in SP:** the unit tests carry DP tolerances (see §4a); an SP tolerance set or an SP-specific
+7. **ctest in SP:** the unit tests carry DP tolerances (see §4b); an SP tolerance set or an SP-specific
    subset was not written.
 8. **GNU SP build** (`--compiler gnu --precision sp`, probe build `build_gnu_sp`): the library and all
    33 drivers compile with gfortran; one test program does not (`test/test_coupling_mixed.F90:193`,
