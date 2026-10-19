@@ -28,7 +28,7 @@ has to reproduce.
 
 ## 2. Mapping: upstream PR → FESOM_F change
 
-The stack named in the brief plus the other merged SP PRs it depends on (`git log --first-parent` of
+The requested stack (#940, #995, #997, #1007, #1054, #1206, #1207) plus the other merged SP PRs it depends on (`git log --first-parent` of
 upstream main: #991 #992 #993 #994 #1026 #1030 #1032 #1056 #986).
 
 | upstream PR | what it does upstream | FESOM_F change (files / routines) |
@@ -47,7 +47,7 @@ upstream main: #991 #992 #993 #994 #1026 #1030 #1032 #1056 #986).
 | #1054 / #1056 FCT low-order tendency in flux form | `fct_LO_tend` instead of `LO*hnode_new - ttf*hnode`; w-split implicit part adds `tr*hnode_new` | **SP only**: `oce/oce_adv_tra_driver.F90 do_oce_adv_tra`, `oce/oce_adv_tra_flux.F90 oce_tra_adv_flux2dtracer (lo_tend)`, `oce/oce_adv_tra_ver.F90 adv_tra_vert_impl (tend)` — production runs w-split, so the #1056 form is the relevant one |
 | #1206 SP conservation (real64 accumulators + tracer carry) | `del_ttf*`, `fct_LO_tend` WP_full, `flux*dt/areasvol` in WP_full, column scratch WP_full, carry | `types/mod_tracer.F90` (`del_ttf`, `del_ttf_advhoriz/advvert`, `fct_LO_tend` WP_full; `carry(nl-1,nod,ntr)` WP); `oce_adv_tra_flux.F90` (WP_full products); `oce_adv_tra_ver.F90 adv_tra_vert_impl` and `oce_ale_tracer.F90 diff_ver_part_impl_ale` (column scratch WP_full); carry at both state writes (`diff_tracers_ale` ALE reconstruction, `diff_ver_part_impl_ale` update; SP only, allocated on first use); `fesom_conserve` budgets in WP_full incl. carry; binary dump through the WP format |
 | #1207 layer thickness in real64 | `hnode`, `hnode_new` WP_full, `exchange_nod_h` | `types/mod_mesh.F90` (`hnode, hnode_new` WP_full); `infra/mod_halo.F90 exchange_nod_h` (hi/lo split, SP); `oce/oce_ale.F90 vert_vel_ale`; `io/mod_io_restart.F90` (thickness staged through WP on write, widened on read, `exchange_nod_h` on the halo); `mod_dump` / `mod_binary_arrays` WP_full specifics |
-| #1029 coupled SP | OIFS/OASIS/XIOS | not needed (brief) |
+| #1029 coupled SP | OIFS/OASIS/XIOS | not ported (no coupling in FESOM_F) |
 
 FESOM_F-only additions (no upstream counterpart, needed to run SP at all):
 - `oce/oce_shortwave_pene.F90`: `exp(z/sc)` in WP_full (SP only). In real32 `exp(-88)` is subnormal
