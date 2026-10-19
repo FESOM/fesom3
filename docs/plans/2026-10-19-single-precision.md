@@ -167,6 +167,28 @@ SSH max 2.7e-3 m, rms 1.1e-4 m; a_ice max 0.067, rms 4.7e-4. (A 46.5-day pair, j
 gave the same picture: SST mean +4e-6, SSS +3e-6, ice area ±4e-4, SSH rms +5e-6.) No FP64 noise
 envelope was run, so these numbers carry no verdict.
 
+### 4c. One model year (CORE2 dist_512, 1958, production physics; jobs 28257317 DP, 28257318 SP)
+
+Both runs complete the year (17520 steps) with finite fields. Loop time per step DP 41.88 ms, SP 35.05
+ms (**0.837**; ocean step 26.48 → 20.12 ms, SSH solve 6.52 → 6.39, ice 8.12 → 7.81, forcing 6.14 → 6.32);
+job wall time 768 s vs 678 s (incl. setup). Loop-only throughput: DP 118 SYPD, SP 141 SYPD on 4 nodes.
+
+State on 1959-01-01 00:00 (`compare_ckpt.py`):
+
+| quantity | DP | SP | SP−DP |
+|---|---|---|---|
+| area-mean SST [°C] | 18.051411 | 18.051366 | −4.5e-05 |
+| area-mean SSS [psu] | 34.5921783 | 34.5922062 | +2.8e-05 |
+| sea-ice area NH / SH [10^6 km²] | 14.40767 / 7.35548 | 14.40766 / 7.36117 | −1.2e-05 / +5.7e-03 |
+| sea-ice volume NH / SH [10^3 km³] | 23.92589 / 8.97554 | 23.92577 / 8.99177 | −1.2e-04 / +1.6e-02 |
+| SSH rms [m] | 0.6230853 | 0.6231148 | +2.9e-05 |
+| global-mean SSH [m] | 7.7e-17 | −9.1e-10 | |
+
+Pointwise: SST max|Δ| 0.83 °C, area-rms 0.014 °C; SSS max 0.30 psu, rms 7.8e-3; SSH max 0.014 m, rms
+7.5e-4 m; a_ice max 0.31, rms 1.2e-3. The SP global-mean SSH is −9e-10 m after one month and after one
+year, so the real32 closure of the linfs divergence (open problem 1) does not accumulate into a mean
+sea-level drift on this time scale (the freshwater balancing integral is WP_full).
+
 ### 4a. ctest in SP
 
 Job 28257224 (`ctest -j 32 --timeout 300` in `build_intel_sp`, commit 507eed0): **80 of 167 pass,
@@ -235,7 +257,11 @@ tests, the clock test, the meshes' read tests and `test_bottom`. Making the unit
    instead of refused).
 7. **ctest in SP:** the unit tests carry DP tolerances (see §4a); an SP tolerance set or an SP-specific
    subset was not written.
-8. The GNU SP build was not tried (upstream needed explicit `real(..,WP)` in `min/max` for gfortran).
+8. **GNU SP build** (`--compiler gnu --precision sp`, probe build `build_gnu_sp`): the library and all
+   33 drivers compile with gfortran; one test program does not (`test/test_coupling_mixed.F90:193`,
+   `allocate(tracers%data(2), tracers%data(2)%values(...))` in one statement, a line unchanged from
+   `main` and unrelated to precision). No GNU SP run was made.
+9. **CG iteration counts** in SP vs DP were not measured (the production driver does not report them).
 
 ## 6. For the JAX port (fesom3_jax): precision policy to reproduce
 
