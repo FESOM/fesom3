@@ -894,7 +894,7 @@ program fesom_pressuredump
     call wr_r2(u, 'density_ref',    real(density_ref, MP))
     call wr_r2(u, 'zbar_3d_n',      mesh%zbar_3d_n(1:nl,   1:mesh%nod2D))
     call wr_r2(u, 'Z_3d_n',         mesh%Z_3d_n(1:nl-1,    1:mesh%nod2D))
-    call wr_r2(u, 'hnode',          mesh%hnode(1:nl-1,     1:mesh%nod2D))
+    call wr_r2(u, 'hnode',          real(mesh%hnode(1:nl-1,     1:mesh%nod2D), MP))
     call wr_r2(u, 'density_m_rho0', real(density,            MP))
     call wr_r2(u, 'hpressure',      real(hpressure(1:nl-1,:), MP))
     call wr_r2(u, 'bvfreq_raw',     real(bvfreq_raw,         MP))

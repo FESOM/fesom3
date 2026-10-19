@@ -14,9 +14,18 @@ module mod_dump
     ! FESOM_DUMP_FILE_ELEM -> element fields (gids on myList_elem2D). Each per-rank:
     ! <prefix>.<mype:05d>.
     use, intrinsic :: iso_fortran_env, only: int32, real64
-    use mod_precision, only: WP
+    use mod_precision, only: WP, WP_full
     implicit none
     private
+
+    ! dump_node is generic: in a single-precision build the WP_full layer thickness
+    ! (hnode/hnode_new, #1207) is dumped through its own specific (the dump is real64)
+    interface dump_node
+        module procedure dump_node_wp
+#if defined(USE_SINGLE_PRECISION)
+        module procedure dump_node_full
+#endif
+    end interface
 
     ! ---- substep IDs (mirror FESOM2 fesom_dump_shim.F90:37-53) ----
     integer, parameter, public :: DUMP_SUBSTEP_INIT        = 0
@@ -149,7 +158,37 @@ contains
         dump_is_active = nod_active .or. elem_active
     end function
 
-    subroutine dump_node(substep_id, step, field_name, field_3d, nlevels_nod2D)
+#if defined(USE_SINGLE_PRECISION)
+    subroutine dump_node_full(substep_id, step, field_name, field_3d, nlevels_nod2D)
+        integer,            intent(in) :: substep_id, step
+        character(len=*),   intent(in) :: field_name
+        real(kind=WP_full), intent(in) :: field_3d(:,:)
+        integer,            intent(in) :: nlevels_nod2D(:)
+        integer :: i, lid, nlev
+        character(len=24) :: name24
+        if (.not. nod_active .or. step > max_steps .or. step < min_step) return
+        name24 = field_name
+        if (dump_all) then
+            do i = 1, my_nod
+                nlev = nlevels_nod2D(i)
+                write(nod_unit) int(step,int32), int(substep_id,int32), &
+                    int(list_nod(i),int32), int(nlev,int32), &
+                    name24, real(field_3d(1:nlev, i), real64)
+            end do
+            return
+        end if
+        do i = 1, DUMP_NPROBES_NOD
+            lid = probe_loc_nod(i)
+            if (lid <= 0) cycle
+            nlev = nlevels_nod2D(lid)
+            write(nod_unit) int(step,int32), int(substep_id,int32), &
+                int(DUMP_PROBE_GIDS_NOD(i),int32), int(nlev,int32), &
+                name24, real(field_3d(1:nlev, lid), real64)
+        end do
+    end subroutine dump_node_full
+#endif
+
+    subroutine dump_node_wp(substep_id, step, field_name, field_3d, nlevels_nod2D)
         ! Column node field (nl, nod_total), truncated to nlevels_nod2D(local).
         integer,          intent(in) :: substep_id, step
         character(len=*), intent(in) :: field_name
@@ -176,7 +215,7 @@ contains
                 int(DUMP_PROBE_GIDS_NOD(i),int32), int(nlev,int32), &
                 name24, real(field_3d(1:nlev, lid), real64)
         end do
-    end subroutine dump_node
+    end subroutine dump_node_wp
 
     subroutine dump_node_2d(substep_id, step, field_name, field_2d)
         integer,          intent(in) :: substep_id, step

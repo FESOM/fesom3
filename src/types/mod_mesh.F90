@@ -19,7 +19,7 @@ module mod_mesh
     ! (myDim+eDim+1 .. +eXDim_nod2D, when dist_N/format.out exists).
     !
     ! Geometry/coordinate arrays are MP (mesh precision, D3); == WP at the DP anchor.
-    use mod_precision, only: WP, MP
+    use mod_precision, only: WP, MP, WP_full
     use, intrinsic :: iso_fortran_env, only: int32
 #if !defined(USE_HALF_PRECISION)
     use mod_binary_arrays, only: write_bin_array, read_bin_array
@@ -39,6 +39,14 @@ module mod_mesh
         integer(int32), allocatable, dimension(:) :: colind_loc
         integer(int32), allocatable, dimension(:) :: rowptr_loc
         real(kind=MP),  allocatable, dimension(:) :: pr_values   ! inverse diagonal (Jacobi preconditioner), owned rows
+#if defined(USE_SINGLE_PRECISION)
+        ! Full-precision accumulator of the SSH stiffness matrix (upstream FESOM/fesom2#997),
+        ! single precision only: update_stiff_mat_ale adds a per-step increment ~1e-7..1e-6 of
+        ! the entry, at or below float32 eps, so in real32 it is partly swallowed and the
+        ! matrix drifts. Accumulated here and rounded into values once per step; the CG keeps
+        ! WP bandwidth. Sized size(values) (the local nnz), seeded on the first update.
+        real(kind=WP_full), allocatable, dimension(:) :: values_full
+#endif
     end type sparse_matrix
 
     type t_mesh
@@ -167,7 +175,12 @@ module mod_mesh
         integer, allocatable, dimension(:,:) :: nn_pos
 
         ! ---- ALE layer thickness / depths ----
-        real(kind=MP), allocatable, dimension(:,:) :: hnode, hnode_new
+        ! Layer thickness in WP_full (real64 also in a single-precision build, upstream
+        ! FESOM/fesom2#1207): it is computed in full precision, and re-rounding it to real32
+        ! every step breaks the volume budget (one ulp of a 100 m layer is 8e-6 m). Readers
+        ! need no change (mixed-kind arithmetic promotes); WP-typed arguments take
+        ! real(., WP). In double precision WP_full == MP.
+        real(kind=WP_full), allocatable, dimension(:,:) :: hnode, hnode_new
         real(kind=MP), allocatable, dimension(:,:) :: zbar_3d_n, Z_3d_n
         real(kind=MP), allocatable, dimension(:,:) :: helem
         real(kind=MP), allocatable, dimension(:)   :: zbar_e_bot     ! (elem2D) depth of partial-cell bottom (full cells: zbar(nlevels(elem)))

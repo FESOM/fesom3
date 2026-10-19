@@ -16,7 +16,7 @@ module oce_adv_tra_flux
     ! with flux_v=0 and without use_lo, so only the horizontal scatter is live and
     ! dttf_v stays 0. mesh%hnode/hnode_new are referenced only in that dead branch.
     ! 1-rank only (myDim_* == global); multi-rank halo of dttf is deferred to M1.5.
-    use mod_precision,   only: WP
+    use mod_precision,   only: WP, WP_full
     use mod_mesh,        only: t_mesh
     use mod_partit,      only: t_partit
     use mod_part_bounds, only: owned_bounds
@@ -26,18 +26,22 @@ module oce_adv_tra_flux
 
 contains
 
-    subroutine oce_tra_adv_flux2dtracer(dt, dttf_h, dttf_v, flux_h, flux_v, mesh, use_lo, ttf, lo, partit)
+    subroutine oce_tra_adv_flux2dtracer(dt, dttf_h, dttf_v, flux_h, flux_v, mesh, use_lo, ttf, lo, partit, lo_tend)
         ! M2.12b: optional partit -> scatter over OWNED nodes/edges (myDim_*).
         real(kind=WP), intent(in)    :: dt
         type(t_mesh),  intent(in)    :: mesh
-        real(kind=WP), intent(inout) :: dttf_h(mesh%nl-1, mesh%nod2D)
-        real(kind=WP), intent(inout) :: dttf_v(mesh%nl-1, mesh%nod2D)
+        ! the tendencies accumulate in WP_full (#1206); the fluxes stay WP
+        real(kind=WP_full), intent(inout) :: dttf_h(mesh%nl-1, mesh%nod2D)
+        real(kind=WP_full), intent(inout) :: dttf_v(mesh%nl-1, mesh%nod2D)
         real(kind=WP), intent(inout) :: flux_h(mesh%nl-1, mesh%edge2D)
         real(kind=WP), intent(inout) :: flux_v(mesh%nl,   mesh%nod2D)
         logical,       optional      :: use_lo
         real(kind=WP), optional      :: ttf(mesh%nl-1, mesh%nod2D)
         real(kind=WP), optional      :: lo (mesh%nl-1, mesh%nod2D)
         type(t_partit), intent(in), optional :: partit
+        ! single precision: the FCT low-order tendency in flux form (#1054/#1056/#1206),
+        ! added directly instead of being reconstructed as lo*hnode_new - ttf*hnode
+        real(kind=WP_full), intent(in), optional :: lo_tend(mesh%nl-1, mesh%nod2D)
         integer :: n, nz, el(2), enodes(3), nu12, nl12, nu1, nu2, nl1, nl2, edge
         integer :: nNodO, nNodL, nEdgeO, nElemO
 
@@ -54,12 +58,21 @@ contains
                 end do
             end if
         end if
+        if (present(lo_tend)) then
+            do n = 1, nNodO
+                nu1 = mesh%ulevels_nod2D(n)
+                nl1 = mesh%nlevels_nod2D(n)
+                do nz = nu1, nl1-1
+                    dttf_v(nz,n) = dttf_v(nz,n) + lo_tend(nz,n)
+                end do
+            end do
+        end if
         ! Vertical flux divergence
         do n = 1, nNodO
             nu1 = mesh%ulevels_nod2D(n)
             nl1 = mesh%nlevels_nod2D(n)
             do nz = nu1, nl1-1
-                dttf_v(nz,n) = dttf_v(nz,n) + (flux_v(nz,n)-flux_v(nz+1,n))*dt/mesh%areasvol(n)
+                dttf_v(nz,n) = dttf_v(nz,n) + (real(flux_v(nz,n), WP_full)-flux_v(nz+1,n))*dt/mesh%areasvol(n)
             end do
         end do
         ! Horizontal edge-flux scatter -> del_ttf_advhoriz
@@ -77,8 +90,8 @@ contains
             nu12 = nu1
             if (nu2 > 0) nu12 = min(nu1, nu2)
             do nz = nu12, nl12
-                dttf_h(nz,enodes(1)) = dttf_h(nz,enodes(1)) + flux_h(nz,edge)*dt/mesh%areasvol(enodes(1))
-                dttf_h(nz,enodes(2)) = dttf_h(nz,enodes(2)) - flux_h(nz,edge)*dt/mesh%areasvol(enodes(2))
+                dttf_h(nz,enodes(1)) = dttf_h(nz,enodes(1)) + real(flux_h(nz,edge), WP_full)*dt/mesh%areasvol(enodes(1))
+                dttf_h(nz,enodes(2)) = dttf_h(nz,enodes(2)) - real(flux_h(nz,edge), WP_full)*dt/mesh%areasvol(enodes(2))
             end do
         end do
     end subroutine oce_tra_adv_flux2dtracer

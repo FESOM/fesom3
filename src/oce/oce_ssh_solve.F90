@@ -56,7 +56,7 @@ module oce_ssh_solve
     ! already IS the global sum). The new MR bit-identity risk is the cross-rank reduction
     ! order — allreduce_sum byte-matches the oracle because both use the same OpenMPI +
     ! comm size + op + 8-byte type (deterministic tree, LESSONS L6).
-    use mod_precision, only: WP, MP
+    use mod_precision, only: WP, MP, WP_full
     use mod_mesh,      only: t_mesh
     use mod_dyn,       only: t_dyn
     use mod_partit,    only: t_partit
@@ -165,7 +165,13 @@ contains
         type(t_partit), intent(in), optional :: partit
         integer                  :: row, iter
         integer                  :: nNodO, nNodL, nEdgeO, nElemO
-        real(kind=WP)            :: sprod(2), s_old, s_aux, al, be, rtol
+        ! CG scalars in WP_full (upstream FESOM/fesom2#994). Each is a global reduction over
+        ! nod2D or derived from one, and they set the search direction and the stopping test,
+        ! so rounding here steers the iteration. The vectors rr/zz/pp/App and the matrix stay
+        ! WP: the bandwidth is theirs. The sparse-row sums of A*v accumulate in WP_full and
+        ! round once into the WP vector. In double precision every real(., WP_full) is the
+        ! identity and this is the previous arithmetic.
+        real(kind=WP_full)       :: sprod(2), s_old, s_aux, al, be, rtol
         real(kind=MP), pointer   :: values(:), pr_values(:)
         real(kind=WP), pointer   :: rr(:), zz(:), pp(:), App(:)
         integer,       pointer   :: rptr(:), cind(:)
@@ -182,22 +188,23 @@ contains
 
         !__________________________________________________________________
         ! working tolerance rtol = soltol*sqrt((b.b)/nod2D)  [nod2D GLOBAL]
-        s_old = 0.0_WP
+        s_old = 0.0_WP_full
         do row = 1, nNodO
-            s_old = s_old + rhs(row)*rhs(row)
+            s_old = s_old + real(rhs(row), WP_full)*real(rhs(row), WP_full)
         end do
         if (is_multirank(partit)) call allreduce_sum(s_old, partit)
-        rtol = dynamics%solverinfo%soltol*sqrt(s_old/real(mesh%nod2D,WP))
+        rtol = dynamics%solverinfo%soltol*sqrt(s_old/real(mesh%nod2D,WP_full))
 
         !__________________________________________________________________
         ! r0 = b - A x0  (owned rows; x's halo columns are the prescribed x0 halo);
         ! z0 = M^-1 r0 (diagonal: local) ; search direction pp = z0 ; rho = r0.z0
-        s_old = 0.0_WP
+        s_old = 0.0_WP_full
         do row = 1, nNodO
-            rr(row) = rhs(row) - sum(values(rptr(row):rptr(row+1)-1)*x(cind(rptr(row):rptr(row+1)-1)))
+            rr(row) = real(real(rhs(row), WP_full) - sum(real(values(rptr(row):rptr(row+1)-1), WP_full) &
+                           *real(x(cind(rptr(row):rptr(row+1)-1)), WP_full)), WP)
             zz(row) = pr_values(row)*rr(row)
             pp(row) = zz(row)
-            s_old   = s_old + rr(row)*zz(row)
+            s_old   = s_old + real(rr(row), WP_full)*real(zz(row), WP_full)
         end do
         if (is_multirank(partit)) call allreduce_sum(s_old, partit)
 
@@ -206,22 +213,23 @@ contains
         if (present(n_iter)) n_iter = dynamics%solverinfo%maxiter   ! fallback: no convergence
         do iter = 1, dynamics%solverinfo%maxiter
             if (is_multirank(partit)) call exchange_nod(pp, partit)   ! halo cols for A*pp
-            s_aux = 0.0_WP
+            s_aux = 0.0_WP_full
             do row = 1, nNodO
-                App(row) = sum(values(rptr(row):rptr(row+1)-1)*pp(cind(rptr(row):rptr(row+1)-1)))
-                s_aux    = s_aux + pp(row)*App(row)
+                App(row) = real(sum(real(values(rptr(row):rptr(row+1)-1), WP_full) &
+                                    *real(pp(cind(rptr(row):rptr(row+1)-1)), WP_full)), WP)
+                s_aux    = s_aux + real(pp(row), WP_full)*real(App(row), WP_full)
             end do
             if (is_multirank(partit)) call allreduce_sum(s_aux, partit)
             al = s_old/s_aux
 
             ! x += al p ; r -= al Ap ; z = M^-1 r (diagonal: local, no halo exchange)
-            sprod(1:2) = 0.0_WP
+            sprod(1:2) = 0.0_WP_full
             do row = 1, nNodO
-                x(row)   = x(row)  + al*pp(row)
-                rr(row)  = rr(row) - al*App(row)
+                x(row)   = real(x(row)  + al*pp(row), WP)
+                rr(row)  = real(rr(row) - al*App(row), WP)
                 zz(row)  = pr_values(row)*rr(row)
-                sprod(1) = sprod(1) + rr(row)*zz(row)
-                sprod(2) = sprod(2) + rr(row)*rr(row)
+                sprod(1) = sprod(1) + real(rr(row), WP_full)*real(zz(row), WP_full)
+                sprod(2) = sprod(2) + real(rr(row), WP_full)*real(rr(row), WP_full)
             end do
             if (is_multirank(partit)) call allreduce_sum(sprod, partit)
 
@@ -233,7 +241,7 @@ contains
             be    = sprod(1)/s_old
             s_old = sprod(1)
             do row = 1, nNodO
-                pp(row) = zz(row) + be*pp(row)
+                pp(row) = real(zz(row) + be*pp(row), WP)
             end do
         end do
         if (is_multirank(partit)) call exchange_nod(x, partit)   ! FESOM2 solver.F90:279

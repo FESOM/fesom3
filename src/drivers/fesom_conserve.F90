@@ -79,7 +79,7 @@ program fesom_conserve
     ! -4.9e-15, salt -1.7e-14 at np=1; 0.0 and -7.8e-15 at np=2) and is the mode to gate on.
     use mpi
     use, intrinsic :: iso_fortran_env, only: int32
-    use mod_precision,      only: WP, MP, MPI_WP
+    use mod_precision,      only: WP, MP, MPI_WP, WP_full
     use mod_constants,      only: density_0, pi, rad
     use mod_param_phys,     only: N2smth_h, alpha, theta, shear_splines, N2_splines, rvo_upwind
     use mod_param_phys,     only: mix_coeff_PP, A_ver, K_ver, Kv0_const, mix_scheme_nmb
@@ -142,8 +142,11 @@ program fesom_conserve
     logical       :: use_wsplit, wsplit_expect_split          ! FESOM3_WSPLIT, _EXPECT_SPLIT
     integer       :: wsplit_expect_min                        ! FESOM3_WSPLIT_EXPECT_SPLIT value
     real(kind=WP) :: wsplit_mincfl_env, wsplit_maxcfl_env     ! FESOM3_WSPLIT_MINCFL/_MAXCFL
-    real(kind=WP) :: content0(2), content(2), conserve_tol, drift(2)
-    real(kind=WP) :: volume0, volume, vdrift
+    ! budgets in WP_full (upstream conservation diagnostic, real64 in every build); in a
+    ! single-precision build the content includes the tracer carry (#1206)
+    real(kind=WP_full) :: content0(2), content(2), drift(2)
+    real(kind=WP) :: conserve_tol
+    real(kind=WP_full) :: volume0, volume, vdrift
     logical :: use_fer_gm, use_redi, use_kpp, use_tke
     real(kind=WP), allocatable :: stress_node_surf(:,:)
     logical         :: use_ice                 ! FESOM3_CONSERVE_ICE
@@ -592,7 +595,7 @@ program fesom_conserve
     idrift   = 0.0_WP
     if (use_ice) then
         do i_ice = 1, 3
-            idrift(i_ice) = reldrift(icemass(i_ice), icemass0(i_ice))
+            idrift(i_ice) = reldrift(real(icemass(i_ice), WP_full), real(icemass0(i_ice), WP_full))
         end do
     end if
     if (partit%mype == 0) then
@@ -662,10 +665,10 @@ contains
         shmax = max(shmax, d)
     end subroutine shared_element_diag
 
-    real(kind=WP) function reldrift(a, b)
-        real(kind=WP), intent(in) :: a, b
-        reldrift = 0.0_WP
-        if (abs(b) > 0.0_WP) reldrift = (a - b) / abs(b)
+    real(kind=WP_full) function reldrift(a, b)
+        real(kind=WP_full), intent(in) :: a, b
+        reldrift = 0.0_WP_full
+        if (abs(b) > 0.0_WP_full) reldrift = (a - b) / abs(b)
     end function reldrift
 
     logical function finite(x)
@@ -734,35 +737,47 @@ contains
         integer, intent(in) :: step
         integer       :: i, j, k, kmin, kmax, elnodes(MAX_NV)
         real(kind=WP) :: acc, hmean, tol, uicemax
+        real(kind=WP_full) :: accf
 
         !______________________________________________________________________
         ! 1. total tracer content over OWNED scalar cells (allreduced at npes>1)
         do i = 1, 2
-            acc = 0.0_WP
+            accf = 0.0_WP_full
             do j = 1, nNodO
                 if (mesh%nlevels_nod2D(j) <= 0) cycle
                 do k = mesh%ulevels_nod2D(j), mesh%nlevels_nod2D(j)-1
-                    acc = acc + tracers%data(i)%values(k,j) &
-                              * real(mesh%hnode(k,j), WP) * real(mesh%areasvol(j), WP)
+                    accf = accf + tracers%data(i)%values(k,j) &
+                              * real(mesh%hnode(k,j), WP_full) * real(mesh%areasvol(j), WP_full)
                 end do
             end do
-            if (partit%npes > 1) call allreduce_sum(acc, partit)
-            content(i) = acc
+#if defined(USE_SINGLE_PRECISION)
+            ! the tracer carry is content too (a separate loop, as upstream #1206)
+            if (allocated(tracers%work%carry)) then
+                do j = 1, nNodO
+                    if (mesh%nlevels_nod2D(j) <= 0) cycle
+                    do k = mesh%ulevels_nod2D(j), mesh%nlevels_nod2D(j)-1
+                        accf = accf + real(mesh%areasvol(j), WP_full)*real(tracers%work%carry(k,j,i), WP_full)
+                    end do
+                end do
+            end if
+#endif
+            if (partit%npes > 1) call allreduce_sum(accf, partit)
+            content(i) = accf
         end do
 
         !______________________________________________________________________
         ! 1b. total VOLUME, sum over owned cells of hnode*areasvol. Tracer content can be
         ! conserved while volume is not (an error in h and an opposite one in T would
         ! cancel in the product), so this is a separate check, not a corollary.
-        acc = 0.0_WP
+        accf = 0.0_WP_full
         do j = 1, nNodO
             if (mesh%nlevels_nod2D(j) <= 0) cycle
             do k = mesh%ulevels_nod2D(j), mesh%nlevels_nod2D(j)-1
-                acc = acc + real(mesh%hnode(k,j), WP) * real(mesh%areasvol(j), WP)
+                accf = accf + real(mesh%hnode(k,j), WP_full) * real(mesh%areasvol(j), WP_full)
             end do
         end do
-        if (partit%npes > 1) call allreduce_sum(acc, partit)
-        volume = acc
+        if (partit%npes > 1) call allreduce_sum(accf, partit)
+        volume = accf
 
         !______________________________________________________________________
         ! 2. T10: no velocity below the element's last FULL prism

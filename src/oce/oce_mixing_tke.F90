@@ -23,9 +23,18 @@ module oce_mixing_tke
     !
     ! M7a-1 scope (this commit): tke_init (param store) + integrate_tke (the column core) +
     ! solve_tridiag. The driver (calc_cvmix_tke) is added M7a-2.
-    use mod_precision, only: WP
+    use mod_precision, only: WP, WP_full
     implicit none
     private
+
+    ! TP: the kind of the TKE column arithmetic. Upstream FESOM2 runs CVMix (cvmix_coeffs_tke)
+    ! in its fixed real64 kind cvmix_r8 whatever WP is, converting WP <-> cvmix_r8 at the call
+    ! boundary (FESOM/fesom2#940, gen_modules_cvmix_tke.F90). integrate_tke and solve_tridiag
+    ! are FESOM_F's transcription of that library code, so they run in TP = WP_full; the TKE
+    ! state and the Av/Kv it produces stay WP. Unsuffixed default-real literals (6.6, 0.5,
+    ! 3./2.) are kept verbatim: upstream compiles cvmix_tke.F90 with the model flags, so in a
+    ! single-precision build they are real32 there as well. In double precision TP == WP.
+    integer, parameter :: TP = WP_full
 
     public :: tke_init
     public :: integrate_tke
@@ -33,15 +42,15 @@ module oce_mixing_tke
 
     ! Module-saved TKE constants (set once by tke_init; mirror cvmix_tke.F90
     ! tke_constants_saved, minus the put/get string-dispatch plumbing).
-    real(kind=WP), save :: tkep_c_k
-    real(kind=WP), save :: tkep_c_eps
-    real(kind=WP), save :: tkep_cd
-    real(kind=WP), save :: tkep_alpha_tke
-    real(kind=WP), save :: tkep_KappaM_min
-    real(kind=WP), save :: tkep_KappaM_max
-    real(kind=WP), save :: tkep_mxl_min
-    real(kind=WP), save :: tkep_tke_min
-    real(kind=WP), save :: tkep_tke_surf_min
+    real(kind=TP), save :: tkep_c_k
+    real(kind=TP), save :: tkep_c_eps
+    real(kind=TP), save :: tkep_cd
+    real(kind=TP), save :: tkep_alpha_tke
+    real(kind=TP), save :: tkep_KappaM_min
+    real(kind=TP), save :: tkep_KappaM_max
+    real(kind=TP), save :: tkep_mxl_min
+    real(kind=TP), save :: tkep_tke_min
+    real(kind=TP), save :: tkep_tke_surf_min
     integer,       save :: tkep_mxl_choice
     logical,       save :: tkep_only_tke
     logical,       save :: tkep_l_lc
@@ -96,32 +105,32 @@ subroutine integrate_tke(tke_old, tke_new, KappaM_out, KappaH_out, &
 
     integer, intent(in)                          :: nlev
     ! OLD values
-    real(kind=WP), dimension(nlev+1), intent(in) :: tke_old, dzt
-    real(kind=WP), dimension(nlev+1), intent(in) :: Ssqr, Nsqr
-    real(kind=WP), dimension(nlev),   intent(in) :: dzw
+    real(kind=TP), dimension(nlev+1), intent(in) :: tke_old, dzt
+    real(kind=TP), dimension(nlev+1), intent(in) :: Ssqr, Nsqr
+    real(kind=TP), dimension(nlev),   intent(in) :: dzw
     ! Langmuir + IDEMIX inputs (zero arrays here)
-    real(kind=WP), dimension(nlev+1), intent(in) :: tke_plc
-    real(kind=WP), dimension(nlev+1), intent(in) :: E_iw, alpha_c, iw_diss
-    real(kind=WP), intent(in)                    :: forc_rho_surf, rho_ref, dtime, grav
-    real(kind=WP), intent(in)                    :: forc_tke_surf
+    real(kind=TP), dimension(nlev+1), intent(in) :: tke_plc
+    real(kind=TP), dimension(nlev+1), intent(in) :: E_iw, alpha_c, iw_diss
+    real(kind=TP), intent(in)                    :: forc_rho_surf, rho_ref, dtime, grav
+    real(kind=TP), intent(in)                    :: forc_tke_surf
     ! NEW values
-    real(kind=WP), dimension(nlev+1), intent(out) :: tke_new, KappaM_out, KappaH_out
+    real(kind=TP), dimension(nlev+1), intent(out) :: tke_new, KappaM_out, KappaH_out
     ! diagnostics
-    real(kind=WP), dimension(nlev+1), intent(out) :: tke_Tbpr, tke_Tspr, tke_Tdif, &
+    real(kind=TP), dimension(nlev+1), intent(out) :: tke_Tbpr, tke_Tspr, tke_Tdif, &
                                                      tke_Tdis, tke_Twin, tke_Tiwf, &
                                                      tke_Tbck, tke_Ttot, tke_Lmix, tke_Pr
 
     ! local variables
-    real(kind=WP), dimension(nlev+1) :: tke_unrest, tke_upd, mxl, sqrttke, prandtl, &
+    real(kind=TP), dimension(nlev+1) :: tke_unrest, tke_upd, mxl, sqrttke, prandtl, &
                                         Rinum, K_diss_v, P_diss_v, forc
-    real(kind=WP) :: tke_surf, tke_bott
-    real(kind=WP) :: alpha_tke, c_eps, cd, KappaM_max, mxl_min, c_k, tke_surf_min, tke_min
+    real(kind=TP) :: tke_surf, tke_bott
+    real(kind=TP) :: alpha_tke, c_eps, cd, KappaM_max, mxl_min, c_k, tke_surf_min, tke_min
     integer       :: tke_mxl_choice
     logical       :: only_tke, use_ubound_dirichlet, use_lbound_dirichlet, l_lc
-    real(kind=WP) :: zzw, depth, diff_surf_forc, diff_bott_forc
-    real(kind=WP), dimension(nlev+1) :: a_dif, b_dif, c_dif, a_tri, b_tri, c_tri, d_tri, ke
+    real(kind=TP) :: zzw, depth, diff_surf_forc, diff_bott_forc
+    real(kind=TP), dimension(nlev+1) :: a_dif, b_dif, c_dif, a_tri, b_tri, c_tri, d_tri, ke
     integer       :: k, kk, kp1
-    real(kind=WP) :: kappaM_min
+    real(kind=TP) :: kappaM_min
 
     ! initialize diagnostics
     tke_Tbpr = 0.0
@@ -407,9 +416,13 @@ subroutine calc_cvmix_tke(dynamics, stress_node_surf, dt, mesh, partit)
     integer :: nNodO, nNodL, nEdgeO, nElemO
     real(kind=WP) :: forc_surf
     real(kind=WP), dimension(:,:),   pointer :: bvfreq, tke, tke_Av, tke_Kv, Kv, Av, shear2
-    real(kind=WP), dimension(mesh%nl) :: vshear2, bvfreq2, dz_trr, tke_old_col, dzw_col, zero_col
+    real(kind=WP), dimension(mesh%nl) :: vshear2, bvfreq2, dz_trr, tke_old_col
+    ! TP (real64) column buffers at the integrate_tke boundary (upstream's WP <-> cvmix_r8
+    ! copy-in/copy-out); in double precision TP == WP and the copies are exact no-ops
+    real(kind=TP), dimension(mesh%nl) :: dzw_col, zero_col, ssqr_tp, nsqr_tp, dzt_tp, tke_old_tp, &
+                                         tke_new_tp, kappam_tp, kappah_tp
     ! discarded diagnostic scratch (integrate_tke requires them; not load-bearing here)
-    real(kind=WP), dimension(mesh%nl) :: dg_tbpr, dg_tspr, dg_tdif, dg_tdis, dg_twin, &
+    real(kind=TP), dimension(mesh%nl) :: dg_tbpr, dg_tspr, dg_tdif, dg_tdis, dg_twin, &
                                          dg_tiwf, dg_tbck, dg_ttot, dg_lmix, dg_pr
 
     shear2 => dynamics%work%shear2
@@ -421,7 +434,7 @@ subroutine calc_cvmix_tke(dynamics, stress_node_surf, dt, mesh, partit)
     Av     => dynamics%work%Av
     call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
 
-    zero_col = 0.0_WP
+    zero_col = 0.0_TP
 
     do node = 1, nNodO
         nln  = mesh%nlevels_nod2D(node)-1
@@ -451,18 +464,23 @@ subroutine calc_cvmix_tke(dynamics, stress_node_surf, dt, mesh, partit)
 
         ! prognostic recurrence: tke_old = the prior-step tke slab; dzw=hnode(nun:nln)
         tke_old_col      = tke(:,node)
-        dzw_col(1:nlev)  = mesh%hnode(nun:nln,node)
+        dzw_col(1:nlev)  = real(mesh%hnode(nun:nln,node), TP)
+        ! copy-in WP -> TP
+        tke_old_tp(nun:nln+1) = real(tke_old_col(nun:nln+1), TP)
+        dzt_tp(nun:nln+1)     = real(dz_trr(nun:nln+1),      TP)
+        ssqr_tp(nun:nln+1)    = real(vshear2(nun:nln+1),     TP)
+        nsqr_tp(nun:nln+1)    = real(bvfreq2(nun:nln+1),     TP)
 
         call integrate_tke( &
-             tke_old      = tke_old_col(nun:nln+1),  &
-             tke_new      = tke(   nun:nln+1,node),  & ! out --> turbulent kinetic energy
-             KappaM_out   = tke_Av(nun:nln+1,node),  & ! out
-             KappaH_out   = tke_Kv(nun:nln+1,node),  & ! out
+             tke_old      = tke_old_tp(nun:nln+1),   &
+             tke_new      = tke_new_tp(nun:nln+1),   & ! out --> turbulent kinetic energy
+             KappaM_out   = kappam_tp(nun:nln+1),    & ! out
+             KappaH_out   = kappah_tp(nun:nln+1),    & ! out
              dzw          = dzw_col(1:nlev),         &
-             dzt          = dz_trr(nun:nln+1),       &
+             dzt          = dzt_tp(nun:nln+1),       &
              nlev         = nlev,                    &
-             Ssqr         = vshear2(nun:nln+1),      &
-             Nsqr         = bvfreq2(nun:nln+1),      &
+             Ssqr         = ssqr_tp(nun:nln+1),      &
+             Nsqr         = nsqr_tp(nun:nln+1),      &
              tke_Tbpr     = dg_tbpr(1:nlev+1),       &
              tke_Tspr     = dg_tspr(1:nlev+1),       &
              tke_Tdif     = dg_tdif(1:nlev+1),       &
@@ -474,14 +492,18 @@ subroutine calc_cvmix_tke(dynamics, stress_node_surf, dt, mesh, partit)
              tke_Lmix     = dg_lmix(1:nlev+1),       &
              tke_Pr       = dg_pr(1:nlev+1),         &
              tke_plc      = zero_col(1:nlev+1),      &
-             forc_tke_surf= forc_surf,               &
+             forc_tke_surf= real(forc_surf, TP),     &
              E_iw         = zero_col(1:nlev+1),      &
-             dtime        = dt,                      &
+             dtime        = real(dt, TP),            &
              iw_diss      = zero_col(1:nlev+1),      &
-             forc_rho_surf= 0.0_WP,                  &
-             rho_ref      = density_0,               &
-             grav         = g,                       &
+             forc_rho_surf= 0.0_TP,                  &
+             rho_ref      = real(density_0, TP),     &
+             grav         = real(g, TP),             &
              alpha_c      = zero_col(1:nlev+1))
+        ! copy-out TP -> WP
+        tke(   nun:nln+1,node) = real(tke_new_tp(nun:nln+1), WP)
+        tke_Av(nun:nln+1,node) = real(kappam_tp(nun:nln+1),  WP)
+        tke_Kv(nun:nln+1,node) = real(kappah_tp(nun:nln+1),  WP)
 
         tke_Av(nln+1,node)=0.0_WP
         tke_Kv(nln+1,node)=0.0_WP
@@ -514,10 +536,10 @@ end subroutine calc_cvmix_tke
 subroutine solve_tridiag(a,b,c,d,x,n)
     implicit none
     integer, intent(in)                       :: n
-    real(kind=WP), dimension(n), intent(in)   :: a,b,c,d
-    real(kind=WP), dimension(n), intent(out)  :: x
-    real(kind=WP), dimension(n) :: cp,dp
-    real(kind=WP) :: m,fxa
+    real(kind=TP), dimension(n), intent(in)   :: a,b,c,d
+    real(kind=TP), dimension(n), intent(out)  :: x
+    real(kind=TP), dimension(n) :: cp,dp
+    real(kind=TP) :: m,fxa
     integer i
 
     ! initialize c-prime and d-prime

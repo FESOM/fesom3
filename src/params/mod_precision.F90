@@ -22,6 +22,21 @@ module mod_precision
 #endif
 
     integer, parameter :: MP = max(WP, 4)   ! mesh precision: at least single
+
+    ! WP_full: always real64, independent of WP (upstream FESOM2 o_PARAM WP_full,
+    ! FESOM/fesom2#992). The single-precision build keeps in WP_full what must not be
+    ! narrowed: the forcing time axis, global integrals and their reductions, the CG
+    ! scalars, the SSH stiffness accumulator, the tracer tendency accumulators, the
+    ! layer thickness hnode/hnode_new and the TKE (CVMix) arithmetic. In a double-
+    ! precision build WP_full == WP, so every real(x, WP_full) is the identity and the
+    ! DP build compiles to the same arithmetic as before. MPI_WP_FULL is its datatype.
+    integer, parameter :: WP_full = 8
+    integer, parameter :: MPI_WP_FULL = MPI_DOUBLE_PRECISION
+
+    ! Tracer carry (upstream use_tracer_carry, FESOM/fesom2#1206): in a single-precision
+    ! build each write of the tracer state keeps its thickness-weighted rounding residual
+    ! in tracers%work%carry and feeds it into the next write. Derived, not a switch.
+    logical, parameter :: use_tracer_carry = (WP /= WP_full)
     integer, parameter :: MAX_PATH = 4096   ! max file-path length (oce_modules.F90:9)
 
     ! MPI datatype matching WP (compile-time parameter; dwarf

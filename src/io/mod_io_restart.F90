@@ -43,7 +43,7 @@ module mod_io_restart
     ! calls restart_resolve_latest and copies WP->MP back for mp_src fields) is Stage 4 (Task 4.1).
     use mpi
     use, intrinsic :: iso_fortran_env, only: real64
-    use mod_precision,   only: WP, MP
+    use mod_precision,   only: WP, MP, WP_full
     use mod_mesh,        only: t_mesh
     use mod_partit,      only: t_partit
     use mod_dyn,         only: t_dyn        ! full-state registration (Task 3.4)
@@ -54,7 +54,8 @@ module mod_io_restart
     use mod_io_decomp
     use mod_io_coords    ! shared lon/lat + _ARRAY_DIMENSIONS + UGRID-attr embedding (Task 2.1)
     use mod_io_posix     ! POSIX fs shims: rename/fsync/rmtree/listdir for atomic finalize + prune (Task 3.1)
-    use mod_halo,        only: exchange_nod, exchange_elem, exchange_elem_full   ! read-back halo recon (Task 4.1)
+    use mod_halo,        only: exchange_nod, exchange_elem, exchange_elem_full, &  ! read-back halo recon (Task 4.1)
+                               exchange_nod_h
     implicit none
     private
 
@@ -103,7 +104,11 @@ module mod_io_restart
         ! lossless. mp_src=.false. fields use p2d/p3d directly (no copy).
         logical           :: mp_src   = .false.
         real(MP), pointer :: pmp2d(:)   => null()      ! live array (2-D field, MP source)
-        real(MP), pointer :: pmp3d(:,:) => null()      ! live array (3-D field, MP source)
+        ! 3-D staged source = the layer thickness mesh%hnode, which is WP_full (real64 in every
+        ! build, upstream #1207). In single precision it is staged through WP on write and
+        ! widened back on read: the checkpoint holds the thickness rounded to WP, as upstream's
+        ! restart does. In double precision WP_full == MP and nothing changes.
+        real(WP_full), pointer :: pmp3d(:,:) => null() ! live array (3-D field, WP_full source)
     end type t_restart_field
 
     type :: t_restart
@@ -209,7 +214,7 @@ contains
         character(len=*),  intent(in)           :: name, units
         integer,           intent(in)           :: entity
         real(MP), pointer, intent(in), optional :: pmp2d(:)
-        real(MP), pointer, intent(in), optional :: pmp3d(:,:)
+        real(WP_full), pointer, intent(in), optional :: pmp3d(:,:)
         logical,           intent(in), optional :: on_full_levels
         integer :: k
         k = restart_new_field(R, name, units, entity, '8')      ! MP -> always full precision
@@ -289,7 +294,8 @@ contains
         type(t_mesh),    intent(in), target :: mesh
         integer,         intent(in), optional :: mix_scheme
         real(WP), pointer :: p2(:), p3(:,:)
-        real(MP), pointer :: q2(:), q3(:,:)
+        real(MP), pointer :: q2(:)
+        real(WP_full), pointer :: q3(:,:)
         integer           :: j, ms
         character(len=32) :: tn
         ms = 0; if (present(mix_scheme)) ms = mix_scheme
@@ -828,7 +834,7 @@ contains
             end do
             call decomp_gather(D, buf3, bo3)
             if (f%mp_src) then
-                f%pmp3d(1:f%nlev, 1:nO) = real(bo3(1:f%nlev, 1:nO), MP)
+                f%pmp3d(1:f%nlev, 1:nO) = real(bo3(1:f%nlev, 1:nO), WP_full)
             else
                 f%p3d(1:f%nlev, 1:nO) = bo3(1:f%nlev, 1:nO)
             end if
@@ -856,8 +862,13 @@ contains
                     n1 = size(f%pmp2d); allocate(s2(n1)); s2 = real(f%pmp2d, WP)
                     call exchange_nod(s2, partit);                     f%pmp2d = real(s2, MP)
                 else
+#if defined(USE_SINGLE_PRECISION)
+                    ! WP_full thickness: hi/lo exchange, owned entries keep every bit
+                    call exchange_nod_h(f%pmp3d, partit)
+#else
                     n1 = size(f%pmp3d,1); n2 = size(f%pmp3d,2); allocate(s3(n1,n2)); s3 = real(f%pmp3d, WP)
                     call exchange_nod(s3, partit);                     f%pmp3d = real(s3, MP)
+#endif
                 end if
             else
                 if (f%ndim == 2) then; call exchange_nod(f%p2d, partit)

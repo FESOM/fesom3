@@ -10,14 +10,14 @@ module mod_halo
     ! Deferred (optimizations, not needed for byte-identity): begin/end overlap split,
     ! multi-field batched exchange, com_elem2D_full default path.
     use mpi
-    use mod_precision, only: WP, MPI_WP
+    use mod_precision, only: WP, MPI_WP, WP_full, MPI_WP_FULL
     use mod_partit,    only: t_partit, com_struct
     implicit none
     private
     public :: exchange_nod, exchange_elem, exchange_elem_full, &
               exchange_edge, exchange_nod_full, exchange_elem_shared, &
               allreduce_sum, allreduce_max, stale_halo_max_nod, stale_halo_max_elem, &
-              shared_copy_max_elem
+              shared_copy_max_elem, exchange_nod_h
 
     interface exchange_nod
         module procedure exchange_nod_2D_r, exchange_nod_3D_r, exchange_nod_2D_i, &
@@ -31,8 +31,15 @@ module mod_halo
     ! (the same determinism FESOM2 relies on, LESSONS L6). Guard callers with
     ! is_multirank — at npes==1 the local sum already IS the global sum (identity).
     ! The integer variant sums COUNTS (mesh invariants, split statistics): exact.
+    ! Single precision (upstream FESOM/fesom2#993/#1030): global integrals and the CG
+    ! scalars are WP_full (real64) and reduce as MPI_WP_FULL. The real64 specifics exist
+    ! only in a single-precision build -- in double precision WP_full == WP and the WP
+    ! specifics already serve them, so the double-precision build is unchanged.
     interface allreduce_sum
         module procedure allreduce_sum_r0, allreduce_sum_r1, allreduce_sum_i0
+#if defined(USE_SINGLE_PRECISION)
+        module procedure allreduce_sum_f0, allreduce_sum_f1
+#endif
     end interface
 
     ! Cross-rank floating-point MAX reduction. Mirrors the FESOM2 extrap_nod3D /
@@ -44,6 +51,17 @@ module mod_halo
     ! reduces a vector of diagnostics in one call (oce_ssh_se's SE_CHECK).
     interface allreduce_max
         module procedure allreduce_max_r0, allreduce_max_r1, allreduce_max_i0
+#if defined(USE_SINGLE_PRECISION)
+        module procedure allreduce_max_f0
+#endif
+    end interface
+
+    ! Halo exchange of a WP_full node field (the layer thickness hnode/hnode_new,
+    ! upstream exchange_nod_h, FESOM/fesom2#1207). In single precision the value travels
+    ! as a WP part plus a WP remainder through the existing WP exchange (exact to 2^-48),
+    ! so the MPI datatypes stay WP; in double precision it is exchange_nod itself.
+    interface exchange_nod_h
+        module procedure exchange_nod_h_3D
     end interface
 
     interface exchange_elem
@@ -288,6 +306,56 @@ contains
         call MPI_Allreduce(MPI_IN_PLACE, s, size(s), MPI_WP, MPI_MAX, &
                            partit%MPI_COMM_FESOM, ierr)
     end subroutine allreduce_max_r1
+
+#if defined(USE_SINGLE_PRECISION)
+    subroutine allreduce_sum_f0(s, partit)
+        real(kind=WP_full), intent(inout) :: s
+        type(t_partit),     intent(in)    :: partit
+        integer :: ierr
+        call MPI_Allreduce(MPI_IN_PLACE, s, 1, MPI_WP_FULL, MPI_SUM, &
+                           partit%MPI_COMM_FESOM, ierr)
+    end subroutine allreduce_sum_f0
+
+    subroutine allreduce_sum_f1(s, partit)
+        real(kind=WP_full), intent(inout) :: s(:)
+        type(t_partit),     intent(in)    :: partit
+        integer :: ierr
+        call MPI_Allreduce(MPI_IN_PLACE, s, size(s), MPI_WP_FULL, MPI_SUM, &
+                           partit%MPI_COMM_FESOM, ierr)
+    end subroutine allreduce_sum_f1
+
+    subroutine allreduce_max_f0(s, partit)
+        real(kind=WP_full), intent(inout) :: s
+        type(t_partit),     intent(in)    :: partit
+        integer :: ierr
+        call MPI_Allreduce(MPI_IN_PLACE, s, 1, MPI_WP_FULL, MPI_MAX, &
+                           partit%MPI_COMM_FESOM, ierr)
+    end subroutine allreduce_max_f0
+#endif
+
+    ! WP_full node field (nl, nod): exchange_nod in DP; hi/lo split through the WP
+    ! exchange in SP. Only the halo entries are rebuilt; owned entries keep all bits.
+    subroutine exchange_nod_h_3D(arr, partit, luse_g2g)
+        real(kind=WP_full), intent(inout) :: arr(:,:)
+        type(t_partit),     intent(in)    :: partit
+        logical, intent(in), optional     :: luse_g2g
+#if defined(USE_SINGLE_PRECISION)
+        real(kind=WP), allocatable :: hi(:,:), lo(:,:)
+        integer :: n0, n1
+        if (partit%npes <= 1) return
+        allocate(hi(size(arr,1), size(arr,2)), lo(size(arr,1), size(arr,2)))
+        hi = real(arr, WP)
+        lo = real(arr - real(hi, WP_full), WP)
+        call exchange_nod(hi, partit)
+        call exchange_nod(lo, partit)
+        n0 = partit%myDim_nod2D + 1
+        n1 = min(size(arr,2), partit%myDim_nod2D + partit%eDim_nod2D)
+        if (n1 >= n0) arr(:, n0:n1) = real(hi(:, n0:n1), WP_full) + real(lo(:, n0:n1), WP_full)
+        deallocate(hi, lo)
+#else
+        call exchange_nod(arr, partit, luse_g2g)
+#endif
+    end subroutine exchange_nod_h_3D
 
     subroutine allreduce_max_i0(s, partit)
         integer,        intent(inout) :: s

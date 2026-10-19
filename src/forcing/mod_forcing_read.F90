@@ -35,7 +35,7 @@ module mod_forcing_read
     ! prefetch reader stack + the SSS/runoff/chl climatology reads are NOT ported
     ! (perf / separate fields).
     use, intrinsic :: iso_fortran_env, only: real32, real64
-    use mod_precision, only: WP
+    use mod_precision, only: WP, WP_full
     use mod_constants,  only: rad
     use mod_io_netcdf
     use mod_mesh_rotate, only: vector_g2r
@@ -52,7 +52,7 @@ module mod_forcing_read
     logical, save :: frc_cache_init = .false.
     public :: t_atm_forcing, forcing_alloc, forcing_read_grid, forcing_build_bilin, &
               forcing_getcoeffld, forcing_rotate_wind, forcing_timeinterp, &
-              forcing_julday, forcing_binarysearch, forcing_sbc_do
+              forcing_julday, forcing_binarysearch, forcing_sbc_do, forcing_rdate
 
     integer, parameter, public :: FRC_MAXFLD = 16
 
@@ -62,7 +62,15 @@ module mod_forcing_read
         character(len=64)  :: calendar = 'none'
         integer            :: nlon = 0, nlat = 0, ntime = 0   ! nlon INCLUDES the +2 lon halo
         integer            :: year_orig = 0
-        real(WP), allocatable :: nc_lon(:), nc_lat(:), nc_time(:)
+        real(WP), allocatable :: nc_lon(:), nc_lat(:)
+        ! The time axis holds an ABSOLUTE Julian day (~2.4e6 for JRA55). Its float32 ulp at
+        ! that magnitude is 0.25 d = 6 h, which collapses the 3-hourly records onto a common
+        ! grid (delta_t = 0) and quantises the forcing clock. So time is WP_full (real64)
+        ! whatever WP is (upstream FESOM/fesom2#940); only the field VALUES are WP.
+        real(WP_full), allocatable :: nc_time(:)
+        ! Single precision: bracket-start time t0 of the point-slope interpolation
+        ! atmdata = coef_b + (rdate - t0)*coef_a (upstream time_t0, #940); see getcoeffld.
+        real(WP_full)      :: time_t0 = 0.0_WP_full
         integer            :: flip_lat = 0
         ! M8b: persisted time bracket from the previous forcing_getcoeffld (FESOM2 flfi_type
         ! t_indx/t_indx_p1). forcing_sbc_do's crossing test reads them; nc_Ntime == ntime.
@@ -118,10 +126,10 @@ contains
                 jy = jy - 1
                 jm = mm + 13
             end if
-            jd = int(365.25_WP*jy) + int(30.6001_WP*jm) + dd + 1720995
+            jd = int(365.25_WP_full*jy) + int(30.6001_WP_full*jm) + dd + 1720995
             if (dd + 31*(mm + 12*yyyy) >= IGREG) then
-                ja = int(0.01_WP*jy)
-                jd = jd + 2 - ja + int(0.25_WP*ja)
+                ja = int(0.01_WP_full*jy)
+                jd = jd + 2 - ja + int(0.25_WP_full*ja)
             end if
         else
             jd = 365*yyyy
@@ -134,28 +142,28 @@ contains
         character(len=*), intent(in) :: calendar
         integer, parameter :: IGREG = 2299161
         integer :: ja, jb, jc, jd, je, mm
-        real(WP) :: x
+        real(WP_full) :: x
         if ((trim(calendar) == 'julian')              .or. &
             (trim(calendar) == 'gregorian')           .or. &
             (trim(calendar) == 'proleptic_gregorian') .or. &
             (trim(calendar) == 'standard')) then
             if (julian >= IGREG) then
-                x = ((julian - 1867216) - 0.25_WP)/36524.25_WP
-                ja = julian + 1 + int(x) - int(0.25*x)
+                x = ((julian - 1867216) - 0.25_WP_full)/36524.25_WP_full
+                ja = julian + 1 + int(x) - int(0.25_WP_full*x)
             else
                 ja = julian
             end if
             jb = ja + 1524
-            jc = int(6680 + ((jb - 2439870) - 122.1_WP)/365.25_WP)
-            jd = int(365*jc + (0.25_WP*jc))
-            je = int((jb - jd)/30.6001_WP)
+            jc = int(6680 + ((jb - 2439870) - 122.1_WP_full)/365.25_WP_full)
+            jd = int(365*jc + (0.25_WP_full*jc))
+            je = int((jb - jd)/30.6001_WP_full)
             mm = je - 1
             if (mm > 12) mm = mm - 12
             yyyy = jc - 4715
             if (mm > 2) yyyy = yyyy - 1
             if (yyyy <= 0) yyyy = yyyy - 1
         else
-            yyyy = int((real(julian) + 1.e-12_WP)/365._WP)
+            yyyy = int((real(julian, WP_full) + 1.e-12_WP_full)/365._WP_full)
         end if
     end function forcing_calyear
 
@@ -183,6 +191,54 @@ contains
         end do
         ind = right
     end subroutine forcing_binarysearch
+
+    ! real64 counterpart for the forcing TIME axis (upstream binarysearch_r8, #940). A generic
+    ! interface cannot hold both: in a double-precision build WP == real64 and the two
+    ! specifics would be ambiguous; hence a distinct name. In DP it is the same arithmetic.
+    subroutine forcing_binarysearch_r8(length, array, value, ind)
+        integer,       intent(in)  :: length
+        real(WP_full), intent(in)  :: array(length)
+        real(WP_full), intent(in)  :: value
+        integer,       intent(out) :: ind
+        integer :: left, middle, right
+        real(WP_full), parameter :: d = 1e-9_WP_full
+        left = 1
+        right = length
+        do
+            if (left > right) exit
+            middle = nint((left + right)/2.0_WP_full)
+            if (abs(array(middle) - value) <= d) then
+                ind = middle
+                return
+            else if (array(middle) > value) then
+                right = middle - 1
+            else
+                left = middle + 1
+            end if
+        end do
+        ind = right
+    end subroutine forcing_binarysearch_r8
+
+    ! Model forcing date on the field's calendar (absolute Julian day, real64), built from the
+    ! clock as FESOM2 sbc_do:1527-1528 / nc_sbc_ini:643-644. half_step subtracts dt/2 (the
+    ! per-step evaluation); the cold-start coefficients are built without it. Every term is
+    ! formed in WP_full: in single precision the ~2.4e6 day would otherwise collapse onto the
+    ! float32 6-hour grid. In double precision this is the original expression, bit for bit.
+    function forcing_rdate(calendar, half_step) result(rdate)
+        use mod_clock,  only: yearnew, daynew, timenew
+        use mod_config, only: dt
+        character(len=*), intent(in) :: calendar
+        logical,          intent(in) :: half_step
+        real(WP_full) :: rdate
+        if (half_step) then
+            rdate = real(forcing_julday(yearnew, 1, 1, calendar), WP_full) &
+                  + real(daynew - 1, WP_full) + real(timenew, WP_full)/86400._WP_full &
+                  - real(dt, WP_full)/86400._WP_full/2._WP_full
+        else
+            rdate = real(forcing_julday(yearnew, 1, 1, calendar), WP_full) &
+                  + real(daynew - 1, WP_full) + real(timenew, WP_full)/86400._WP_full
+        end if
+    end function forcing_rdate
 
     subroutine forcing_alloc(frc)
         type(t_atm_forcing), intent(inout) :: frc
@@ -214,12 +270,15 @@ contains
         if (allocated(frc%f(fld)%nc_time)) deallocate(frc%f(fld)%nc_time)
         allocate(frc%f(fld)%nc_lon(frc%f(fld)%nlon), frc%f(fld)%nc_lat(frc%f(fld)%nlat), &
                  frc%f(fld)%nc_time(frc%f(fld)%ntime))
-        ! lat (no halo)
-        call nc_get_axis_dp(ncid, ['LAT ','lat '], frc%f(fld)%nc_lat)
+        ! lat (no halo); read as double (the file type), narrowed to WP (identity in DP)
+        allocate(tmp(frc%f(fld)%nlat))
+        call nc_get_axis_dp(ncid, ['LAT ','lat '], tmp)
+        frc%f(fld)%nc_lat = real(tmp, WP)
+        deallocate(tmp)
         ! lon into interior 2:nlon-1, then periodic halo (377-379)
         allocate(tmp(nlon0))
         call nc_get_axis_dp(ncid, ['LON ','lon '], tmp)
-        frc%f(fld)%nc_lon(2:frc%f(fld)%nlon-1) = tmp
+        frc%f(fld)%nc_lon(2:frc%f(fld)%nlon-1) = real(tmp, WP)
         frc%f(fld)%nc_lon(1)            = frc%f(fld)%nc_lon(frc%f(fld)%nlon-1)
         frc%f(fld)%nc_lon(frc%f(fld)%nlon) = frc%f(fld)%nc_lon(2)
         deallocate(tmp)
@@ -240,10 +299,10 @@ contains
         ! mid-point shift (505-512): pi has tmid=1 -> skipped
         if (frc%tmid /= 1 .and. frc%f(fld)%ntime > 1) then
             do i = 1, frc%f(fld)%ntime - 1
-                frc%f(fld)%nc_time(i) = (frc%f(fld)%nc_time(i+1) + frc%f(fld)%nc_time(i))/2.0_WP
+                frc%f(fld)%nc_time(i) = (frc%f(fld)%nc_time(i+1) + frc%f(fld)%nc_time(i))/2.0_WP_full
             end do
             frc%f(fld)%nc_time(frc%f(fld)%ntime) = frc%f(fld)%nc_time(frc%f(fld)%ntime) + &
-                (frc%f(fld)%nc_time(frc%f(fld)%ntime) - frc%f(fld)%nc_time(frc%f(fld)%ntime-1))/2.0
+                (frc%f(fld)%nc_time(frc%f(fld)%ntime) - frc%f(fld)%nc_time(frc%f(fld)%ntime-1))/2.0_WP_full
         end if
         ! lat flip if descending (519-526)
         frc%f(fld)%flip_lat = 0
@@ -303,14 +362,15 @@ contains
     subroutine forcing_getcoeffld(frc, fld, year, rdate, mesh, partit)
         type(t_atm_forcing), intent(inout), target :: frc
         integer,  intent(in) :: fld, year
-        real(WP), intent(in) :: rdate
+        real(WP_full), intent(in) :: rdate    ! absolute Julian day (real64 in every build)
         type(t_mesh),   intent(in), target :: mesh
         type(t_partit), intent(in), target :: partit
         character(len=512) :: fname
         character(len=4) :: cyear
         character(len=8) :: env
         integer :: ncid, nlon, nlat, ntime, t_indx, t_indx_p1, ii, i, j, ip1, jp1, extrp, ln, ios
-        real(WP) :: delta_t, x, y, x1, x2, y1, y2, denom, data1, data2
+        real(WP_full) :: delta_t
+        real(WP) :: x, y, x1, x2, y1, y2, denom, data1, data2
         real(real32), allocatable :: raw(:,:)
         real(real32), pointer     :: sbc1(:,:), sbc2(:,:)
         logical :: cache1
@@ -327,15 +387,17 @@ contains
         write(cyear, '(I4)') year
         fname = trim(frc%f(fld)%file_base)//trim(adjustl(cyear))//'.nc'
 
-        call forcing_binarysearch(ntime, frc%f(fld)%nc_time, rdate, t_indx)
+        call forcing_binarysearch_r8(ntime, frc%f(fld)%nc_time, rdate, t_indx)
         if (t_indx < ntime .and. t_indx > 0) then
             t_indx_p1 = t_indx + 1
             delta_t   = frc%f(fld)%nc_time(t_indx_p1) - frc%f(fld)%nc_time(t_indx)
         else if (t_indx > 0) then            ! no extrapolation into the future
-            t_indx = ntime; t_indx_p1 = t_indx; delta_t = 1.0_WP
+            t_indx = ntime; t_indx_p1 = t_indx; delta_t = 1.0_WP_full
         else                                 ! t_indx < 1: no extrapolation back in time
-            t_indx = 1; t_indx_p1 = t_indx; delta_t = 1.0_WP
+            t_indx = 1; t_indx_p1 = t_indx; delta_t = 1.0_WP_full
         end if
+        ! bracket-start time of the single-precision point-slope form (upstream time_t0)
+        frc%f(fld)%time_t0 = frc%f(fld)%nc_time(t_indx)
         ! M8b: persist the resolved bracket so forcing_sbc_do's crossing test can read it next
         ! step (FESOM2 getcoeffld stores via the sbc_flfi%t_indx/%t_indx_p1 pointers).
         frc%f(fld)%t_indx    = t_indx
@@ -424,8 +486,19 @@ contains
             else
                 data1 = sbc1(i,j); data2 = sbc2(i,j)
             end if
+#if defined(USE_SINGLE_PRECISION)
+            ! Point-slope (offset) form, upstream FESOM/fesom2#940: store the slope and the
+            ! base VALUE data1, evaluate coef_b + (rdate - time_t0)*coef_a. The affine form
+            ! below would put a ~2.4e6-magnitude intercept into a float32 array and lose ~7
+            ! digits to cancellation. The slope is formed in real64 (delta_t) and rounded once.
+            ! Single precision only: upstream applies it in both precisions, which changes the
+            ! double-precision rounding; FESOM_F keeps the double-precision build bit-identical.
+            frc%coef_a(fld, ii) = real((data2 - data1) / delta_t, WP)
+            frc%coef_b(fld, ii) = data1
+#else
             frc%coef_a(fld, ii) = (data2 - data1) / delta_t
             frc%coef_b(fld, ii) = data1 - frc%coef_a(fld, ii) * frc%f(fld)%nc_time(t_indx)
+#endif
         end do
         call timer_stop(TMR_FRC_INTRP2)
         sbc1 => null(); sbc2 => null()
@@ -449,14 +522,26 @@ contains
     ! ---- atmdata = rdate*coef_a + coef_b (FESOM2 data_timeinterp, 1041) ----------
     subroutine forcing_timeinterp(frc, rdate, partit)
         type(t_atm_forcing), intent(inout) :: frc
-        real(WP), intent(in) :: rdate
+        real(WP_full), intent(in) :: rdate      ! absolute Julian day (real64 in every build)
         type(t_partit), intent(in), target :: partit
         integer :: fld, i
+#if defined(USE_SINGLE_PRECISION)
+        real(WP) :: dt_elapsed
+        ! point-slope form (see getcoeffld): the elapsed time since the bracket start is formed
+        ! in real64 and narrowed once; it is at most one record interval, so exact enough in WP.
+        do fld = 1, frc%nfld
+            dt_elapsed = real(rdate - frc%f(fld)%time_t0, WP)
+            do i = 1, frc%nnod
+                frc%atmdata(fld, i) = frc%coef_b(fld, i) + dt_elapsed * frc%coef_a(fld, i)
+            end do
+        end do
+#else
         do fld = 1, frc%nfld
             do i = 1, frc%nnod
                 frc%atmdata(fld, i) = rdate * frc%coef_a(fld, i) + frc%coef_b(fld, i)
             end do
         end do
+#endif
     end subroutine forcing_timeinterp
 
     ! ---- per-step record/day forcing rollover (FESOM2 sbc_do, body 1524-1576) ------
@@ -476,7 +561,7 @@ contains
         type(t_mesh),   intent(in),    target :: mesh
         type(t_partit), intent(in),    target :: partit
         integer  :: fld
-        real(WP) :: rdate
+        real(WP_full) :: rdate
         logical  :: do_rotation_wind, force_newcoeff, needs_refresh
         ! M8c year-file rollover (sbc_do:1510-1519): on a year change re-read EVERY field's grid +
         ! time axis from the next year's file (forcing_read_grid re-anchors nc_time to yearnew, see its
@@ -507,8 +592,7 @@ contains
         do_rotation_wind = .false.
         do fld = 1, frc%nfld
             ! running model rdate on the field's calendar (sbc_do:1527-1528)
-            rdate = real(forcing_julday(yearnew, 1, 1, frc%f(fld)%calendar), WP) &
-                  + real(daynew - 1, WP) + timenew/86400._WP - dt/86400._WP/2._WP
+            rdate = forcing_rdate(frc%f(fld)%calendar, .true.)
             ! crossing test (sbc_do:1561): rdate past the bracket end AND not at the last record, OR a
             ! year rollover just forced a refresh (force_newcoeff). getcoeffld re-binarysearches rdate
             ! so the stale (prev-year) t_indx is reset to the new year's early-January bracket.

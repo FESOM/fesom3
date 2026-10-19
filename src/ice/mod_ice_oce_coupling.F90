@@ -35,7 +35,7 @@ module mod_ice_oce_coupling
     ! exchange_nod(u_w,v_w) ocean2ice already does upstream) are the M3f multi-rank concern;
     ! at 1-rank nNodL==nod2D so every read is local. The per-node arithmetic is UNCHANGED so
     ! codegen — and the byte-match — is preserved.
-    use mod_precision,   only: WP
+    use mod_precision,   only: WP, WP_full
     use mod_constants,   only: density_0
     use mod_mesh,        only: t_mesh, MAX_NV
     use mod_ice,         only: t_ice
@@ -251,15 +251,19 @@ contains
         type(t_mesh),   intent(in)            :: mesh
         type(t_partit), intent(in), optional  :: partit
         integer :: row, nNodO, nNodL, nEdgeO, nElemO
-        real(kind=WP) :: lval
+        ! Accumulate in WP_full (upstream FESOM/fesom2#993): an uncompensated sum over every
+        ! surface node, used to BALANCE global fluxes to zero, so its rounding would become a
+        ! systematic net source. Reduced as WP_full and rounded once into the WP result. In
+        ! double precision WP_full == WP and this is the previous arithmetic.
+        real(kind=WP_full) :: lval
 
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
-        lval = 0.0_WP
+        lval = 0.0_WP_full
         do row = 1, nNodO
             lval = lval + data(row)*mesh%areasvol(row)
         end do
-        int2D = lval
-        if (is_multirank(partit)) call allreduce_sum(int2D, partit)
+        if (is_multirank(partit)) call allreduce_sum(lval, partit)
+        int2D = real(lval, WP)
     end subroutine integrate_nod_2D
 
 end module mod_ice_oce_coupling

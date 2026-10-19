@@ -119,7 +119,7 @@ program test_wimpl_tra
     ! read_mesh (assert_min_layers, ctest test_minlayers), not by the kernel, which is
     ! stateless and validates nothing.
     use mpi
-    use mod_precision,      only: WP, MP
+    use mod_precision,      only: WP, MP, WP_full
     use mod_constants,      only: pi
     use mod_mesh,           only: t_mesh
     use mod_dyn,            only: t_dyn
@@ -155,7 +155,8 @@ program test_wimpl_tra
     real(kind=WP), parameter :: smin(nsplit) = [0.5_WP, 0.0_WP, 0.9_WP]
     real(kind=WP), parameter :: smax(nsplit) = [1.0_WP, 1.0_WP, 1.0_WP]
     real(kind=WP), allocatable :: tin(:,:), tlo(:,:), tnew(:,:), tother(:,:)
-    real(kind=WP), allocatable :: flux_v(:,:), flux_h(:,:), dttf_h(:,:), dttf_v(:,:)
+    real(kind=WP), allocatable :: flux_v(:,:), flux_h(:,:)
+    real(kind=WP_full), allocatable :: dttf_h(:,:), dttf_v(:,:)
     real(kind=WP), allocatable :: vel(:,:,:)
 
     nfail = 0
@@ -716,7 +717,8 @@ contains
         real(kind=WP) :: d(nl), inc(nl), tdrv, tcf, hmin_fp, hmin_fm
         logical :: ok_lim, upward
         character(len=8) :: stag, wtag
-        real(kind=WP), allocatable :: adf_test(:,:), adf_unlim(:,:), dttf_wrong(:,:)
+        real(kind=WP), allocatable :: adf_test(:,:), adf_unlim(:,:)
+        real(kind=WP_full), allocatable :: dttf_wrong(:,:)
         real(kind=WP), allocatable :: fmin_t(:,:), fmax_t(:,:), fplus_t(:,:), fminus_t(:,:), adfh_t(:,:)
 
         allocate(adf_test(nl, nNodL), adf_unlim(nl, nNodL), dttf_wrong(nl-1, nNodL))

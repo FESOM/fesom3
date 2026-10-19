@@ -45,7 +45,7 @@ program fesom_lifecycle_native_mr
     use mod_timer           ! permanent per-component wall-clock timing (TMR_* ids, timer_start/stop/report)
     use, intrinsic :: ieee_arithmetic   ! M8c Step-3 fix: control flush-to-zero (denormal) underflow mode
     use, intrinsic :: iso_fortran_env, only: int32, real64
-    use mod_precision,      only: WP, MP, MPI_WP
+    use mod_precision,      only: WP, MP, MPI_WP, WP_full, MPI_WP_FULL
     use mod_constants,      only: density_0
     use mod_halo,           only: shared_copy_max_elem   ! FESOM3_STEP_DIAG shared-element spreads
     use mod_param_phys,     only: N2smth_h, alpha, theta, scale_area, shear_splines, N2_splines, rvo_upwind
@@ -140,7 +140,7 @@ program fesom_lifecycle_native_mr
     ! M8a: model clock (cold start from FESOM3_START_CLOCK) + run-length driver
     integer            :: clk_d0, clk_y0, clk_unit, idx, ierr
     real(kind=WP)      :: clk_t0, dstat(10)  ! dstat: M8c Step-3 global per-step physical diagnostics
-    real(kind=WP)      :: dsum(2)            ! [sum ssh_rhs_old, sum|ssh_rhs_old|] over owned nodes
+    real(kind=WP_full) :: dsum(2)            ! [sum ssh_rhs_old, sum|ssh_rhs_old|] over owned nodes
     logical            :: ftz_supported   ! M8c Step-3: flush-to-zero (denormal) underflow control (match FESOM2)
     logical            :: step_diag        ! perf: per-step global MPI_MAX stability diagnostic (env FESOM3_STEP_DIAG; default OFF — FESOM2 has no per-step collective)
     integer            :: mon_every        ! perf monitoring: emit a per-component timing report every mon_every steps (env FESOM3_TIMING_EVERY; 0 = only the final report)
@@ -175,7 +175,7 @@ program fesom_lifecycle_native_mr
     character(len=16)   :: forc_set, forc_calendar
     type(t_atm_forcing) :: frc
     integer             :: fld, fyear
-    real(kind=WP)       :: rdate_cold
+    real(kind=WP_full)  :: rdate_cold   ! absolute Julian day: real64 in every build
     real(kind=WP), allocatable :: nuw(:), nvw(:), nta(:), nsh(:), nswr(:), nlw(:), npr(:), nps(:)
     real(kind=WP), allocatable :: ncd(:), nch(:), nce(:), nsx(:), nsy(:), nix(:), niy(:)
     real(kind=WP), allocatable :: nro(:), nss(:)
@@ -316,6 +316,15 @@ program fesom_lifecycle_native_mr
         nEdgeO = partit%myDim_edge2D
         nElemO = partit%myDim_elem2D
         nElemF = partit%myDim_elem2D + partit%eDim_elem2D + partit%eXDim_elem2D
+    end if
+    ! working-precision banner (upstream #940 prints the same in fesom_init)
+    if (partit%mype == 0) then
+#if defined(USE_SINGLE_PRECISION)
+        write(*,'(a,i0,a)') 'fesom_lifecycle_native_mr: working precision WP=', WP, &
+            ' bytes (SINGLE PRECISION MODE; WP_full=8 for time axis, integrals, CG, accumulators, hnode, TKE)'
+#else
+        write(*,'(a,i0,a)') 'fesom_lifecycle_native_mr: working precision WP=', WP, ' bytes (DOUBLE PRECISION MODE)'
+#endif
     end if
     if (partit%mype == 0) &
         write(*,'(a,i0,a,i0,a,i0,a,i0)') 'fesom_lifecycle_native_mr: nod2D=', mesh%nod2D, &
@@ -774,8 +783,7 @@ program fesom_lifecycle_native_mr
         frc%f(7)%file_base = trim(forcing_dir)//'/ncar_precip.'; frc%f(7)%varname = 'RAIN'
         frc%f(8)%file_base = trim(forcing_dir)//'/ncar_precip.'; frc%f(8)%varname = 'SNOW'
     end if
-    rdate_cold = real(forcing_julday(yearnew,1,1,forc_calendar),WP) &  ! cold-start rdate, NO half-step
-               + real(daynew-1,WP) + timenew/86400._WP                 ! (FESOM2 nc_sbc_ini:643-644)
+    rdate_cold = forcing_rdate(forc_calendar, .false.)   ! cold-start rdate, NO half-step (nc_sbc_ini:643-644)
     call forcing_alloc(frc)
     do fld = 1, frc%nfld
         call forcing_read_grid(frc, fld, fyear)
@@ -1073,14 +1081,14 @@ program fesom_lifecycle_native_mr
         ! step line stays byte-identical (G0 and run_cutout_short.sh read its fields).
         dstat(10) = maxval(dyn%cfl_z(:,1:nNodO))
         call MPI_Allreduce(MPI_IN_PLACE, dstat, 10, MPI_WP, MPI_MAX, partit%MPI_COMM_FESOM, ierr)
-        dsum = [sum(dyn%ssh_rhs_old(1:nNodO)), sum(abs(dyn%ssh_rhs_old(1:nNodO)))]
-        call MPI_Allreduce(MPI_IN_PLACE, dsum, 2, MPI_WP, MPI_SUM, partit%MPI_COMM_FESOM, ierr)
+        dsum = [sum(real(dyn%ssh_rhs_old(1:nNodO), WP_full)), sum(abs(real(dyn%ssh_rhs_old(1:nNodO), WP_full)))]
+        call MPI_Allreduce(MPI_IN_PLACE, dsum, 2, MPI_WP_FULL, MPI_SUM, partit%MPI_COMM_FESOM, ierr)
         if (partit%mype == 0) &
             write(*,'(a,i0,10(a,es12.4))') 'fesom_lifecycle_native_mr: step ', n, &
                 '  max|eta|=', dstat(1), '  max|uv|=', dstat(2), &
                 '  a_ice=', dstat(3), '  m_ice=', dstat(4), &
                 '  Tmax=', dstat(5), '  Smax=', dstat(6), &
-                '  divsum=', abs(dsum(1))/max(dsum(2), tiny(1.0_WP)), &
+                '  divsum=', abs(dsum(1))/max(dsum(2), tiny(1.0_WP_full)), &
                 '  dUV=', dstat(7), '  dAB=', dstat(8), '  dsig=', dstat(9)
         if (partit%mype == 0) &
             write(*,'(a,i0,a,es12.4)') 'fesom_lifecycle_native_mr: CFL_z step ', n, '  max CFL_z=', dstat(10)
@@ -1258,7 +1266,7 @@ contains
     ! once at setup. Every routine threads partit -> the OWNED+HALO nodes are filled.
     subroutine compute_native_forcing(n)
         integer, intent(in) :: n                       ! step index -> per-step forcing rdate (rcur)
-        real(kind=WP) :: rcur
+        real(kind=WP_full) :: rcur
         ! M8b: refresh interp coefficients on record/day crossings (forcing_sbc_do reads the model
         ! clock yearnew/daynew/timenew), THEN evaluate atmdata at the per-step rdate. rcur MUST equal
         ! forcing_sbc_do's per-field rdate (same formula, same clock; forc_calendar matches the file
@@ -1267,8 +1275,7 @@ contains
         call timer_start(TMR_FRC_SBC)
         call forcing_sbc_do(frc, mesh, partit)
         call timer_stop(TMR_FRC_SBC)
-        rcur = real(forcing_julday(yearnew,1,1,forc_calendar),WP) + real(daynew-1,WP) &
-             + timenew/86400._WP - dt/86400._WP/2._WP
+        rcur = forcing_rdate(forc_calendar, .true.)
         call timer_start(TMR_FRC_INTERP)
         call forcing_timeinterp(frc, rcur, partit)
         nuw = frc%atmdata(1,1:nNodL);  nvw = frc%atmdata(2,1:nNodL);  nsh = frc%atmdata(3,1:nNodL)
