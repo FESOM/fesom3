@@ -43,7 +43,8 @@ module oce_pressure_bv
     use oce_vert_spline, only: spline_eval
     use mod_param_phys,  only: state_equation, N2smth_h, N2smth_hidx, N2_splines, &
                                scaling_ODM95, ODM95_Scr, ODM95_Sd, scaling_LDD97, &
-                               LDD97_c, LDD97_rmin, LDD97_rmax, Fer_GM, Redi, Redi_Ktaper
+                               LDD97_c, LDD97_rmin, LDD97_rmax, Fer_GM, Redi, Redi_Ktaper, &
+                               S_ref_anomaly
     use mod_partit,      only: t_partit
     use mod_part_bounds, only: owned_bounds, is_multirank
     use mod_halo,        only: exchange_nod
@@ -99,7 +100,7 @@ contains
         smin = 0.0_WP
         do node=1, nNodL
             do nz = mesh%ulevels_nod2D(node), mesh%nlevels_nod2D(node)-1
-                smin = min(smin, salt(nz,node))
+                smin = min(smin, salt(nz,node) + S_ref_anomaly)   ! absolute S (S_ref=0 unless use_salt_anomaly)
             end do
         end do
         if (smin < 0.0_WP) write(*,*) ' --> oce_pressure_bv: s<0 happens!', smin
@@ -265,7 +266,7 @@ contains
         ! the exact Horner factorization below.
         real(kind=WP), intent(in)  :: t, s
         real(kind=WP), intent(out) :: bulk_0, bulk_pz, bulk_pz2, rhopot
-        real(kind=WP) :: s_sqrt
+        real(kind=WP) :: s_sqrt, s_abs
 
         real(kind=WP), parameter   :: a0    = 19092.56,     at   = 209.8925
         real(kind=WP), parameter   :: at2   = -3.041638,    at3  = -1.852732e-3
@@ -292,22 +293,23 @@ contains
         real(kind=WP), parameter   :: bss = -5.72466e-3,  bsst = 1.02270e-4
         real(kind=WP), parameter   :: bsst2 = -1.65460e-6,bss2 = 4.8314e-4
 
-        s_sqrt = sqrt(s)
+        s_abs  = s + S_ref_anomaly   ! the EOS needs absolute salinity (S_ref=0 unless use_salt_anomaly)
+        s_sqrt = sqrt(s_abs)
 
         bulk_0 =  a0      + t*(at   + t*(at2  + t*(at3 + t*at4)))      &
-                + s* (as  + t*(ast  + t*(ast2 + t*ast3))               &
+                + s_abs* (as  + t*(ast  + t*(ast2 + t*ast3))           &
                      + s_sqrt*(ass  + t*(asst + t*asst2)))
 
         bulk_pz =  ap  + t*(apt  + t*(apt2 + t*apt3))                  &
-                        + s*(aps + t*(apst + t*apst2) + s_sqrt*apss)
+                        + s_abs*(aps + t*(apst + t*apst2) + s_sqrt*apss)
 
         bulk_pz2 = ap2 + t*(ap2t + t*ap2t2)                           &
-                      + s *(ap2s + t*(ap2st + t*ap2st2))
+                      + s_abs *(ap2s + t*(ap2st + t*ap2st2))
 
         rhopot =  b0 + t*(bt + t*(bt2 + t*(bt3  + t*(bt4  + t*bt5))))  &
-                     + s*(bs + t*(bst + t*(bst2 + t*(bst3 + t*bst4)))  &
+                     + s_abs*(bs + t*(bst + t*(bst2 + t*(bst3 + t*bst4))) &
                         + s_sqrt*(bss + t*(bsst + t*bsst2))            &
-                             + s* bss2)
+                             + s_abs* bss2)
     end subroutine densityJM_components
 
     !===========================================================================
@@ -521,7 +523,7 @@ contains
         p1 = p
         t1_2 = t1*t1; t1_3 = t1_2*t1; t1_4 = t1_3*t1
         p1_2 = p1*p1; p1_3 = p1_2*p1
-        s35  = s-35.0_WP; s35_2 = s35*s35
+        s35  = (s + S_ref_anomaly)-35.0_WP; s35_2 = s35*s35   ! absolute S (S_ref=0 unless use_salt_anomaly)
         beta = 0.785567e-3_WP - 0.301985e-5_WP*t1 &
              + 0.555579e-7_WP*t1_2 - 0.415613e-9_WP*t1_3 &
              + s35*(-0.356603e-6_WP + 0.788212e-8_WP*t1 &

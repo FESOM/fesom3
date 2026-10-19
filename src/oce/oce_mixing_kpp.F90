@@ -97,6 +97,7 @@ contains
         use mod_part_bounds, only: owned_bounds, is_multirank
         use mod_halo,        only: exchange_nod
         use mod_constants,   only: g, vcpw, density_0_r
+        use mod_param_phys,  only: S_ref_anomaly
         use oce_pressure_bv, only: smooth_nod
         type(t_dyn),    intent(inout), target :: dynamics
         type(t_tracer), intent(in),    target :: tracers
@@ -158,7 +159,7 @@ contains
             nzmin = mesh%ulevels_nod2D(node)
             ustar(node) = sqrt( sqrt( stress_node_surf(1,node)**2 + stress_node_surf(2,node)**2 )*density_0_r )
             Bo(node)    = -g*( sw_alpha(nzmin,node)*heat_flux(node)/vcpw &
-                             + sw_beta (nzmin,node)*water_flux(node)*salt(nzmin,node) )
+                             + sw_beta (nzmin,node)*water_flux(node)*(salt(nzmin,node)+S_ref_anomaly) )  ! absolute S
         end do
 
         !_______________________________________________________________________

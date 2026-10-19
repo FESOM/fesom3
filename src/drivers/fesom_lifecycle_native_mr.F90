@@ -49,6 +49,7 @@ program fesom_lifecycle_native_mr
     use mod_constants,      only: density_0
     use mod_halo,           only: shared_copy_max_elem   ! FESOM3_STEP_DIAG shared-element spreads
     use mod_param_phys,     only: N2smth_h, alpha, theta, scale_area, shear_splines, N2_splines, rvo_upwind
+    use mod_param_phys,     only: use_salt_anomaly, S_ref_anomaly
     use mod_param_phys,     only: mix_coeff_PP, A_ver, K_ver, Kv0_const, mix_scheme_nmb
     use mod_param_phys,     only: use_instabmix, instabmix_kv, use_momix, use_windmix
     ! M4f: GM bolus (FESOM3_FER_GM) + Redi isopycnal diffusion (FESOM3_REDI) at MULTI-RANK —
@@ -199,6 +200,11 @@ program fesom_lifecycle_native_mr
     use_fer_gm = (ios == 0 .and. env_len > 0)
     call get_environment_variable('FESOM3_REDI', env, length=env_len, status=ios)
     use_redi = (ios == 0 .and. env_len > 0)
+    ! FESOM3_SALT_ANOMALY=1: store salinity as S - 35 (upstream use_salt_anomaly, #986/#940).
+    ! S_ref_anomaly is set after the initial conditions are read (they arrive absolute).
+    call get_environment_variable('FESOM3_SALT_ANOMALY', env, length=env_len, status=ios)
+    use_salt_anomaly = (ios == 0 .and. env_len > 0)
+    if (use_salt_anomaly) use_salt_anomaly = (trim(env) /= '0')
     call get_environment_variable('FESOM3_MIX_KPP', env, length=env_len, status=ios)
     use_kpp = (ios == 0 .and. env_len > 0)
     call get_environment_variable('FESOM3_MIX_TKE', env, length=env_len, status=ios)
@@ -432,6 +438,14 @@ program fesom_lifecycle_native_mr
     ic%ic_cyclic   = .true.
     ic%dummy       = 1.e10_WP
     call do_ic3d(tracers, ic, mesh, partit)
+    ! use_salt_anomaly: the IC arrives absolute (insitu2pot has used it) -> convert ONCE here,
+    ! before the AB copies below (upstream ocean_setup). Restarts are converted after the read.
+    if (use_salt_anomaly) then
+        S_ref_anomaly = 35.0_WP
+        tracers%data(2)%values = tracers%data(2)%values - S_ref_anomaly
+        if (partit%mype == 0) write(*,'(a,f6.2)') &
+            'fesom_lifecycle_native_mr: use_salt_anomaly: salinity state = S - ', S_ref_anomaly
+    end if
     if (partit%mype == 0) &
         write(*,'(a,2es12.4,a,2es12.4)') 'fesom_lifecycle_native_mr: IC(rank0 owned) T=', &
             minval(tracers%data(1)%values(:,1:nNodO)), maxval(tracers%data(1)%values(:,1:nNodO)), &
@@ -952,6 +966,25 @@ program fesom_lifecycle_native_mr
             if (partit%mype == 0) write(*,'(a,f9.1,a,i0,a,i0)') &
                 'restart: state restored (resumed run) at clock time=', timenew, ' day=', daynew, &
                 ' year=', yearnew
+            ! use_salt_anomaly (upstream fesom_init): a restart may hold ABSOLUTE salinity (from a run
+            ! without the anomaly) or the anomaly. Detect by the global maximum (absolute peaks near
+            ! 41 psu, the anomaly near 41-S_ref) and convert once; every AB level shifts alike.
+            if (use_salt_anomaly) then
+                block
+                    real(kind=WP) :: smax_g
+                    smax_g = maxval(tracers%data(2)%values(:,1:nNodO))
+                    call MPI_Allreduce(MPI_IN_PLACE, smax_g, 1, MPI_WP, MPI_MAX, partit%MPI_COMM_FESOM, ierr)
+                    if (smax_g > 20.0_WP) then
+                        tracers%data(2)%values    = tracers%data(2)%values    - S_ref_anomaly
+                        tracers%data(2)%valuesAB  = tracers%data(2)%valuesAB  - S_ref_anomaly
+                        tracers%data(2)%valuesold = tracers%data(2)%valuesold - S_ref_anomaly
+                        if (partit%mype == 0) write(*,'(a)') &
+                            'restart: use_salt_anomaly: absolute-salinity restart -> converted to S - S_ref'
+                    else if (partit%mype == 0) then
+                        write(*,'(a)') 'restart: use_salt_anomaly: anomaly-salinity restart -> no conversion'
+                    end if
+                end block
+            end if
         end if
     end if
 
@@ -1001,12 +1034,13 @@ program fesom_lifecycle_native_mr
         if (do_output) then
             if (means_has(oio,'ssh'))    call means_accumulate(oio,'ssh',    dyn%eta_n(1:nNodO))
             if (means_has(oio,'sst'))    call means_accumulate(oio,'sst',    tracers%data(1)%values(1,1:nNodO))
-            if (means_has(oio,'sss'))    call means_accumulate(oio,'sss',    tracers%data(2)%values(1,1:nNodO))
+            ! salinity output stays absolute (S_ref=0 unless use_salt_anomaly)
+            if (means_has(oio,'sss'))    call means_accumulate(oio,'sss',    tracers%data(2)%values(1,1:nNodO) + S_ref_anomaly)
             if (means_has(oio,'a_ice'))  call means_accumulate(oio,'a_ice',  ice%data(1)%values(1:nNodO))
             if (means_has(oio,'m_ice'))  call means_accumulate(oio,'m_ice',  ice%data(2)%values(1:nNodO))
             if (means_has(oio,'m_snow')) call means_accumulate(oio,'m_snow', ice%data(3)%values(1:nNodO))
             if (means_has(oio,'temp'))   call means_accumulate(oio,'temp',   tracers%data(1)%values(1:nl-1, 1:nNodO))
-            if (means_has(oio,'salt'))   call means_accumulate(oio,'salt',   tracers%data(2)%values(1:nl-1, 1:nNodO))
+            if (means_has(oio,'salt'))   call means_accumulate(oio,'salt',   tracers%data(2)%values(1:nl-1, 1:nNodO) + S_ref_anomaly)
             if (means_has(oio,'w'))      call means_accumulate(oio,'w',      dyn%w(1:nl, 1:nNodO))
             if (means_has(oio,'unod'))   call means_accumulate(oio,'unod',   dyn%uvnode(1, 1:nl-1, 1:nNodO))
             if (means_has(oio,'vnod'))   call means_accumulate(oio,'vnod',   dyn%uvnode(2, 1:nl-1, 1:nNodO))
@@ -1062,7 +1096,7 @@ program fesom_lifecycle_native_mr
         dstat(3) = maxval(ice%data(1)%values(1:nNodO))            ! a_ice  (area fraction, >=0)
         dstat(4) = maxval(ice%data(2)%values(1:nNodO))            ! m_ice  (effective thickness, >=0)
         dstat(5) = maxval(tracers%data(1)%values(:,1:nNodO))      ! T max  (tropical SST ceiling)
-        dstat(6) = maxval(tracers%data(2)%values(:,1:nNodO))      ! S max  (evaporative-basin salinity)
+        dstat(6) = maxval(tracers%data(2)%values(:,1:nNodO)) + S_ref_anomaly  ! S max (absolute)
         ! Shared elements (docs/plans/completed/20261012-shared-element-sync.md): the copy spreads
         ! max|copy - designated owner's copy| of uv (0 with FESOM3_SHARED_SYNC=1; the drift
         ! without it), uv_rhsAB and sigma (0 by construction, guarded by test_vinv V13 and

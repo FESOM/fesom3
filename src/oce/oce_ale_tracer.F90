@@ -35,7 +35,7 @@ module oce_ale_tracer
     use mod_part_bounds,    only: owned_bounds, is_multirank, local_dims
     use mod_halo,           only: exchange_nod
     use mod_param_phys,     only: Fer_GM, Redi, use_kpp_nonlclflx, &
-                                  mix_scheme_nmb, ref_sss, ref_sss_local
+                                  mix_scheme_nmb, ref_sss, ref_sss_local, S_ref_anomaly
     use mod_config,         only: use_sw_pene
     use oce_tracer_mod,     only: init_tracers_AB
     use oce_tracer_grad,    only: tracer_gradient_z
@@ -183,8 +183,9 @@ contains
         do node = 1, nNodL
             nzmax = mesh%nlevels_nod2D(node) - 1
             nzmin = mesh%ulevels_nod2D(node)
-            where (Svalues(nzmin:nzmax,node) > 45.0_WP) Svalues(nzmin:nzmax,node) = 45.0_WP
-            where (Svalues(nzmin:nzmax,node) <  3.0_WP) Svalues(nzmin:nzmax,node) =  3.0_WP
+            ! clip bounds in anomaly space (S_ref=0 unless use_salt_anomaly)
+            where (Svalues(nzmin:nzmax,node) > 45.0_WP - S_ref_anomaly) Svalues(nzmin:nzmax,node) = 45.0_WP - S_ref_anomaly
+            where (Svalues(nzmin:nzmax,node) <  3.0_WP - S_ref_anomaly) Svalues(nzmin:nzmax,node) =  3.0_WP - S_ref_anomaly
         end do
 
     end subroutine solve_tracers_ale
@@ -701,7 +702,7 @@ contains
                                         *(mesh%area(n)/mesh%areasvol(n)) ) * heat_flux(n) / vcpw * dt
                 else if (id == 2) then      ! salinity
                     rsss = ref_sss
-                    if (ref_sss_local) rsss = trarr(1,n)   ! FESOM2 values(1,n): level 1 (=nzmin, no cavity)
+                    if (ref_sss_local) rsss = trarr(1,n) + S_ref_anomaly   ! FESOM2 values(1,n); absolute S
                     nz = nzmin
                     tr(nz) = tr(nz) - ( -MIN(dynamics%work%ghats(nz+1,n)*dynamics%work%blmc(nz+1,n,3), 1.0_WP) &
                                         *(mesh%area(n)/mesh%areasvol(n)) ) * rsss * water_flux(n) * dt
@@ -780,7 +781,10 @@ contains
         case (1)  ! temperature
             bc_surface = -dt*(heat_flux/vcpw + sval*water_flux*is_nonlinfs)
         case (2)  ! salinity (virtual_salt is 0 for zlevel/zstar; nonzero for linfs)
-            bc_surface =  dt*(virtual_salt + relax_salt + real_salt_flux*is_nonlinfs)
+            ! use_salt_anomaly background-dilution term (upstream #940/#986; S_ref=0 unless enabled,
+            ! reducing to the original BC): S_ref*water_flux cancels most of the constancy error of
+            ! the offset S_ref in the free-surface advection (upstream: ~99.4 %).
+            bc_surface =  dt*(virtual_salt + relax_salt + (real_salt_flux + S_ref_anomaly*water_flux)*is_nonlinfs)
         case default
             bc_surface = 0.0_WP
         end select

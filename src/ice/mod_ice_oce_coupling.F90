@@ -37,6 +37,7 @@ module mod_ice_oce_coupling
     ! codegen — and the byte-match — is preserved.
     use mod_precision,   only: WP, WP_full
     use mod_constants,   only: density_0
+    use mod_param_phys,  only: S_ref_anomaly
     use mod_mesh,        only: t_mesh, MAX_NV
     use mod_ice,         only: t_ice
     use mod_ice_thermo,  only: t_atmflux
@@ -180,7 +181,7 @@ contains
         if (atm%use_virt_salt) then
             rsss = atm%ref_sss
             do n = 1, nNodL
-                if (atm%ref_sss_local) rsss = salt(mesh%ulevels_nod2D(n), n)
+                if (atm%ref_sss_local) rsss = salt(mesh%ulevels_nod2D(n), n) + S_ref_anomaly   ! S_ref=0 unless use_salt_anomaly
                 virtual_salt(n) = rsss*water_flux(n)
             end do
 
@@ -195,7 +196,8 @@ contains
         !_______________________________________________________________________
         ! balance SSS restoring to climatology (no cavity)
         do n = 1, nNodL
-            relax_salt(n) = atm%surf_relax_S*(Ssurf(n) - salt(mesh%ulevels_nod2D(n), n))
+            ! Ssurf is absolute; subtract S_ref (0 unless use_salt_anomaly) to match the anomaly state
+            relax_salt(n) = atm%surf_relax_S*(Ssurf(n) - S_ref_anomaly - salt(mesh%ulevels_nod2D(n), n))
         end do
         call integrate_nod_2D(relax_salt, net, mesh, partit)
         net = net/mesh%ocean_area
