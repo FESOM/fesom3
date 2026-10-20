@@ -153,7 +153,10 @@ program fesom_conserve
     integer         :: whichevp                ! FESOM3_WHICHEVP
     type(t_ice)     :: ice
     type(t_atmflux) :: atm
-    real(kind=WP)   :: icemass0(3), icemass(3), idrift(3), klon, kwave
+    ! sea-ice masses: budgets in WP_full like content/volume (real64 in a single-precision
+    ! build, where a real32 sum over the nodes alone rounds at ~1e-6 relative; == WP in double)
+    real(kind=WP_full) :: icemass0(3), icemass(3), idrift(3)
+    real(kind=WP)   :: klon, kwave
     real(kind=WP)   :: divsum_tol, shmax(4)    ! FESOM3_DIVSUM_TOL; run maxima: ratio, dUV, dAB, dsig
     logical         :: shared_ok
     character(len=24) :: verdict
@@ -592,10 +595,10 @@ program fesom_conserve
     drift(1) = reldrift(content(1), content0(1))
     drift(2) = reldrift(content(2), content0(2))
     vdrift   = reldrift(volume, volume0)
-    idrift   = 0.0_WP
+    idrift   = 0.0_WP_full
     if (use_ice) then
         do i_ice = 1, 3
-            idrift(i_ice) = reldrift(real(icemass(i_ice), WP_full), real(icemass0(i_ice), WP_full))
+            idrift(i_ice) = reldrift(icemass(i_ice), icemass0(i_ice))
         end do
     end if
     if (partit%mype == 0) then
@@ -824,12 +827,12 @@ contains
         !     the quantity the ice FCT conserves (Task 16); finite ice velocity and tracers
         if (use_ice) then
             do i = 1, 3
-                acc = 0.0_WP
+                accf = 0.0_WP_full
                 do j = 1, nNodO
-                    acc = acc + ice%work%fct_lumpedmass(j)*ice%data(i)%values(j)
+                    accf = accf + real(ice%work%fct_lumpedmass(j), WP_full)*ice%data(i)%values(j)
                 end do
-                if (partit%npes > 1) call allreduce_sum(acc, partit)
-                icemass(i) = acc
+                if (partit%npes > 1) call allreduce_sum(accf, partit)
+                icemass(i) = accf
             end do
             do j = 1, nNodO
                 if (.not. finite(ice%uice(j)) .or. .not. finite(ice%vice(j))) then
