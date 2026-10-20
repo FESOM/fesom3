@@ -8,7 +8,7 @@ module mod_dyn
     !
     ! Aux 3D WORK fields (density/N^2/Kv/Av/hpressure/sw_alpha-beta/GM slopes, D5)
     ! are added to t_dyn_work at M2.1 with verified FESOM2 names.
-    use mod_precision, only: WP
+    use mod_precision, only: WP, WP_full
     use, intrinsic :: iso_fortran_env, only: int32
     use mod_binary_arrays, only: write_bin_array, read_bin_array
     implicit none
@@ -174,10 +174,11 @@ module mod_dyn
         real(kind=WP), allocatable, dimension(:,:)   :: se_vn         ! (2,nElemO): flow viscosity W(U^n), frozen over a step
         ! FESOM3_SE_CHECK: the area-mean elevation at the start of the run (set by the first
         ! se_check_core of this process), the reference of the mean-sea-level change, and the
-        ! part of that change the freshwater explains (non-linfs; accumulated per check)
-        real(kind=WP) :: se_msl0     = 0.0_WP
-        logical       :: se_msl0_set = .false.
-        real(kind=WP) :: se_fwmsl    = 0.0_WP
+        ! part of that change the freshwater explains (non-linfs; accumulated per check).
+        ! Diagnostic integrals: WP_full (real64 in a single-precision build, == WP in double)
+        real(kind=WP_full) :: se_msl0     = 0.0_WP_full
+        logical            :: se_msl0_set = .false.
+        real(kind=WP_full) :: se_fwmsl    = 0.0_WP_full
 
         ! ---- sub-objects ----
         type(t_solverinfo) :: solverinfo
