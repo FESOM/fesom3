@@ -315,3 +315,134 @@ precision: FESOM_F-SP is deterministic per rank count, so a JAX SP oracle compar
 level, not bitwise, unless the summation orders already matched in DP (they do in fesom3_jax's CPU gate).
 XLA must not fuse float64 accumulations into float32 (watch `jnp` dtype promotion: a float32 array times
 a Python float stays float32 — use explicit `.astype(jnp.float64)` at every WP_full point).
+
+## 7. Rebased on split-explicit (fb92d87)
+
+**Date:** 2026-10-20. **Branch:** `single-precision-se` (local, not pushed), worktree
+`/work/ab0995/a270088/fesom3_sp_se`: the seven commits of `single-precision` replayed on
+`origin/split-explicit` fb92d87 (PR #3), plus two commits for split-explicit (SE) in SP. The DP
+reference is a build of fb92d87 in the detached worktree `/work/ab0995/a270088/fesom3_se_refbuild`.
+Run output: `/work/ab0995/a270088/fesom3_sp_runs/se_rebase/`.
+
+**Conflicts (two, both resolved by keeping both sides):**
+- `src/drivers/fesom_lifecycle_native_mr.F90`: SE's `dstat(10)` = max CFL_z in the step diagnostic
+  next to SP's `dsum` in WP_full (`real(ssh_rhs_old, WP_full)`, reduced as `MPI_WP_FULL`).
+- `src/infra/mod_halo.F90`: SE's `allreduce_max_r1` (vector MAX for SE_CHECK) next to SP's
+  `allreduce_max_f0`, `allreduce_sum_f0/f1` (SP only) and `exchange_nod_h`.
+
+**What SE needed for SP.** Nothing to compile: library, all 33 drivers and all test programs
+(including `test_ssh_se`) build in SP unchanged. The SE arithmetic stays in WP, i.e. real32 in SP:
+the elevation and transport rings, the AB3/AM4 substeps, the mean transport, the trim, the depth
+law and the CFL-guard power iteration (the JAX SP port keeps SE in float32 too). Two diagnostic
+commits, DP-neutral under rule 1 (identity casts, unchanged operation order):
+- `0aa8737` SE_CHECK integrals in WP_full: the mean-sea-level area sums of `se_check_values`,
+  `dyn%se_msl0`, `dyn%se_fwmsl`, and the `hnode` layer sum of `se_check_tail_values` (a real32 sum
+  of a 4000 m column rounds at 2.4e-4 m). The SP model state is unchanged (pi checkpoint
+  identical before/after).
+- `ff64992` sea-ice mass budgets of `fesom_conserve` in WP_full. The SP port had moved the tracer
+  content and volume to WP_full but not the three ice masses; their real32 sum over the nodes rounds
+  at ~1e-6 relative by itself, so the zstar + SE + sea-ice case that the SE branch adds to
+  `tools/run_conserve_pi.sh` failed at TOL = 1e-6 (ice drift −1.5e-6; the same case with the CG
+  solver gives −2.2e-6, job 28268546/28268547). With the fix the largest SP ice drift is 3.5e-8.
+
+**Gates** (`compute`, Intel, `env.sh intel`; job scripts as in §4; checkpoint comparison = `diff -rq`
+of the final checkpoint folders, 354 files with SE off, 464 with SE on):
+
+| check | code | job | result |
+|---|---|---|---|
+| SP build (library, drivers, tests) | a59c961, ff64992 | interactive allocation | compiles, no SP changes needed |
+| DP pi np 2, 144 steps, SE off: fb92d87 vs rebased | a59c961 | 28268373 | identical |
+| DP pi np 2, 144 steps, `FESOM3_SSH_SE=1` | a59c961 | 28268374 | identical |
+| DP CORE2 dist_512, 72 steps, SE off | a59c961 | 28268375 | identical |
+| DP CORE2 dist_512, 72 steps, SE on | a59c961 | 28268376 | identical |
+| ctest DP, fb92d87 / rebased | a59c961 | 28268377 / 28268378 | 176/176 / 176/176 |
+| `run_conserve_pi.sh` DP, fb92d87 | fb92d87 | 28268379 | GATE OK |
+| the same four checkpoint pairs at HEAD | ff64992 | 28268577 / 28268578 / 28268579 / 28268580 | identical / identical / identical / identical |
+| ctest DP at HEAD | ff64992 | 28268581 | 176/176 |
+| `run_conserve_pi.sh` DP at HEAD | ff64992 | 28268582 | GATE OK, log byte-identical to fb92d87's |
+| SP pi np 2, 240 steps, SE on (+ STEP_DIAG, SE_CHECK) | a59c961; 0aa8737 code | 28268353; 28268438 | stable, finite; the two checkpoints identical |
+| SP / DP CORE2 dist_512, 1488 steps, SE on | 0aa8737 code (= HEAD for this driver) | 28268439 / 28268441 | stable, all fields finite |
+| `run_conserve_pi.sh` SP, TOL = 1e-6, SE tolerances report-only | before ff64992 / ff64992 | 28268442 / 28268583 | 1 failure (ice budget, above) / GATE OK |
+| ctest SP | ff64992 | 28268584 | 84 of 176 pass (SP branch: 80 of 167), see below |
+
+**SP with SE, pi** (np 2, 5 days, job 28268438): step 240 max|η| 3.5166 m (DP 3.5163; SP with the CG
+solver gives 2.10 m, §4, so the higher maximum comes with the method, not the precision), max|u| 0.777 m/s (DP 0.766),
+divsum 8.4e-9 (DP 4.3e-17; SP with CG 1.1e-7). CFL guard identical to DP (ω_max 5.9801e-3 1/s,
+M_min 8 for M = 50). SE_CHECK run maxima SP / DP: etacomp 2.9e-6 / 4.9e-15 m, trim 2.4e-4 / 4.5e-13
+m²/s (max|U| 915 m²/s), |msl| 5.0e-8 / 3.5e-16 m, copy spreads 0 in both.
+
+**SP with SE, CORE2 one month** (dist_512, Jan 1958, production physics + `FESOM3_SSH_SE=1`, M = 50,
+CFL guard M_min = 40 in both precisions). Per step (ms, mean over ranks), next to the CG pair of §4
+(jobs 28257097 / 28257111, commit 2fbcc8f):
+
+| | DP SE | SP SE | SP/DP | DP CG | SP CG |
+|---|---|---|---|---|---|
+| LOOP TOTAL | 40.18 | 32.23 | **0.802** | 43.22 | 35.69 |
+| ocean step | 24.07 | 16.86 | 0.70 | 27.17 | 20.28 |
+| — SSH part (dynamics ssh) | 4.55 | 3.62 | 0.80 | 7.76 | 7.02 |
+| — of which SE barotropic substeps / CG solve | 3.79 | 3.07 | 0.81 | 6.77 | 6.40 |
+| — mix, pressure, EOS | 3.19 | 2.31 | 0.73 | 3.16 | 2.32 |
+| — dynamics u,v,w | 4.89 | 3.35 | 0.69 | 4.86 | 3.35 |
+| — GM / Redi | 2.41 | 1.57 | 0.65 | 2.38 | 1.57 |
+| — tracers | 9.04 | 6.01 | 0.67 | 9.01 | 6.02 |
+| sea ice | 8.62 | 8.06 | 0.93 | 8.55 | 8.10 |
+| forcing | 6.32 | 6.52 | 1.03 | 6.35 | 6.52 |
+| job wall time | 87 s | 78 s | 0.90 | 92 s | 79 s |
+
+At 512 ranks the SE substeps (per substep one 2-D node halo exchange and, with the default BT
+viscosity, one element exchange; no reductions) cost 0.56 of the CG
+solve in DP and 0.48 in SP; unlike the latency-bound CG, they gain ~20 % from SP.
+
+State on day 31 (`compare_ckpt.py`), SP − DP with SE next to SP − DP with CG (§4 Gate 3):
+
+| quantity | DP SE | SP SE − DP SE | SP CG − DP CG |
+|---|---|---|---|
+| area-mean SST [°C] | 18.264090 | −3.2e-06 | −1.16e-05 |
+| area-mean SSS [psu] | 34.6611805 | −5.5e-06 | −4.0e-07 |
+| sea-ice area NH / SH [10^6 km²] | 15.30033 / 9.54767 | +1.5e-05 / +1.7e-04 | +8.7e-05 / +1.14e-04 |
+| sea-ice volume NH / SH [10^3 km³] | 19.55625 / 19.03312 | +1.4e-04 / +3.2e-04 | +1.0e-04 / +1.4e-04 |
+| SSH rms [m] | 0.6444626 | −3.6e-06 | −1.5e-06 |
+| global-mean SSH [m] | 8.6e-17 | SP: +3.8e-09 | SP: −9.8e-10 |
+| pointwise area-rms SST / SSS / SSH / a_ice | | 2.5e-3 / 1.3e-3 / 1.3e-4 m / 4.6e-4 | 2.5e-3 / 1.3e-3 / 1.05e-4 m / 4.7e-4 |
+
+The precision differences with SE are at the level of those with CG. For scale, the method
+difference DP SE − DP CG after the same month (against the §4 DP run, job 28257097) is 5 to 55 times
+larger (SST rms 1.2e-2, SSS 6.6e-3, SSH 7.2e-3 m, a_ice 3.4e-3; ice area NH −8.5e-3).
+
+**Conservation in SP with SE** (`run_conserve_pi.sh`, 20 steps, |relative drift|, job 28268583):
+
+| | heat | salt | volume |
+|---|---|---|---|
+| zstar, CG (21 cases) | 3.5e-14 … 4.2e-12 | 1.5e-14 … 8.3e-13 | 6.8e-14 … 4.9e-13 |
+| zstar, SE (6 cases, np 1/2/8) | 1.7e-12 … 1.5e-11 | 6.6e-13 … 2.1e-12 | 8.9e-14 … 2.2e-12 |
+
+SE_CHECK run maxima in SP (DP in brackets): etacomp 0.9–1.0e-6 m (2e-15), trim 6–9e-5 m²/s for
+max|U| 425 m²/s (1.7e-13), |msl| 3–15e-9 m (8e-17), spreads 0; zstar tail: laysum 0.8–1.3e-7 m,
+w1 5.2–6.1e-10 m/s (1.3e-18), hlaw 2.9–3.4e-3 m (6.4e-12; the real32 rounding of 4000 m column sums of
+`helem`, about 7 ulp relative, in the model's `se_H` and in the check alike).
+
+**Why SE in SP closes worse than CG in SP, and why it is left as is.** The elevation is advanced in
+the M = 50 substeps, `eta^{m+1} = eta^m + I(U*)·dtbt/areasvol`, and every substep rounds `eta` to
+real32 on every node; these per-node roundings do not telescope. With CG the elevation is rounded once
+per baroclinic step. So in SP `eta^{n+1} − eta^n` differs from `tau·I(<<U>>)/areasvol` by the
+accumulated substep rounding (etacomp ~1e-6 m), the mean sea level does a random walk (pi: 12,000
+roundings per node over 240 steps, of order 3e-6 m per node and 3e-6 m/√3140 ≈ 6e-8 m for the area
+mean, measured 5e-8 m), and
+under zstar the same mismatch shows up as w(1) ≈ etacomp/tau ≈ 5e-10 m/s and a volume drift
+≈ msl/depth ≈ 2e-12 per 20 steps. The CORE2 month gives a global-mean SSH of +3.8e-9 m in SP with SE
+(−9.8e-10 with CG). All of this is real32 rounding at well below the precision differences above;
+nothing here shows that SE needs real64. If a tighter closure is ever wanted, two DP-neutral options:
+commit `eta^{n+1} = eta^n + tau·ssh_rhs_old/areasvol` at the end of the step (one rounding, as CG;
+mathematically equal to eta^M), or carry the substep elevation in WP_full. Neither was done.
+
+**ctest in SP** (job 28268584): 84 of 176 pass. Against the SP branch's SP ctest (§4b): every
+test that passed there still passes. Of the nine SE tests, the four `fesom_conserve_se_*` cases for
+linfs and for the knob and CFL-guard refusals pass. `fesom_conserve_se_zstar_np1/np2` fail at their
+TOL = 1e-12 (the same physics passes `run_conserve_pi.sh` at 1e-6), and `test_ssh_se_np1` fails 42
+round-off assertions (adjointness, closed-basin sums, trim and eta-compatibility to ~1e-14, as in
+§4b). `test_ssh_se_np2/np8` are not run because they need the np1 fixture. None of these failures
+is a crash. `test_geom_mixed_np2` now times out instead of failing; it is one of the §4b tests that
+pass `MPI_DOUBLE_PRECISION` on WP buffers, and split-explicit does not touch it.
+
+**For the JAX port:** SE stays float32 in the SP policy (§6); only the SE_CHECK diagnostic
+integrals are float64.
