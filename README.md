@@ -196,9 +196,10 @@ export FESOM3_STEP_PER_DAY=48                        # 1800 s on CORE2; 72 (1200
 
 > **On/off switches are presence-based.** `FESOM3_FER_GM`, `FESOM3_REDI`, `FESOM3_MIX_TKE`,
 > `FESOM3_MIX_KPP`, `FESOM3_SW_PENE`, `FESOM3_CHL_SWEENEY`, `FESOM3_WSPLIT`, `FESOM3_SHEAR_SPLINES`,
-> `FESOM3_N2_SPLINES` and `FESOM3_STEP_DIAG` are on whenever the variable is set and not empty, also
-> for `=0`; leave it unset to turn the option off. `FESOM3_MOMADV_OPT`, `FESOM3_RVO_UPWIND`,
-> `FESOM3_WSPLIT_MAXCFL`/`_MINCFL` and `FESOM3_SHARED_SYNC` take values.
+> `FESOM3_N2_SPLINES`, `FESOM3_IC_EXTRAP_DET` and `FESOM3_STEP_DIAG` are on whenever the variable is set
+> and not empty, also for `=0`; leave it unset to turn the option off. `FESOM3_MOMADV_OPT`,
+> `FESOM3_RVO_UPWIND`, `FESOM3_WSPLIT_MAXCFL`/`_MINCFL`, `FESOM3_IC_EXTRAP_TOL` and `FESOM3_SHARED_SYNC`
+> take values.
 
 **Where the knobs are defined.** The authoritative, always-current list of run variables is the
 environment block at the top of **`src/drivers/fesom_lifecycle_native_mr.F90`** (each is read with
@@ -210,6 +211,7 @@ examples. The most common variables:
 |---|---|
 | `FESOM3_MESH_DIR` | mesh directory (must contain `dist_<NP>/`) |
 | `FESOM3_IC_FILE` | initial T/S netCDF |
+| `FESOM3_IC_EXTRAP_DET`, `FESOM3_IC_EXTRAP_TOL` | cold start: fill the land-masked points of the initial T/S with FESOM2's deterministic fill (`ic_extrap_det`, PR #979): the same initial state on every `dist_<NP>`. Off by default (the historical fill, whose result depends on the partition and the node numbering); the tolerance of its relaxation defaults to `1e-3`. Read in `src/oce/oce_initial_state.F90` |
 | `FESOM3_FORCING_DIR`, `FESOM3_FORCING` | atmospheric forcing directory and set (`JRA55`/`CORE2`) |
 | `FESOM3_RUNOFF_FILE`, `FESOM3_SSS_FILE` | runoff and sea-surface-salinity restoring climatologies |
 | `FESOM3_START_CLOCK` | cold-start clock, `"timeofday day year"` |

@@ -354,6 +354,14 @@ ones:
   snow thickness (~1e-309 m) that FESOM2 flushed to exactly zero, which flipped an ice-albedo branch.
   The fix forces FTZ on at startup (`ieee_set_underflow_mode`), matching the FESOM2 process — a
   reminder that bit-identity depends on the floating-point *runtime mode*, not only the source.
+- **The cold start's hole filling (opt-in determinism).** FESOM2's `extrap_nod3D` fills the
+  land-masked points of the climatology by a Gauss-Seidel sweep per rank in local order, so the
+  cold start depends on the partition and on the node numbering (LESSONS L60; CORE2 np 1 vs
+  dist_512: up to 27 psu at single Baltic nodes). `FESOM3_IC_EXTRAP_DET` switches to FESOM2's
+  deterministic fill (`ic_extrap_det`, PR #979, `extrap_nod3D_det`): Jacobi sweeps, neighbour sums in
+  ascending global node id, a halo exchange after every sweep. The IC is then bit-identical on every
+  `dist_<NP>` (CORE2 np 1 to 512); a renumbered mesh sums in another order and agrees to roundoff.
+  Off by default, so the historical IC and every gate built on it are unchanged.
 - **A genuine, FESOM2-inherited floor.** At multiple ranks, element fields can differ by ~1 ULP on
   the ~562 elements that FESOM2's partitioning lets more than one rank "own"; the partition-
   independent stores deduplicate these. This is inherent to FESOM2 (its own netCDF restart shows it),

@@ -887,7 +887,9 @@ marked **decide** need a design decision.
    Gauss–Seidel IC extrapolation with per-rank halo snapshots) makes np 1 and np N start from different
    T/S at the extrapolated points; from one checkpoint the model is decomposition-independent to
    roundoff. A partition-independent sweep would change every production IC (details in "Gate
-   migration for hybrid meshes").
+   migration for hybrid meshes"). **Option available (2026-10-20, branch `ic-extrap-det`, L71):**
+   `FESOM3_IC_EXTRAP_DET` = FESOM2's own fix (`ic_extrap_det`, PR #979): the CORE2 IC is then
+   bit-identical at np 1–512; off by default. Whether production switches it on is still the decision.
 2. **Linear tracers are not advected exactly at triangle–quad interface nodes and on general quads**
    (Task 11) — **decide**: the median-dual edge scheme is linearly exact only where the dual cell is all
    triangles or all parallelograms; elsewhere the node tendency of a linear tracer in uniform flow has an
