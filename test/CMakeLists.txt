@@ -486,3 +486,42 @@ set_tests_properties(fesom_conserve_linfs_vinv_shsync_np2 PROPERTIES
     PASS_REGULAR_EXPRESSION "shared elements \\(sync ON\\).* -- OK within tol"
     FAIL_REGULAR_EXPRESSION "VIOLATED"
     SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+
+# Deterministic IC hole filling (FESOM3_IC_EXTRAP_DET, the port of FESOM2 PR #979 ic_extrap_det;
+# src/oce/oce_initial_state.F90 extrap_nod3D_det). fesom_icgather builds the cold-start T/S as
+# the lifecycle driver does and gathers it by global id: the np 1 run writes it (fixture), the
+# np 2 / np 8 runs must reproduce it bit for bit (pi_w: triangles; nemo025mix_cut: triangles +
+# quads). Teeth: with the historical fill (switch unset) the np 2 IC of pi_w differs from np 1.
+foreach(_case piw:${_mesh_piw}:8 mixcut:${_mesh_mix}:4)
+    string(REPLACE ":" ";" _pair ${_case})
+    list(GET _pair 0 _tag)
+    list(GET _pair 1 _mesh)
+    list(GET _pair 2 _npmax)
+    set(_ref ${CMAKE_CURRENT_BINARY_DIR}/icgather_det_${_tag}_np1.bin)
+    add_mesh_test(fesom_icgather_det_${_tag}_np1 fesom_icgather ${_mesh} 1
+                  FESOM3_IC_FILE=${_icf} FESOM3_IC_EXTRAP_DET=1 FESOM3_IC_OUT=${_ref})
+    set_tests_properties(fesom_icgather_det_${_tag}_np1 PROPERTIES FIXTURES_SETUP icdet_${_tag})
+    require_files(fesom_icgather_det_${_tag}_np1 ${_icf})
+    foreach(_np 2 ${_npmax})
+        add_mesh_test(fesom_icgather_det_${_tag}_np${_np} fesom_icgather ${_mesh} ${_np}
+                      FESOM3_IC_FILE=${_icf} FESOM3_IC_EXTRAP_DET=1 FESOM3_IC_REF=${_ref}
+                      FESOM3_IC_EXPECT=identical)
+        set_tests_properties(fesom_icgather_det_${_tag}_np${_np} PROPERTIES
+            FIXTURES_REQUIRED icdet_${_tag}
+            PASS_REGULAR_EXPRESSION "IC IDENTICAL"
+            FAIL_REGULAR_EXPRESSION "IC DIFFER")
+        require_files(fesom_icgather_det_${_tag}_np${_np} ${_icf})
+    endforeach()
+endforeach()
+set(_ref ${CMAKE_CURRENT_BINARY_DIR}/icgather_hist_piw_np1.bin)
+add_mesh_test(fesom_icgather_hist_piw_np1 fesom_icgather ${_mesh_piw} 1
+              FESOM3_IC_FILE=${_icf} FESOM3_IC_OUT=${_ref})
+set_tests_properties(fesom_icgather_hist_piw_np1 PROPERTIES FIXTURES_SETUP ichist_piw)
+require_files(fesom_icgather_hist_piw_np1 ${_icf})
+add_mesh_test(fesom_icgather_hist_piw_np2 fesom_icgather ${_mesh_piw} 2
+              FESOM3_IC_FILE=${_icf} FESOM3_IC_REF=${_ref} FESOM3_IC_EXPECT=differ)
+set_tests_properties(fesom_icgather_hist_piw_np2 PROPERTIES
+    FIXTURES_REQUIRED ichist_piw
+    PASS_REGULAR_EXPRESSION "IC DIFFER"
+    FAIL_REGULAR_EXPRESSION "IC IDENTICAL")
+require_files(fesom_icgather_hist_piw_np2 ${_icf})
