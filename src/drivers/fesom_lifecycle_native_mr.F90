@@ -94,6 +94,8 @@ program fesom_lifecycle_native_mr
     use oce_initial_state,  only: t_ic3d_config, do_ic3d
     use oce_muscl_adv,      only: muscl_adv_init
     use oce_ssh_rhs,        only: init_stiff_mat_ale
+    use oce_ssh_solve,      only: ssh_solve_preconditioner   ! zstar exact resume (cold-matrix preconditioner)
+    use oce_ale,            only: rebuild_thickness_ale      ! zstar exact resume (geometry from hnode)
     use mod_step_oce,       only: step_oce
     use mod_io_meshdiag,    only: meshdiag_write
     use mod_io_means,       only: t_io_means, t_io_config, t_io_entry, t_means_clock, MEANS_MAXF, &
@@ -914,14 +916,21 @@ program fesom_lifecycle_native_mr
     ! (the forcing build reads only the clock + atmosphere). restart_read resolves the folder via
     ! restart.latest under RestartInPath; clock_year/day/time_sec drive the time-vs-clock safety warning
     ! (time_sec is the sec-of-day == timenew, matching the folder tag + checkpoint.json convention).
+    ! FESOM3_RESTART_ZSTAR_EXACT=1 (read by restart_init; zstar only, rst%zstar_exact): the checkpoint
+    ! adds ssh_stiff + dhe, and the resume (1) builds the SSH Jacobi preconditioner from the COLD
+    ! matrix before restart_read replaces its values (a straight run builds it at its first solve,
+    ! where step 1 adds -dhe = 0, and keeps it), (2) rebuilds zbar_3d_n/Z_3d_n/helem/hnode_new from
+    ! the restored hnode after it. Then the resumed run is bitwise the straight one.
     if (do_restart) then
         call restart_init(rst, mesh, partit)
-        call restart_register_state(rst, dyn, tracers, ice, mesh, mix_scheme=mix_scheme_nmb)
+        call restart_register_state(rst, dyn, tracers, ice, mesh, mix_scheme=mix_scheme_nmb, partit=partit)
         if (partit%mype == 0) write(*,'(a,i0,a)') &
             'restart: registered ', rst%nf, ' prognostic fields -> '//trim(RestartOutPath)
         if (r_restart) then
+            if (rst%zstar_exact) call ssh_solve_preconditioner(dyn, mesh, partit)
             call restart_read(rst, trim(RestartInPath), mesh, partit, &
                               clock_year=yearnew, clock_day=daynew, clock_time_sec=real(timenew, real64))
+            if (rst%zstar_exact) call rebuild_thickness_ale(mesh, partit)
             if (partit%mype == 0) write(*,'(a,f9.1,a,i0,a,i0)') &
                 'restart: state restored (resumed run) at clock time=', timenew, ' day=', daynew, &
                 ' year=', yearnew

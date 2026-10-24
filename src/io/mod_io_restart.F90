@@ -41,8 +41,25 @@ module mod_io_restart
     ! restart_register_state, which maps the FULL oce+ice prognostic state (incl. EVP sigma and the
     ! real(MP) mesh%hbar/hnode via a lossless WP staging copy) to the registry. The READ path (which
     ! calls restart_resolve_latest and copies WP->MP back for mp_src fields) is Stage 4 (Task 4.1).
+    !
+    ! ZSTAR EXACT RESTART (FESOM3_RESTART_ZSTAR_EXACT=1, which_ALE='zstar' only). The default set
+    ! makes a zstar resume inexact: the SSH stiffness values accumulate -dhe every step
+    ! (update_stiff_mat_ale) and dhe is lagged one step, but a resume restarts from the cold
+    ! matrix with dhe = 0. With the switch the checkpoint adds two stores (restart_register_stiff):
+    !   ssh_stiff  node-indexed, W values per row (W = the longest row of the GLOBAL matrix):
+    !              slot 1 the diagonal, then the off-diagonals by ascending GLOBAL node index of
+    !              their column, zeros after the row's last entry; float64, a (W, nod2) store with
+    !              the slot coordinate 'nstiff' = 0..W-1. The CSR order (diagonal, edge neighbours
+    !              in local edge order, quad diagonals) depends on the partition, so stiff_pos maps
+    !              slot -> CSR position; restart_write packs, restart_read unpacks. fesom3_jax reads
+    !              and writes the same layout: keep it.
+    !   dhe        element 2-D (DECOMP_ELEM, owned-only like its consumer update_stiff_mat_ale).
+    ! The driver does the rest of the resume (fesom_lifecycle_native_mr): the Jacobi preconditioner
+    ! is built from the cold matrix BEFORE restart_read (a straight run builds it at its first solve,
+    ! where step 1 adds -dhe = 0), and rebuild_thickness_ale derives zbar_3d_n/Z_3d_n/helem/hnode_new
+    ! from the restored hnode after it.
     use mpi
-    use, intrinsic :: iso_fortran_env, only: real64
+    use, intrinsic :: iso_fortran_env, only: real64, error_unit
     use mod_precision,   only: WP, MP
     use mod_mesh,        only: t_mesh
     use mod_partit,      only: t_partit
@@ -55,6 +72,7 @@ module mod_io_restart
     use mod_io_coords    ! shared lon/lat + _ARRAY_DIMENSIONS + UGRID-attr embedding (Task 2.1)
     use mod_io_posix     ! POSIX fs shims: rename/fsync/rmtree/listdir for atomic finalize + prune (Task 3.1)
     use mod_halo,        only: exchange_nod, exchange_elem, exchange_elem_full   ! read-back halo recon (Task 4.1)
+    use mod_config,      only: which_ALE      ! the zstar exact restart applies to zstar only
     implicit none
     private
 
@@ -125,6 +143,14 @@ module mod_io_restart
         real(WP), allocatable :: lon_e(:), lat_e(:), rlon_e(:), rlat_e(:)
         integer,  allocatable :: nlev_e(:)
         real(WP), allocatable :: depth_nz(:), depth_nz1(:)  ! -zbar / -Z (CF positive-down depths)
+        ! zstar exact restart (FESOM3_RESTART_ZSTAR_EXACT=1; restart_register_stiff). zstar_exact is
+        ! read by restart_init and cleared by restart_register_state unless which_ALE == 'zstar'.
+        logical               :: zstar_exact = .false.
+        integer               :: stiff_w = 0                 ! W: longest row of the global matrix
+        integer,  allocatable :: stiff_pos(:,:)              ! (W, nNodO) CSR position of each slot, 0 = empty
+        real(WP), pointer     :: stiff_stage(:,:) => null()  ! (W, nNodO) slot layout, the 'ssh_stiff' store
+        real(MP), pointer     :: stiff_vals(:) => null()     ! live mesh%ssh_stiff%values
+        real(WP), allocatable :: stiff_slot(:)               ! slot coordinate 0..W-1
     end type t_restart
 
 contains
@@ -158,6 +184,14 @@ contains
         call read_env_int('FESOM3_RESTART_KEEP', R%restart_keep)
         cbuf = ''; call get_environment_variable('FESOM3_COMPRESSOR', cbuf)
         if (len_trim(cbuf) > 0) R%compressor = cbuf
+        ! zstar exact restart: 1 = on, 0 or unset = off (applied by restart_register_state)
+        cbuf = ''; call get_environment_variable('FESOM3_RESTART_ZSTAR_EXACT', cbuf)
+        select case (trim(cbuf))
+        case ('', '0'); R%zstar_exact = .false.
+        case ('1');     R%zstar_exact = .true.
+        case default
+            call restart_stop('restart: FESOM3_RESTART_ZSTAR_EXACT must be 1 or 0, not "'//trim(cbuf)//'"')
+        end select
         call local_dims(mesh, partit, R%nNodO, nNodL, nEdgeO, nEdgeL, R%nElemO, nElemL, nElemF)
         call decomp_init_entity(R%Dn, C, nw, DECOMP_NODE, mesh, partit)
         call decomp_init_entity(R%De, C, nw, DECOMP_ELEM, mesh, partit)
@@ -277,13 +311,16 @@ contains
     !                w w_expl w_impl (FULL nl) | tke (FULL nl, if mix_scheme==5)
     !     elem 3-D : u v urhs_AB vrhs_AB [urhs_AB3 vrhs_AB3 if dyn%AB_order==3]   (nl-1)
     !     elem 2-D : sigma11 sigma12 sigma22
-    subroutine restart_register_state(R, dyn, tracers, ice, mesh, mix_scheme)
+    !     zstar exact restart only (R%zstar_exact): ssh_stiff (node, W slots) | dhe (elem 2-D)
+    ! partit (optional) is needed only by the zstar exact restart at np>1 (global column ids).
+    subroutine restart_register_state(R, dyn, tracers, ice, mesh, mix_scheme, partit)
         type(t_restart), intent(inout)      :: R
         type(t_dyn),     intent(in), target :: dyn
         type(t_tracer),  intent(in), target :: tracers
         type(t_ice),     intent(in), target :: ice
         type(t_mesh),    intent(in), target :: mesh
         integer,         intent(in), optional :: mix_scheme
+        type(t_partit),  intent(in), optional :: partit
         real(WP), pointer :: p2(:), p3(:,:)
         real(MP), pointer :: q2(:), q3(:,:)
         integer           :: j, ms
@@ -351,7 +388,113 @@ contains
         p2 => ice%work%sigma11; call restart_register_field(R, 'sigma11', '', DECOMP_ELEM, p2d=p2)
         p2 => ice%work%sigma12; call restart_register_field(R, 'sigma12', '', DECOMP_ELEM, p2d=p2)
         p2 => ice%work%sigma22; call restart_register_field(R, 'sigma22', '', DECOMP_ELEM, p2d=p2)
+
+        ! ---- zstar exact restart: the accumulated SSH stiffness values + the lagged dhe ----
+        if (R%zstar_exact) then
+            if (trim(which_ALE) == 'zstar') then
+                call restart_register_stiff(R, mesh, partit)
+                ! dhe is computed and read over owned elements only -> no halo (element default)
+                q2 => mesh%dhe; call restart_register_field_mp(R, 'dhe', 'm', DECOMP_ELEM, pmp2d=q2)
+                if (R%mype == 0) write(*,'(a,i0,a)') 'restart: FESOM3_RESTART_ZSTAR_EXACT=1 -> '// &
+                    'checkpoint adds ssh_stiff (W=', R%stiff_w, ') and dhe, exact zstar resume'
+            else
+                if (R%mype == 0) write(*,'(a)') 'restart: FESOM3_RESTART_ZSTAR_EXACT=1 ignored, which_ALE='// &
+                    trim(which_ALE)//' (only zstar needs it; the linfs resume is exact without it)'
+                R%zstar_exact = .false.
+            end if
+        end if
     end subroutine restart_register_state
+
+    ! Register the 'ssh_stiff' store of the zstar exact restart (layout: module header). Builds the
+    ! slot -> CSR position map once: slot 1 = the diagonal (the first CSR entry of every row,
+    ! init_stiff_mat_ale), slots 2.. = the off-diagonals sorted by global column (insertion sort,
+    ! rows are short), so the store does not depend on the partition. W is the global maximum row
+    ! length. The field points at the stiff_stage buffer that restart_write fills (pack) and
+    ! restart_read empties (unpack); rows are owned-only, so no halo exchange.
+    subroutine restart_register_stiff(R, mesh, partit)
+        type(t_restart), intent(inout)        :: R
+        type(t_mesh),    intent(in), target   :: mesh
+        type(t_partit),  intent(in), optional :: partit
+        integer :: n, k, j, m, nini, nend, wloc, gc, ierr
+        integer, allocatable :: gcol(:)
+        call zarr_check(allocated(mesh%ssh_stiff%values), &
+                        'restart: ssh_stiff must be built (init_stiff_mat_ale) before restart_register_state')
+        call zarr_check(present(partit) .or. .not. R%mr, &
+                        'restart: the zstar exact restart needs partit at np>1 (restart_register_state)')
+        associate(S => mesh%ssh_stiff)
+        wloc = 0
+        do n = 1, R%nNodO
+            wloc = max(wloc, S%rowptr_loc(n+1) - S%rowptr_loc(n))
+        end do
+        R%stiff_w = wloc
+        if (R%mr) call MPI_Allreduce(wloc, R%stiff_w, 1, MPI_INTEGER, MPI_MAX, R%comm, ierr)
+        allocate(R%stiff_pos(R%stiff_w, max(1, R%nNodO)), gcol(R%stiff_w))
+        R%stiff_pos = 0
+        do n = 1, R%nNodO
+            nini = S%rowptr_loc(n); nend = S%rowptr_loc(n+1) - 1
+            call zarr_check(S%colind_loc(nini) == n, 'restart: an ssh_stiff row does not start with its diagonal')
+            R%stiff_pos(1, n) = nini
+            m = 0                                       ! off-diagonals sorted so far: gcol(1:m)
+            do k = nini + 1, nend
+                gc = S%colind_loc(k)
+                if (R%mr) gc = partit%myList_nod2D(gc)  ! local (owned or halo) -> global node id
+                j = m
+                do while (j >= 1)
+                    if (gcol(j) < gc) exit
+                    gcol(j+1) = gcol(j); R%stiff_pos(j+2, n) = R%stiff_pos(j+1, n)
+                    j = j - 1
+                end do
+                gcol(j+1) = gc; R%stiff_pos(j+2, n) = k
+                m = m + 1
+            end do
+        end do
+        end associate
+        allocate(R%stiff_stage(R%stiff_w, max(1, R%nNodO)))
+        R%stiff_stage = 0.0_WP
+        ! FESOM_F-SP (PR #4): store the real64 shadow ssh_stiff%values_full here instead of values.
+        R%stiff_vals => mesh%ssh_stiff%values
+        allocate(R%stiff_slot(R%stiff_w))
+        do j = 1, R%stiff_w
+            R%stiff_slot(j) = real(j - 1, WP)
+        end do
+        k = restart_new_field(R, 'ssh_stiff', 'm2/s', DECOMP_NODE, '8')
+        R%f(k)%ndim = 3
+        R%f(k)%nlev = R%stiff_w
+        R%f(k)%vdim = 'nstiff'
+        R%f(k)%halo = RESTART_HALO_NONE
+        R%f(k)%p3d  => R%stiff_stage
+    end subroutine restart_register_stiff
+
+    ! Live CSR values -> the slot layout (before a checkpoint write). Empty slots hold 0.
+    subroutine restart_stiff_pack(R)
+        type(t_restart), intent(in) :: R
+        integer :: n, k
+        do n = 1, R%nNodO
+            do k = 1, R%stiff_w
+                if (R%stiff_pos(k, n) > 0) then
+                    R%stiff_stage(k, n) = real(R%stiff_vals(R%stiff_pos(k, n)), WP)
+                else
+                    R%stiff_stage(k, n) = 0.0_WP
+                end if
+            end do
+        end do
+    end subroutine restart_stiff_pack
+
+    ! The slot layout -> live CSR values (after restart_read). A non-zero value in an empty slot
+    ! means the store belongs to another mesh: stop.
+    subroutine restart_stiff_unpack(R)
+        type(t_restart), intent(in) :: R
+        integer :: n, k
+        do n = 1, R%nNodO
+            do k = 1, R%stiff_w
+                if (R%stiff_pos(k, n) > 0) then
+                    R%stiff_vals(R%stiff_pos(k, n)) = real(R%stiff_stage(k, n), MP)
+                else if (R%stiff_stage(k, n) /= 0.0_WP) then
+                    call restart_stop('restart_read: ssh_stiff has a value in an empty slot (another mesh?)')
+                end if
+            end do
+        end do
+    end subroutine restart_stiff_unpack
 
     ! Tracer store name == FESOM2 ini_ocean_io CASE(id) (io_restart.F90:167-212): id keys the canonical
     ! name (1=temp, 2=salt, passive species by tracer ID), default 'tra'//j for an unlisted passive tracer.
@@ -417,6 +560,7 @@ contains
         end if
         if (R%mr) call MPI_Barrier(R%comm, ierr)           ! tmp folder must exist before any store write
         ! 2) every writer stages its field stores INTO the tmp folder; rank 0 stages checkpoint.json.
+        if (R%zstar_exact) call restart_stiff_pack(R)      ! live CSR -> the ssh_stiff slot layout
         do k = 1, R%nf
             call restart_write_field(R, R%f(k), trim(tmp_folder)//'/'//trim(R%f(k)%name)//'.zarr')
         end do
@@ -615,8 +759,13 @@ contains
             if (f%ndim == 3) then
                 call zarr_attrs_init(at)
                 call zattr_str_arr(at, '_ARRAY_DIMENSIONS', [character(len=8) :: f%vdim])
-                call zattr_str(at, 'long_name', 'depth'); call zattr_str(at, 'units', 'meters')
-                call zattr_str(at, 'positive', 'down')
+                if (trim(f%vdim) == 'nstiff') then      ! ssh_stiff: the row slot, not a depth
+                    call zattr_str(at, 'long_name', 'row slot: 0 = diagonal, then the off-diagonals '// &
+                                   'by ascending global column; 0 after the row end')
+                else
+                    call zattr_str(at, 'long_name', 'depth'); call zattr_str(at, 'units', 'meters')
+                    call zattr_str(at, 'positive', 'down')
+                end if
                 call zarr_define_array(store, a_vert, at)
             end if
             call io_coords_define_lonlat(store, a_lon, a_lat, f%hdim)
@@ -660,6 +809,8 @@ contains
         if (R%mype == 0 .and. f%ndim == 3) then
             if (trim(f%vdim) == 'nz') then
                 call zarr_write_whole(store, a_vert, R%depth_nz(1:R%nl))
+            else if (trim(f%vdim) == 'nstiff') then
+                call zarr_write_whole(store, a_vert, R%stiff_slot(1:R%stiff_w))
             else
                 call zarr_write_whole(store, a_vert, R%depth_nz1(1:R%nl-1))
             end if
@@ -699,7 +850,7 @@ contains
         integer,          intent(in), optional :: clock_year, clock_day
         real(real64),     intent(in), optional :: clock_time_sec
         character(len=:), allocatable :: folder
-        logical :: ok, have_json
+        logical :: ok, have_json, have_stiff, have_dhe
         integer :: k, jyear, jday, ierr
         real(real64) :: jtime
         call restart_resolve_latest(restart_dir, folder, ok)
@@ -714,10 +865,21 @@ contains
                     ' differs from clock time_sec=', clock_time_sec, ' (continuing)'
             end if
         end if
+        ! zstar exact restart: a checkpoint written without the switch lacks its two stores
+        if (R%zstar_exact) then
+            inquire(file=folder//'/ssh_stiff.zarr/.zgroup', exist=have_stiff)
+            inquire(file=folder//'/dhe.zarr/.zgroup', exist=have_dhe)
+            if (.not. (have_stiff .and. have_dhe)) call restart_stop('restart_read: FESOM3_RESTART_ZSTAR_EXACT=1 '// &
+                'but the checkpoint has no ssh_stiff/dhe stores (written without the switch): '//folder// &
+                ' -- unset FESOM3_RESTART_ZSTAR_EXACT to resume it inexactly')
+        end if
         ! restore + halo-reconstruct every field
         do k = 1, R%nf
             call restart_read_field(R, R%f(k), folder//'/'//trim(R%f(k)%name)//'.zarr', partit)
         end do
+        ! the slot layout -> live CSR values. The caller must have built the SSH preconditioner from
+        ! the cold matrix before this call (fesom_lifecycle_native_mr; module header).
+        if (R%zstar_exact) call restart_stiff_unpack(R)
         if (R%mr) call MPI_Barrier(R%comm, ierr)
     end subroutine restart_read
 
@@ -957,6 +1119,13 @@ contains
         write(u) text//char(10)
         close(u)
     end subroutine write_text_file
+
+    ! Stop with a one-line message (zarr_check's list-directed write may wrap a long line).
+    subroutine restart_stop(msg)
+        character(len=*), intent(in) :: msg
+        write(error_unit, '(a)') msg
+        error stop 1
+    end subroutine restart_stop
 
     subroutine read_env_int(name, val)
         character(len=*), intent(in)    :: name
