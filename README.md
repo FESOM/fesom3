@@ -239,7 +239,7 @@ examples. The most common variables:
 | `FESOM3_OUTPUT`, `FESOM3_OUTPUT_EVERY` | output directory (enables output) and step cadence |
 | `FESOM3_RESTART`, `FESOM3_RESTART_LENGTH`, `FESOM3_RESTART_UNIT` | checkpoint directory and cadence |
 | `FESOM3_SHARED_SYNC` | shared border elements: `1` (default) = every step the other owners take the designated owner's `uv` (no volume leak, exact np>1 restarts); `0` = off, the old unsynced copies (A/B comparisons only). Read in `src/infra/mod_shared_elem.F90` |
-| `FESOM3_STEP_DIAG` | per-step global diagnostic line (max\|eta\|, max\|uv\|, ice, Tmax, Smax, and the shared-element numbers `divsum=`, `dUV=`, `dAB=`, `dsig=`); two extra collectives per step, off by default. Under zstar a second line per step, `salt step`: the ocean + sea-ice salt content, the step's residual (change minus the balanced SSS restoring; roundoff when salt is conserved) and the ice salt the conserving cut_off returned |
+| `FESOM3_STEP_DIAG` | per-step global diagnostic line (max\|eta\|, max\|uv\|, ice, Tmax, Smax, and the shared-element numbers `divsum=`, `dUV=`, `dAB=`, `dsig=`); two extra collectives per step, off by default. Under zstar a second line per step, `salt step`: the ocean + sea-ice salt content, the step's residual (change minus the balanced SSS restoring; roundoff when salt is conserved) and the ice salt the conserving cut_off returned (one more collective) |
 | `FESOM3_SSH_SOLTOL`, `FESOM3_SSH_MAXITER` | SSH solver tolerance and iteration cap — test/diagnostic only, read in `src/oce/oce_ssh_solve.F90` (defaults `1e-5`, `2000`) |
 
 > **Configuration today vs. intent.** The production drivers are configured by these `FESOM3_*`
