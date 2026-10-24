@@ -110,7 +110,7 @@ assembled step — data flow and dispatch — is byte-faithful, not just the ker
 
 ### 5. The `ctest` self-test suite
 
-`test/CMakeLists.txt` registers **167 ctest cases**, run on the Intel and GNU builds. The core
+`test/CMakeLists.txt` registers **168 ctest cases**, run on the Intel and GNU builds. The core
 infrastructure cases:
 
 | Test | Ranks | Checks |
@@ -131,6 +131,7 @@ infrastructure cases:
 | `fesom_analytic` | 1, 2 | end-to-end analytic driver runs clean |
 | `test_shared_elem` (+ `_corrupt`, `_badknob`, `_off`) | pi 1/2/8, pi_w 2/4, cut-outs 2, core2_w 8 | shared elements: the list `com_elem2D_shared` vs an allgather oracle (S1), its exchange and the copy-spread probe (S2), the mechanism through `update_vel` + `compute_hbar_ale` with the sync on and off (S3: divergence-sum ratio ~1e-17 vs 1e-5..4e-4); the error stops and `FESOM3_SHARED_SYNC=0` |
 | `fesom_conserve_linfs_vinv_shsync` | 2 | linfs, vector invariant with `rvo_upwind` 1, sea ice: divergence-sum ratio < 1e-12 and zero shared-copy spreads in every step (`FESOM3_DIVSUM_TOL`) |
+| `fesom_cutoff_conserve_pi_w` | 1, 2 | conserving sea-ice cut_off (`FESOM3_ICE_CUTOFF_CONSERVE`, §6c): `tools/run_cutoff_conserve_pi.sh` with 48 steps of a June cold start on pi_w (JRA55, production driver): zstar ocean + ice salt closes per step with the switch, loses the cut ice's salt without it; linfs with it runs; a bad value stops |
 
 Kernel tests from the bottom-at-vertices and momentum work (`test_vert_spline`, `test_vinv`,
 `test_muscl_onthefly`, `test_ivertvisc`, `test_wsplit`, `test_wimpl_tra`, `test_minlayers`, the
@@ -156,7 +157,7 @@ The mesh-dependent hybrid cases read meshes from the hard-coded root `/work/ab09
 (`test/CMakeLists.txt`). Whether a mesh exists is decided at configure time
 (`if(EXISTS <meshes>/<mesh>/nod2d.out)`): a case whose mesh is absent is registered as DISABLED
 (ctest prints "Not Run (Disabled)"); a missing `dist_N`/`com_info` file in an existing mesh
-directory FAILS. "167/167 passed" therefore holds on a filesystem that has these meshes. The
+directory FAILS. "168/168 passed" therefore holds on a filesystem that has these meshes. The
 shared-element guards live in existing tests: `test_vinv` V13 (`uv_rhsAB` copies bitwise equal with
 the upwind blend on) and `test_ice_dyn_mixed` D6 (EVP/mEVP sigma copies bitwise equal), at np>1.
 
@@ -176,8 +177,9 @@ cd build_intel_dp && ctest --output-on-failure
 > `run_ice*_gate*`.
 >
 > The **self-consistency** gates are not oracle-dependent and remain the live net:
-> `run_conserve_pi.sh` (§6a), `run_restartroundtrip.sh`, `run_output_gate.sh` (partition
-> independence), the restart straight-vs-resume gates, and `run_bottom_audit.sh` (§6a).
+> `run_conserve_pi.sh` (§6a), `run_cutoff_conserve_pi.sh` (§6c), `run_restartroundtrip.sh`,
+> `run_output_gate.sh` (partition independence), the restart straight-vs-resume gates, and
+> `run_bottom_audit.sh` (§6a).
 > The table below documents the gates as they were built; treat the oracle rows as history.
 
 Beyond the self-tests, byte-gates cover each subsystem as it was built. They live in `tools/` as
@@ -270,6 +272,36 @@ for hybrid meshes"):
   partitions).
 - The Python mesh tools have their own suites: `tools/mesh/test_nemo_meshq.sh`,
   `tools/mesh/test_mesh_tools.sh`.
+
+### 6c. The conserving sea-ice cut_off gate
+
+**`tools/run_cutoff_conserve_pi.sh`.** FESOM2's `cut_off` deletes the ice and snow where `a_ice`
+or `m_ice` falls below 1e-9 without a flux; `FESOM3_ICE_CUTOFF_CONSERVE=1` melts them into the
+ocean in the same step (`src/ice/mod_ice_thermo.F90`: `cut_off` records the
+deleted amounts, `thermodynamics` returns their fresh water and ice salt and counts them as negative
+growth in `thdgr`/`thdgrsn`; latent heat not returned). The tool runs the production driver
+(`fesom_lifecycle_native_mr`, the physics of `tools/prod_env.sh`, SSH at the production defaults) on
+pi_w from a cold start on 1 June 1958, when the Antarctic ice edge advances and `cut_off` fires every
+step. Under zstar `FESOM3_STEP_DIAG` prints a `salt step` line per step: the ocean + ice salt
+`sum(areasvol*hnode*S) + Sice*rhoice/rhowat*sum(areasvol*m_ice)`, the residual (summed per node:
+change minus `dt*sum(areasvol*relax_salt)`) and the ice salt the conserving cut_off returned. With
+the switch the residual must stay below `1e-15` of the content per step and `1e-14` over the run;
+without it the run must lose more than `1e-14`. With `REF_BIN` (a build of the base commit) the
+switch-off runs (zstar and linfs) write checkpoints and must match it byte for byte.
+
+Measured 2026-10-24, Intel dp, 192 steps (content `4.74e19` psu m³):
+
+| run | np | max \|residual\| per step | residual over 192 steps | ice salt returned by cut_off |
+|---|---|---|---|---|
+| zstar, switch on | 1 | `8.3e2` | `-5.2e2` | `3.49e8` |
+| zstar, switch on | 2 | `1.0e3` | `+8.6e2` | `3.68e8` |
+| zstar, switch off | 1 | `1.75e7` | `-3.71e8` (days 1-4: `-1.78e7`, `-6.20e7`, `-1.89e8`, `-3.71e8`) | — |
+| zstar / linfs, switch off vs base commit | 1 | — | checkpoints: 1418 / 1418 files, none differ | — |
+
+The switch-off loss agrees with the fesom3_jax port's budget of the same start (`-3.72e8`, from
+FESOM_F's GNU oracle build, which that port reproduces bit for bit; there the whole loss is `cut_off`). The residual of a conserving step is the roundoff of the column sums (~1e3 psu m³, 2e-17
+of the content). The ctest `fesom_cutoff_conserve_pi_w` runs the same cases for 48 steps
+(np 1: max residual `6.2e2`, returned `1.78e7`; off: `-1.78e7`).
 
 ### 7. Multi-rank and partition independence
 

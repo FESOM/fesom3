@@ -474,6 +474,23 @@ add_mesh_test(test_shared_elem_off_np2 test_shared_elem ${_mesh_pi} 2
 set_tests_properties(test_shared_elem_off_np2 PROPERTIES
     PASS_REGULAR_EXPRESSION "shared-element sync: OFF, [0-9]+ shared elements.*ALL PASS"
     FAIL_REGULAR_EXPRESSION "FAIL")
+# Conserving sea-ice cut_off (FESOM3_ICE_CUTOFF_CONSERVE, src/ice/mod_ice_thermo.F90) in the production
+# driver: tools/run_cutoff_conserve_pi.sh, pi_w, JRA55, cold start 1 June 1958, 48 steps (the Antarctic
+# ice edge advances and cut_off fires from the first day). zstar with the switch at np 1 and 2: ocean +
+# ice salt closes per step (the driver's "salt step" budget line) and cut_off returned ice; zstar
+# without it: the loss is visible (-1.8e7 psu m^3 on day 1); linfs with it runs; a bad value stops.
+# Logs only (no REF_BIN), in a new cutoff_conserve.XXXXXX under the test build directory.
+string(REPLACE ";" " " _mpiflags_str "${FESOM3_MPI_LAUNCH_FLAGS}")
+set(_jra /pool/data/AWICM/FESOM2/FORCING/JRA55-do-v1.4.0)
+add_test(NAME fesom_cutoff_conserve_pi_w
+         COMMAND env BIN=$<TARGET_FILE:fesom_lifecycle_native_mr> MPIRUN=${FESOM3_MPIEXEC}
+                 "MPIFLAGS=${_mpiflags_str}" MESH=${_mesh_piw}
+                 bash ${CMAKE_SOURCE_DIR}/tools/run_cutoff_conserve_pi.sh 48
+         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+set_tests_properties(fesom_cutoff_conserve_pi_w PROPERTIES
+    PASS_REGULAR_EXPRESSION "run_cutoff_conserve_pi: GATE OK"
+    FAIL_REGULAR_EXPRESSION "GATE FAILED")
+require_files(fesom_cutoff_conserve_pi_w ${_mesh_piw}/nod2d.out ${_icf} ${_jra}/CORE2_runoff.nc)
 # Shared-element gate in the full model (fesom_conserve, header SHARED ELEMENTS): linfs,
 # vector-invariant momentum with rvo_upwind 1 (the CORE2 leak's trigger), sea ice, np 2.
 # FESOM3_DIVSUM_TOL=1e-12: the divergence-sum ratio must stay below 1e-12 in every step and
