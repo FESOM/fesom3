@@ -65,6 +65,9 @@ conservation, mesh-delta, regression and self-consistency gates take its place
   - A run resumed from a restart now matches a straight run bit for bit at np > 1.
 - **Zarr I/O:** the chunk writer and reader no longer copy through `transfer()`. This fixes the
   end-of-run restart crash on large meshes.
+- **Exact `zstar` restart (opt-in):** with `FESOM3_RESTART_ZSTAR_EXACT=1` a `zstar` checkpoint also
+  holds the SSH stiffness values and `dhe`, and a resumed run matches the straight run bit for bit.
+  Without it a `zstar` resume continues from the cold stiffness matrix and geometry (not bitwise).
 
 Production runs on Levante with these changes conserve volume to roundoff: CORE2 on 512 ranks (about
 95 model years per day) and the NEMO ORCA025 quad mesh on 1280 ranks (about 29 model years per day).
@@ -202,8 +205,9 @@ export FESOM3_STEP_PER_DAY=48                        # 1800 s on CORE2; 72 (1200
 
 **Where the knobs are defined.** The authoritative, always-current list of run variables is the
 environment block at the top of **`src/drivers/fesom_lifecycle_native_mr.F90`** (each is read with
-`get_environment_variable`); the SSH solver knobs and `FESOM3_SHARED_SYNC` in the table below are read
-where they act (the solver, `src/infra/mod_shared_elem.F90`). The `tools/*.sbatch` and `tools/run_lifecycle_*.sh` scripts are working
+`get_environment_variable`); the SSH solver knobs, `FESOM3_SHARED_SYNC` and `FESOM3_RESTART_ZSTAR_EXACT`
+in the table below are read where they act (the solver, `src/infra/mod_shared_elem.F90`,
+`src/io/mod_io_restart.F90`). The `tools/*.sbatch` and `tools/run_lifecycle_*.sh` scripts are working
 examples. The most common variables:
 
 | Variable | Meaning |
@@ -225,6 +229,7 @@ examples. The most common variables:
 | `FESOM3_WSPLIT`, `FESOM3_WSPLIT_MAXCFL`, `FESOM3_WSPLIT_MINCFL` | Courant-dependent explicit/implicit w split; explicit CFL cap (default `1.0`) and onset (default half the cap) |
 | `FESOM3_OUTPUT`, `FESOM3_OUTPUT_EVERY` | output directory (enables output) and step cadence |
 | `FESOM3_RESTART`, `FESOM3_RESTART_LENGTH`, `FESOM3_RESTART_UNIT` | checkpoint directory and cadence |
+| `FESOM3_RESTART_ZSTAR_EXACT` | `1` = exact `zstar` resume: the checkpoint adds the stores `ssh_stiff` (SSH stiffness values) and `dhe`, and the resume rebuilds the `zstar` geometry from `hnode`; set it for the run that writes and the run that reads. `0` or unset = off (default; a `zstar` resume then differs from the straight run). Ignored with one log line under `linfs`, whose resume is exact anyway; resuming a checkpoint without the two stores with it on stops. Read in `src/io/mod_io_restart.F90` |
 | `FESOM3_SHARED_SYNC` | shared border elements: `1` (default) = every step the other owners take the designated owner's `uv` (no volume leak, exact np>1 restarts); `0` = off, the old unsynced copies (A/B comparisons only). Read in `src/infra/mod_shared_elem.F90` |
 | `FESOM3_STEP_DIAG` | per-step global diagnostic line (max\|eta\|, max\|uv\|, ice, Tmax, Smax, and the shared-element numbers `divsum=`, `dUV=`, `dAB=`, `dsig=`); two extra collectives per step, off by default |
 | `FESOM3_SSH_SOLTOL`, `FESOM3_SSH_MAXITER` | SSH solver tolerance and iteration cap — test/diagnostic only, read in `src/oce/oce_ssh_solve.F90` (defaults `1e-5`, `2000`) |
@@ -237,7 +242,8 @@ examples. The most common variables:
 **Restart.** Set `FESOM3_RESTART=<dir>` to write checkpoints (cadence via `FESOM3_RESTART_LENGTH` /
 `FESOM3_RESTART_UNIT`). On the next launch, if a complete checkpoint is found under that directory
 (a `restart.latest` pointer to a folder containing `checkpoint.json`), the run resumes from it
-byte-exactly; otherwise it cold-starts. See [IMPLEMENTATION.md](IMPLEMENTATION.md) §I/O.
+byte-exactly; otherwise it cold-starts. Under `FESOM3_WHICH_ALE=zstar` the resume is byte-exact only
+with `FESOM3_RESTART_ZSTAR_EXACT=1` (table above). See [IMPLEMENTATION.md](IMPLEMENTATION.md) §I/O.
 
 ---
 

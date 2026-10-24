@@ -5,6 +5,15 @@ Full pre-M2.12 milestone detail + the per-gate recipes live in [`HANDOFF-archive
 
 ## Where we are
 
+- **Exact zstar restart ✅ (2026-10-24, branch `zstar-exact-restart`, opt-in `FESOM3_RESTART_ZSTAR_EXACT=1`):**
+  under zstar the checkpoint adds `ssh_stiff` (stiffness values in a partition-independent node-row
+  layout, the format fesom3_jax shares) and `dhe`; the resume builds the SSH preconditioner from the
+  cold matrix before `restart_read` and rebuilds `zbar_3d_n`/`Z_3d_n`/`helem`/`hnode_new` from `hnode`
+  after it (`rebuild_thickness_ale`). Gate `tools/run_restart_gate_zstar.sh`: straight == split
+  `max|Δ|=0` at np 1/2/8 on pi and CORE2, restore round trip np 2 → 1/8 exact; without the switch not
+  bitwise (TESTING.md §8, LESSONS L71). Unset: checkpoints and runs bit-identical to `main`. Follow-ups:
+  the SP branch stores `ssh_stiff%values_full` (comment in `restart_register_stiff`); split-explicit +
+  zstar needs only the geometry rebuild, which this covers.
 - **Shared-element velocity sync ✅ DONE (2026-10-12, plan `plans/completed/20261012-shared-element-sync.md`,
   on `bottom-at-vertices`):** a border element is owned by every rank that owns one of its vertices;
   `update_vel` now gives every such element one owner for `uv` (the highest vertex-owner rank, whose copy

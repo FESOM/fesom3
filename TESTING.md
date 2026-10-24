@@ -191,6 +191,7 @@ Beyond the self-tests, byte-gates cover each subsystem as it was built. They liv
 | Multi-rank | `run_step_gate_multirank.sh`, `run_lifecycle_fullynative_gate_multirank.sh`, `run_lifecycle_jra55_gate_multirank.sh` | pi/CORE2, 2–864 | the same fields match per gid across rank counts |
 | Output | `run_output_gate.sh`, `run_meshdiag_gate.sh` | pi, 1/2/8 | Zarr stores round-trip; mesh diagnostics match FESOM2 |
 | Restart | `run_restart_gate_core2.sh`, `run_restart_gate_multirank.sh`, `run_restartroundtrip.sh` | CORE2, 1/2/8 | resume reproduces the straight-through trajectory |
+| Restart, zstar | `run_restart_gate_zstar.sh` | pi and CORE2, 1/2/8 | with `FESOM3_RESTART_ZSTAR_EXACT=1` a `zstar` resume is bitwise the straight run, the restore round trip np 2 → 1/8 too; without the switch it is not; the error stops (§8) |
 
 Each gate is `max|Δ| = 0` at its stated anchor. As built, the np>1 restart gate admitted the
 multi-rank element floor of §1/§7; since the shared-element sync it is strict at every np (the floor
@@ -314,6 +315,30 @@ steps, checkpoints, starts a *fresh process*, reads the checkpoint, and runs the
 - **Different rank count:** the state is *restored* exactly (partition-independent storage,
   `C2 ≡ C8`), after which the run continues on a physically valid — but, because element ownership
   differs, not bit-identical — trajectory.
+- **`zstar`:** the default restart set resumes a `zstar` run inexactly: the SSH stiffness values
+  (accumulating `-dhe` each step), the lagged `dhe` and the geometry derived from `hnode` start cold.
+  With `FESOM3_RESTART_ZSTAR_EXACT=1` the checkpoint adds `ssh_stiff` and `dhe` and the resume
+  rebuilds the rest (README run-variable table, IMPLEMENTATION.md §10).
+  `tools/run_restart_gate_zstar.sh` (`MESH=pi|core2`) runs N = 4 steps straight against 2 + 2 split
+  (CORE2 NCAR forcing from 1948-01-01, EVP sea ice):
+  - with the switch: checkpoint (all stores, `ssh_stiff` and `dhe` included) and live node dumps
+    `max|Δ| = 0` at np 1, 2, 8, on pi and CORE2, each with the default physics and with the
+    production ocean physics (TKE, GM + Redi, splines, vector-invariant momentum, w split, SW
+    penetration);
+  - restore round trip: the np 2 checkpoint read at np 1 and np 8 with zero steps and re-written is
+    `max|Δ| = 0`, `ssh_stiff` included (the store layout is partition-independent);
+  - without the switch (np 1) the resumed run differs after 2 resumed steps, relative
+    (`max|Δ| / max|field|`): on pi `eta_n` 7.2e-4, `temp` 1.3e-5, the EVP stresses up to 5 %; on
+    CORE2 `eta_n` 9.6e-4, `temp` 9.6e-4, `u` 8.9e-4, the EVP stresses up to 8.5 %;
+  - each restored piece is needed (pi np 1, a temporary build that skips one of them; `eta_n` relative
+    difference after 2 resumed steps): the geometry rebuild 7.2e-4, `dhe` 3.2e-5, the stiffness values
+    1.8e-5, the cold-matrix preconditioner 3.6e-6;
+  - `FESOM3_RESTART_ZSTAR_EXACT=1` on a checkpoint without the two stores stops with a message, under
+    `linfs` it is ignored with one log line, a value other than `1`/`0` stops; with the switch unset
+    the checkpoints of a `zstar` and a `linfs` run equal those of the base commit (same 27 stores,
+    `max|Δ| = 0`; pi np 1 and CORE2 np 1).
+  Cross-rank *evolution* is not bitwise for any setting (the CG reductions depend on the rank count),
+  so the cross-rank case is the restore round trip, as for `linfs`.
 
 ### 9. Results
 
