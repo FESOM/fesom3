@@ -130,6 +130,7 @@ infrastructure cases:
 | `dump_diff_selftest` | — | the comparison tool itself (synthetic perturbation detection) |
 | `fesom_analytic` | 1, 2 | end-to-end analytic driver runs clean |
 | `test_shared_elem` (+ `_corrupt`, `_badknob`, `_off`) | pi 1/2/8, pi_w 2/4, cut-outs 2, core2_w 8 | shared elements: the list `com_elem2D_shared` vs an allgather oracle (S1), its exchange and the copy-spread probe (S2), the mechanism through `update_vel` + `compute_hbar_ale` with the sync on and off (S3: divergence-sum ratio ~1e-17 vs 1e-5..4e-4); the error stops and `FESOM3_SHARED_SYNC=0` |
+| `fesom_conserve_linfs_ts` (+ `_wsplit`, `_badvalue`, `_zstar`) | 1, 2 | `linfs` with `FESOM3_LINFS_CONSERVE=TS`: heat and salt conserve to `1e-12` (§6a); an unknown value and `zstar` stop the run |
 | `fesom_conserve_linfs_vinv_shsync` | 2 | linfs, vector invariant with `rvo_upwind` 1, sea ice: divergence-sum ratio < 1e-12 and zero shared-copy spreads in every step (`FESOM3_DIVSUM_TOL`) |
 
 Kernel tests from the bottom-at-vertices and momentum work (`test_vert_spline`, `test_vinv`,
@@ -216,6 +217,9 @@ The conservation part gates on **zstar only**, at a relative tolerance of `1e-12
 | zstar | 2 | `+1.34e-14` | `-1.43e-14` |
 | zstar + Redi | 1 | `-1.07e-15` | `-6.91e-16` |
 | linfs | 1 | `-2.17e-04` | `-1.09e-06` |
+| linfs + `FESOM3_LINFS_CONSERVE=TS` | 1 | `-6.82e-15` | `-1.07e-14` |
+| linfs + `FESOM3_LINFS_CONSERVE=TS` | 2 | `+1.96e-14` | `-2.38e-14` |
+| linfs + `FESOM3_LINFS_CONSERVE=TS`, production ocean set + w split | 8 | `+8.52e-16` | `-1.90e-15` |
 
 **The Redi case is not optional coverage.** `diff_ver_part_redi_expl` is the only caller of the
 `tr_xynodes` node-average whose denominator the depth-independent area changed, and it runs only
@@ -232,9 +236,17 @@ linear tracer field produces), averaging over the elements that actually contrib
 **`linfs` is not tracer-conserving and cannot be gated on drift.** The linear free surface freezes
 `hnode`, so the surface vertical advective flux `-w*T*area` at `nzmin` (`oce_adv_tra_ver.F90:66`) is
 a real source/sink with no thickness change to balance it — the textbook reason `zlevel`/`zstar`
-exist. Its drift is also non-monotone, i.e. a free-surface adjustment transient. So `linfs` runs for
-the invariants only, with drift reported and never gated. `zstar` is the production mode, so the
-gate covers the path that matters.
+exist. Its drift is also non-monotone, i.e. a free-surface adjustment transient. So plain `linfs` runs for
+the invariants only, with drift reported and never gated.
+
+**`FESOM3_LINFS_CONSERVE=TS` makes `linfs` conserve, and gates it like `zstar`.** `linfs_surface_flux`
+(`src/oce/oce_ale_tracer.F90`) sums, per tracer and step, the flux the FCT advection put through the top
+interface (low-order explicit with `w_e` and `T^n`, implicit with `w_i` and the new `fct_LO`, plus the limited
+antidiffusive `adv_flux_ver` at the top) and returns it as a uniform surface flux (`relax_salt` for S,
+`heat_flux` for T). The drift then stays at round-off (table above; `run_conserve_pi.sh` runs it at np 1, 2
+and 8, with the w split and with the production ocean set). In a forced CORE2 JRA55-do cold-start year (Dmitry's
+setup, np 512) plain `linfs` lowers the whole-ocean salinity by `5.5e-5`, a third of it in the first four steps;
+with `FESOM3_LINFS_CONSERVE=TS` the salt content after the year equals the initial one to 13 digits.
 
 **`tools/run_bottom_audit.sh` — mesh delta.** Dumps the built geometry on pi and core2 and checks
 the element-bottom shift against numbers measured from the mesh files *before* any code was

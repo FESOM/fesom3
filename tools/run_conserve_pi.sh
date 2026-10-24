@@ -22,6 +22,10 @@
 #       vertical advective flux -w*T*area at nzmin is a real source/sink with no thickness
 #       change to balance it. Measured baseline on pi over 20 steps: heat -2.2e-04,
 #       salt -1.2e-06, non-monotone (a free-surface adjustment transient).
+#   linfs + FESOM3_LINFS_CONSERVE=TS, np 1, 2 and 8 (plain, w split, production ocean set) -> HARD
+#       conservation gate. The switch returns that surface flux (oce_ale_tracer linfs_surface_flux, the FCT
+#       top-interface flux of the step) as a uniform surface flux of T and S, so heat and salt must hold to TOL
+#       like zstar. np 2 and 8 run its global sum, the w split its implicit w_i part.
 #
 #   zstar + wsplit, np 1 and 8 (+ momadv-vinv-wsplit and GM+wsplit, np 1) -> the smooth
 #       w = w_e + w_i split (use_wsplit, oce_wsplit) with ALL its consumers live: the
@@ -166,6 +170,28 @@ if FESOM3_WHICH_ALE=linfs mpirun $MPIFLAGS -n 1 "$BIN" 2>&1 | tail -7; then
 else
     echo "run_conserve_pi: FAILED (linfs invariants np=1)"; fail=1
 fi
+
+# linfs + FESOM3_LINFS_CONSERVE=TS: the conservation gate (header). Own loop: label np vars.
+LINFS_TS_ENV="FESOM3_WHICH_ALE=linfs FESOM3_LINFS_CONSERVE=TS"
+PROD_OCEAN="FESOM3_FER_GM=1 FESOM3_REDI=1 FESOM3_MIX_TKE=1 FESOM3_SHEAR_SPLINES=1 FESOM3_N2_SPLINES=1 FESOM3_MOMADV_OPT=1 FESOM3_RVO_UPWIND=1.0"
+while read -r -u 3 label np vars; do
+    [ -z "$label" ] && continue
+    echo "=== linfs + LINFS_CONSERVE=TS + $label, np=$np, $NSTEPS steps (conservation gate, tol=$TOL) ==="
+    if env $LINFS_TS_ENV $vars FESOM3_CONSERVE_TOL="$TOL" \
+         mpirun $MPIFLAGS -n "$np" "$BIN" < /dev/null 2>&1 | tail -8; then
+        :
+    else
+        echo "run_conserve_pi: FAILED (linfs+LINFS_CONSERVE=TS+$label np=$np)"; fail=1
+    fi
+done 3<<CFG
+plain 1
+plain 2
+plain 8
+wsplit 1 $WSPLIT_CFG
+wsplit 8 $WSPLIT_CFG
+prod 1 $PROD_OCEAN $WSPLIT_CFG
+prod 8 $PROD_OCEAN $WSPLIT_CFG
+CFG
 
 # SHARED: linfs + sea ice, the shared-element gate (header). Own blocks, not the heredoc loop:
 # that loop runs np 1 only. The sync-off case is report-only (no FESOM3_DIVSUM_TOL).
