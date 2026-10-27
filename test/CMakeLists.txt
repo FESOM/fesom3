@@ -283,6 +283,42 @@ foreach(_np 1 2)
         SKIP_REGULAR_EXPRESSION "cannot open;No such file")
 endforeach()
 
+# linfs with FESOM3_LINFS_CONSERVE=TS (oce_ale_tracer linfs_surface_flux): the tracer the linear free surface
+# advects out returned as a uniform surface flux, so heat and salt conserve to round-off like zstar (plain linfs
+# drifts, -2e-4 heat and -1e-6 salt over these 20 steps, and is not gated). np 2 runs the flux's global sum, the
+# wsplit variant its implicit w_i part (the cap of _wsplit_cfg below). Then the switch's teeth: an unknown value
+# and a non-linfs coordinate must stop the run before the drift report.
+foreach(_np 1 2)
+    add_test(NAME fesom_conserve_linfs_ts_np${_np}
+             COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np ${_np}
+                     $<TARGET_FILE:fesom_conserve>)
+    set_tests_properties(fesom_conserve_linfs_ts_np${_np} PROPERTIES
+        ENVIRONMENT "FESOM3_MESH_DIR=/home/a/a270088/port2/fesom2/tests/data/MESHES/pi;FESOM3_IC_FILE=/pool/data/AWICM/FESOM2/INITIAL/phc3.0/phc3.0_winter.nc;FESOM3_NSTEPS=20;FESOM3_WHICH_ALE=linfs;FESOM3_LINFS_CONSERVE=TS;FESOM3_CONSERVE_TOL=1e-12"
+        SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+    add_test(NAME fesom_conserve_linfs_ts_wsplit_np${_np}
+             COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np ${_np}
+                     $<TARGET_FILE:fesom_conserve>)
+    set_tests_properties(fesom_conserve_linfs_ts_wsplit_np${_np} PROPERTIES
+        ENVIRONMENT "FESOM3_MESH_DIR=/home/a/a270088/port2/fesom2/tests/data/MESHES/pi;FESOM3_IC_FILE=/pool/data/AWICM/FESOM2/INITIAL/phc3.0/phc3.0_winter.nc;FESOM3_NSTEPS=20;FESOM3_WHICH_ALE=linfs;FESOM3_LINFS_CONSERVE=TS;FESOM3_WSPLIT=1;FESOM3_WSPLIT_MAXCFL=0.005;FESOM3_WSPLIT_EXPECT_SPLIT=1000;FESOM3_CONSERVE_TOL=1e-12"
+        SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+endforeach()
+add_test(NAME fesom_conserve_linfs_ts_badvalue_np1
+         COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np 1
+                 $<TARGET_FILE:fesom_conserve>)
+set_tests_properties(fesom_conserve_linfs_ts_badvalue_np1 PROPERTIES
+    ENVIRONMENT "FESOM3_MESH_DIR=/home/a/a270088/port2/fesom2/tests/data/MESHES/pi;FESOM3_IC_FILE=/pool/data/AWICM/FESOM2/INITIAL/phc3.0/phc3.0_winter.nc;FESOM3_NSTEPS=20;FESOM3_WHICH_ALE=linfs;FESOM3_LINFS_CONSERVE=ST"
+    PASS_REGULAR_EXPRESSION "FESOM3_LINFS_CONSERVE: expected S, T or TS"
+    FAIL_REGULAR_EXPRESSION "relative drift over the run"
+    SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+add_test(NAME fesom_conserve_linfs_ts_zstar_np1
+         COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np 1
+                 $<TARGET_FILE:fesom_conserve>)
+set_tests_properties(fesom_conserve_linfs_ts_zstar_np1 PROPERTIES
+    ENVIRONMENT "FESOM3_MESH_DIR=/home/a/a270088/port2/fesom2/tests/data/MESHES/pi;FESOM3_IC_FILE=/pool/data/AWICM/FESOM2/INITIAL/phc3.0/phc3.0_winter.nc;FESOM3_NSTEPS=20;FESOM3_WHICH_ALE=zstar;FESOM3_LINFS_CONSERVE=TS"
+    PASS_REGULAR_EXPRESSION "FESOM3_LINFS_CONSERVE needs which_ALE linfs"
+    FAIL_REGULAR_EXPRESSION "relative drift over the run"
+    SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+
 # Redi variant: diff_ver_part_redi_expl is the only caller of the tr_xynodes node-average
 # whose denominator this change touched, and it runs only when Redi is on.
 add_test(NAME fesom_conserve_zstar_redi_np1
