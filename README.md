@@ -226,6 +226,7 @@ examples. The most common variables:
 |---|---|
 | `FESOM3_MESH_DIR` | mesh directory (must contain `dist_<NP>/`) |
 | `FESOM3_IC_FILE` | initial T/S netCDF |
+| `FESOM3_IC_EXTRAP_DET`, `FESOM3_IC_EXTRAP_TOL` | cold start: fill the land-masked points of the initial T/S with FESOM2's deterministic fill (`ic_extrap_det`, PR #979): the same initial state on every `dist_<NP>`. Off by default (the historical fill, whose result depends on the partition and the node numbering); the tolerance of its relaxation defaults to `1e-3`. Read in `src/oce/oce_initial_state.F90` |
 | `FESOM3_FORCING_DIR`, `FESOM3_FORCING` | atmospheric forcing directory and set (`JRA55`/`CORE2`) |
 | `FESOM3_RUNOFF_FILE`, `FESOM3_SSS_FILE` | runoff and sea-surface-salinity restoring climatologies |
 | `FESOM3_START_CLOCK` | cold-start clock, `"timeofday day year"` |

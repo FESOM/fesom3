@@ -2875,7 +2875,31 @@ once and send it, or test that the copies stay bitwise equal. At np>1, test the 
 np>1, find the duplicated state behind it before accepting it.
 
 
-## L71 — Under Intel `-no-prec-div` a division by a loop invariant rounds differently in the vectorised body and in the scalar remainder: per-element results then depend on the local index, and the copies of a shared element differ by 1 ULP
+## L71A — FESOM2's deterministic IC fill (`ic_extrap_det`) is decomposition-independent to the bit, but "independent of the node numbering" means the LOCAL numbering: a global renumbering changes the sum order
+
+**Context.** Branch `ic-extrap-det` (2026-10-20): port of FESOM2 PR #979 (`extrap_nod3D_det`) as
+`FESOM3_IC_EXTRAP_DET`, the answer to L60's partition-dependent cold start.
+
+**Lessons.**
+- **Jacobi + a sum in global-id order + an exchange per sweep is enough for bit-identity across
+  ranks.** Every owned node sees its whole element ring (owned elements include every element with an
+  owned vertex), the halo is current after every sweep, and the termination tests are global maxima
+  (exact). Measured: the CORE2 IC is bit-identical at np 1, 2, 8, 128 and 512 (`fesom_icgather`),
+  and the lifecycle driver's cold start (checkpoint `*_M1` after step 1) is that IC.
+- **A renumbered mesh is a different global numbering.** The neighbour sum is ordered by global id;
+  the Hilbert copy `core2_hil` orders the same neighbours differently, so its IC equals CORE2's through
+  the permutation only to roundoff (6.8e-14 degC, 1.6e-13 psu; volume means equal). An order that does
+  not depend on ids makes it exact: sorting the neighbours by their (lon, lat) instead of their id gives
+  core2_hil the CORE2 fill bit for bit (fesom3_jax numpy experiment, 2026-10-20), but that is no longer
+  FESOM2's arithmetic.
+- **Off must mean off.** The switch dispatches at the top of `extrap_nod3D`; with it unset, CORE2
+  dist_512 and pi_w np 2 runs of the branch are bit-identical to main over 3 steps (every store of
+  every checkpoint). Keep new options behind a dispatch that leaves the old code path untouched.
+- **Check the gather tool against the model.** `fesom_icgather` rebuilds the IC outside the lifecycle;
+  it was trusted only after its output matched the lifecycle checkpoint's `temp_M1`/`salt_M1` bit for
+  bit (CORE2 np 512, pi_w np 1 and 2).
+
+## L71B — Under Intel `-no-prec-div` a division by a loop invariant rounds differently in the vectorised body and in the scalar remainder: per-element results then depend on the local index, and the copies of a shared element differ by 1 ULP
 
 **Context.** Split-explicit plan (`docs/plans/completed/2026-10-17-split-explicit.md`), Task 2.1, and Task 3.1
 on a side branch (found twice, independently). The SE design keeps the copies of a shared border

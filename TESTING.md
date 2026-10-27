@@ -131,6 +131,7 @@ infrastructure cases:
 | `fesom_analytic` | 1, 2 | end-to-end analytic driver runs clean |
 | `test_shared_elem` (+ `_corrupt`, `_badknob`, `_off`) | pi 1/2/8, pi_w 2/4, cut-outs 2, core2_w 8 | shared elements: the list `com_elem2D_shared` vs an allgather oracle (S1), its exchange and the copy-spread probe (S2), the mechanism through `update_vel` + `compute_hbar_ale` with the sync on and off (S3: divergence-sum ratio ~1e-17 vs 1e-5..4e-4); the error stops and `FESOM3_SHARED_SYNC=0` |
 | `fesom_conserve_linfs_vinv_shsync` | 2 | linfs, vector invariant with `rvo_upwind` 1, sea ice: divergence-sum ratio < 1e-12 and zero shared-copy spreads in every step (`FESOM3_DIVSUM_TOL`) |
+| `fesom_icgather_det_{piw,mixcut}`, `fesom_icgather_hist_piw` | pi_w 1/2/8, nemo025mix_cut 1/2/4 | the cold-start T/S gathered by global id (`fesom_icgather`): with `FESOM3_IC_EXTRAP_DET` the np 2/4/8 IC is the np 1 one bit for bit (triangles; triangles + quads); with the historical fill the pi_w np 2 IC differs (the test's teeth) |
 
 Kernel tests from the bottom-at-vertices and momentum work (`test_vert_spline`, `test_vinv`,
 `test_muscl_onthefly`, `test_ivertvisc`, `test_wsplit`, `test_wimpl_tra`, `test_minlayers`, the
