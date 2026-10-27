@@ -250,17 +250,20 @@ contains
         ! linFSConserveTr returns it the same way). Under FCT that flux is the low-order one, explicit with w_e
         ! and T^n and implicit with w_i and the new fct_LO (adv_tra_vert_impl; w_i = 0 without the split), plus
         ! the limited antidiffusive adv_flux_ver at the top. Owned nodes, then the global sum, over ocean_area
-        ! (the sum of areasvol without cavities, as oce_fluxes' balancing).
+        ! (the sum of areasvol without cavities, as oce_fluxes' balancing). Accumulated and reduced in
+        ! WP_full and rounded once into the WP result, as integrate_nod_2D (FESOM/fesom2#993): in single
+        ! precision a WP sum's rounding would itself be a net source; in double precision this is the same
+        ! arithmetic.
         integer,        intent(in)           :: tr_num
         type(t_dyn),    intent(in)           :: dynamics
         type(t_tracer), intent(in)           :: tracers
         type(t_mesh),   intent(in)           :: mesh
         type(t_partit), intent(in), optional :: partit
         integer       :: n, nz, nNodO, nNodL, nEdgeO, nElemO
-        real(kind=WP) :: s
+        real(kind=WP_full) :: s
 
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
-        s = 0.0_WP
+        s = 0.0_WP_full
         do n = 1, nNodO
             nz = mesh%ulevels_nod2D(n)
             s = s + mesh%area(n)*(dynamics%w_e(nz,n)*tracers%data(tr_num)%values(nz,n) &
@@ -268,7 +271,7 @@ contains
                   - tracers%work%adv_flux_ver(nz,n)
         end do
         if (is_multirank(partit)) call allreduce_sum(s, partit)
-        linfs_surface_flux = s/mesh%ocean_area
+        linfs_surface_flux = real(s/mesh%ocean_area, WP)
     end function linfs_surface_flux
 
     !===========================================================================
