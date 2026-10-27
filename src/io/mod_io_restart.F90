@@ -56,8 +56,8 @@ module mod_io_restart
     !   dhe        element 2-D (DECOMP_ELEM, owned-only like its consumer update_stiff_mat_ale).
     ! The driver does the rest of the resume (fesom_lifecycle_native_mr): the Jacobi preconditioner
     ! is built from the cold matrix BEFORE restart_read (a straight run builds it at its first solve,
-    ! where step 1 adds -dhe = 0), and rebuild_thickness_ale derives zbar_3d_n/Z_3d_n/helem/hnode_new
-    ! from the restored hnode after it.
+    ! where step 1 adds -dhe = 0), and after it every zstar resume (exact or not) derives
+    ! zbar_3d_n/Z_3d_n/helem/hnode_new from the restored hnode with update_thickness_ale.
     use mpi
     use, intrinsic :: iso_fortran_env, only: real64, error_unit
     use mod_precision,   only: WP, MP
@@ -127,6 +127,7 @@ module mod_io_restart
     type :: t_restart
         integer               :: nf = 0
         type(t_restart_field) :: f(RESTART_MAXF)
+        logical               :: se = .false.          ! split-explicit state registered (read pre-check)
         type(t_io_decomp)     :: Dn                    ! node decomp (node fields)
         type(t_io_decomp)     :: De                    ! element decomp (element fields)
         integer               :: nNodO = 0, nElemO = 0
@@ -311,6 +312,9 @@ contains
     !                w w_expl w_impl (FULL nl) | tke (FULL nl, if mix_scheme==5)
     !     elem 3-D : u v urhs_AB vrhs_AB [urhs_AB3 vrhs_AB3 if dyn%AB_order==3]   (nl-1)
     !     elem 2-D : sigma11 sigma12 sigma22
+    !     split-explicit (only when dyn%use_ssh_se; FESOM_F's own, no FESOM2 counterpart):
+    !       node 2-D : se_eta1 se_eta2
+    !       elem 2-D : se_ubt0_u se_ubt0_v se_ubt1_u se_ubt1_v se_ubt2_u se_ubt2_v se_sbar_old_u se_sbar_old_v
     !     zstar exact restart only (R%zstar_exact): ssh_stiff (node, W slots) | dhe (elem 2-D)
     ! partit (optional) is needed only by the zstar exact restart at np>1 (global column ids).
     subroutine restart_register_state(R, dyn, tracers, ice, mesh, mix_scheme, partit)
@@ -388,6 +392,44 @@ contains
         p2 => ice%work%sigma11; call restart_register_field(R, 'sigma11', '', DECOMP_ELEM, p2d=p2)
         p2 => ice%work%sigma12; call restart_register_field(R, 'sigma12', '', DECOMP_ELEM, p2d=p2)
         p2 => ice%work%sigma22; call restart_register_field(R, 'sigma22', '', DECOMP_ELEM, p2d=p2)
+
+        ! ---- split-explicit barotropic state (FESOM3_SSH_SE; oce_ssh_se.F90) ----
+        ! The SE arrays carried from one baroclinic step to the next; everything else of SE is rebuilt
+        ! every step (se_H, se_c from helem / zbar_3d_n, se_ubtn, se_umean, se_force, se_kdrag) or is
+        ! geometry (se_kappa, se_zlen). se_init runs before the restart block, so a resume overwrites
+        ! its cold rings.
+        !   se_eta1, se_eta2   eta^{-1/M}, eta^{-2/M}: kept on owned + halo nodes, every level
+        !                      exchange_nod'ed in the substeps -> NODE variant (the default).
+        !   se_ubt<k>_{u,v}    ring level k = 0, 1, 2 (U^n, U^{-1/M}, U^{-2/M}): with a BT viscosity
+        !                      (se_visc_ah > 0 or FESOM3_SE_VISC_FLOW=1) the substeps read U at eDim
+        !                      neighbours, and every level is the exchange_elem'ed U of its substep (the
+        !                      rings shift by copying over owned + eDim) -> ELEM variant. With no viscosity the eDim entries are never
+        !                      refreshed in a straight run and never read; the resumed run gets owner
+        !                      values there, which nothing reads either (the restart gate covers that mode).
+        !   se_sbar_old_{u,v}  s^{n-1} = sum_k helem*uv: written and read on the owned elements only
+        !                      (se_bt_forcing) -> NONE; the halo keeps se_init's 0, as in a straight run.
+        ! 10 stores. (Plan Task 5.4 dropped se_sbar_old_{u,v} with the first-substep Coriolis r-term;
+        ! Task 5.5 restored both, 2026-10-18. A checkpoint of that interim code, 8 SE stores, does not
+        ! resume: restart_read aborts on the missing se_sbar_old store.)
+        ! All of them are bitwise equal over the owners of a shared element (the F and uv syncs,
+        ! plan 2026-10-17 Task 2.1), so the store's one copy per element restores every owner exactly.
+        ! The checkpoint holds no M or chi: both must stay the same over a restart chain.
+        if (dyn%use_ssh_se) then
+            R%se = .true.
+            p2 => dyn%se_eta(:,1);      call restart_register_field(R, 'se_eta1', 'm', DECOMP_NODE, p2d=p2)
+            p2 => dyn%se_eta(:,2);      call restart_register_field(R, 'se_eta2', 'm', DECOMP_NODE, p2d=p2)
+            do j = 0, 2
+                write(tn, '(a,i1)') 'se_ubt', j
+                p2 => dyn%se_ubt(1,:,j)
+                call restart_register_field(R, trim(tn)//'_u', 'm2/s', DECOMP_ELEM, p2d=p2, halo=RESTART_HALO_ELEM)
+                p2 => dyn%se_ubt(2,:,j)
+                call restart_register_field(R, trim(tn)//'_v', 'm2/s', DECOMP_ELEM, p2d=p2, halo=RESTART_HALO_ELEM)
+            end do
+            p2 => dyn%se_sbar_old(1,:)
+            call restart_register_field(R, 'se_sbar_old_u', 'm2/s', DECOMP_ELEM, p2d=p2, halo=RESTART_HALO_NONE)
+            p2 => dyn%se_sbar_old(2,:)
+            call restart_register_field(R, 'se_sbar_old_v', 'm2/s', DECOMP_ELEM, p2d=p2, halo=RESTART_HALO_NONE)
+        end if
 
         ! ---- zstar exact restart: the accumulated SSH stiffness values + the lagged dhe ----
         if (R%zstar_exact) then
@@ -850,13 +892,20 @@ contains
         integer,          intent(in), optional :: clock_year, clock_day
         real(real64),     intent(in), optional :: clock_time_sec
         character(len=:), allocatable :: folder
-        logical :: ok, have_json, have_stiff, have_dhe
+        logical :: ok, have_json, ex, have_stiff, have_dhe
         integer :: k, jyear, jday, ierr
         real(real64) :: jtime
         call restart_resolve_latest(restart_dir, folder, ok)
         call zarr_check(ok, 'restart_read: restart.latest missing/unreadable or checkpoint incomplete under '// &
                             trim(restart_dir))
         if (R%mype == 0) write(*,'(a)') '[restart] reading checkpoint '//folder
+        ! split-explicit (plan 2026-10-17 D6): an SE run resumes only from an SE checkpoint. Checked
+        ! before any field is read, so the message names the cause instead of a missing store.
+        if (R%se) then
+            inquire(file=folder//'/se_eta1.zarr/.zgroup', exist=ex)
+            call zarr_check(ex, 'restart_read: checkpoint has no split-explicit state: written with '// &
+                                'FESOM3_SSH_SE off; SI<->SE restarts are not supported ('//folder//')')
+        end if
         ! time-vs-clock safety check (WARN, never abort)
         if (present(clock_time_sec)) then
             call read_checkpoint_json(folder//'/checkpoint.json', jyear, jday, jtime, have_json)

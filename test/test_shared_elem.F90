@@ -14,7 +14,12 @@ program test_shared_elem
     !       before the exchange the block probe is positive (np > 1); after it every receive
     !       slot holds blkval(d, ...) of its designated owner d, the probe is 0, and the other
     !       owned and halo slots are bitwise unchanged. Rank-1 probe: a difference planted on
-    !       one receive slot is returned exactly on that rank and 0 elsewhere. At np 1 the
+    !       one receive slot is returned exactly on that rank and 0 elsewhere. A (2,elem)
+    !       array (the split-explicit barotropic transport) holds blkval(mype, ...) on this
+    !       rank's shared elements and the same value on every rank elsewhere: before the
+    !       exchange its probe equals the spread computed from the designated owners (> 0 at
+    !       np > 1); after it every receive slot holds the designated copy, the designated
+    !       and all other slots are bitwise unchanged, and the probe is 0. At np 1 the
     !       arrays stay unchanged and the probes return 0.
     !   S3  the mechanism, through the real kernels update_vel and compute_hbar_ale. uv and
     !       uv_rhs are hashed from the global id (equal on every copy), DELTA is added to
@@ -204,10 +209,10 @@ contains
     subroutine s2_exchange()
         integer :: nElemO, nElemF, nl, e, j1, j2, p, k, d, nbad, rplant, ierr
         real(kind=WP), allocatable :: a3(:,:,:), a3_0(:,:,:), ab(:,:,:,:), ab_0(:,:,:,:)
-        real(kind=WP), allocatable :: a1(:)
-        logical, allocatable :: is_recv(:)
+        real(kind=WP), allocatable :: a1(:), a2(:,:), a2_0(:,:)
+        logical, allocatable :: is_recv(:), is_shared(:)
         integer, allocatable :: dsg(:)
-        real(kind=WP) :: pr, pr_ab
+        real(kind=WP) :: pr, pr_ab, spread, pr_a2
         real(kind=WP), parameter :: PLANT = 0.375_WP
 
         nElemO = partit%myDim_elem2D
@@ -264,6 +269,52 @@ contains
         if (partit%npes > 1) call check(count(is_recv) > 0 .or. partit%com_elem2D_shared%sPEnum > 0, &
                                         'S2 every rank takes part in the exchange', partit%mype)
 
+        ! ---- (2, elem): rank-dependent on this rank's shared elements, rank 0's value elsewhere ----
+        allocate(is_shared(nElemF), a2(2, nElemF))
+        is_shared = is_recv
+        do p = 1, partit%com_elem2D_shared%sPEnum
+            do k = partit%com_elem2D_shared%sptr(p), partit%com_elem2D_shared%sptr(p+1) - 1
+                is_shared(partit%com_elem2D_shared%slist(k)) = .true.
+            end do
+        end do
+        do e = 1, nElemF
+            do j1 = 1, 2
+                a2(j1, e) = blkval(merge(partit%mype, 0, is_shared(e)), partit%myList_elem2D(e), j1, 0)
+            end do
+        end do
+        a2_0 = a2
+        spread = 0.0_WP                                   ! this rank's spread from the oracle
+        do e = 1, nElemF
+            if (.not. is_recv(e)) cycle
+            do j1 = 1, 2
+                spread = max(spread, abs(a2(j1, e) - blkval(dsg(e), partit%myList_elem2D(e), j1, 0)))
+            end do
+        end do
+        pr_a2 = shared_copy_max_elem(a2, partit)
+        call check(pr_a2 == spread, 'S2 (2,elem) probe == the designated-owner spread', partit%mype)
+        call max_all(pr_a2, partit)
+        if (partit%npes > 1) then
+            call check(pr_a2 > 0.0_WP, 'S2 (2,elem) probe > 0 before the exchange', partit%mype)
+        else
+            call check(pr_a2 == 0.0_WP, 'S2 np 1: (2,elem) probe 0', partit%mype)
+        end if
+
+        call exchange_elem_shared(a2, partit)
+        nbad = 0
+        do e = 1, nElemF
+            if (is_recv(e)) then
+                do j1 = 1, 2
+                    if (a2(j1, e) /= blkval(dsg(e), partit%myList_elem2D(e), j1, 0)) nbad = nbad + 1
+                end do
+            else
+                if (any(a2(:, e) /= a2_0(:, e))) nbad = nbad + 1
+            end if
+        end do
+        call check(nbad == 0, 'S2 (2,elem) receive slots hold the designated copy, the rest unchanged', &
+                   partit%mype)
+        pr = shared_copy_max_elem(a2, partit); call max_all(pr, partit)
+        call check(pr == 0.0_WP, 'S2 (2,elem) probe 0 after the exchange', partit%mype)
+
         ! ---- rank-1 probe: plant PLANT on one receive slot of the lowest rank that has one ----
         allocate(a1(nElemF))
         a1 = real(partit%myList_elem2D(1:nElemF), WP)
@@ -281,7 +332,8 @@ contains
         end if
         if (partit%npes > 1) call check(rplant < partit%npes, 'S2 some rank has a receive slot', &
                                         partit%mype)
-        if (partit%mype == 0) write(*,'(a)') '  S2: exchange and probes done'
+        if (partit%mype == 0) write(*,'(a,es10.2)') '  S2: exchange and probes done; (2,elem) spread before', &
+                                                     pr_a2
     end subroutine s2_exchange
 
     subroutine s3_mechanism()

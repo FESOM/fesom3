@@ -19,7 +19,7 @@ tolerance to be accepted.
 
 Validation rests on two pillars:
 
-1. **Automated self-tests** (`ctest`) — 153 cases over the infrastructure (types, partitioning, halo
+1. **Automated self-tests** (`ctest`) — 176 cases over the infrastructure (types, partitioning, halo
    exchange, I/O decomposition, restart redistribution, …), the kernels and conservation, on triangle,
    quad and mixed meshes, run on 1 to 8 ranks, on both the Intel and GNU toolchains.
 2. **Byte-gates against the FESOM2 oracle** — an instrumented FESOM2 v2.7.3 and FESOM_F are run on
@@ -110,7 +110,7 @@ assembled step — data flow and dispatch — is byte-faithful, not just the ker
 
 ### 5. The `ctest` self-test suite
 
-`test/CMakeLists.txt` registers **167 ctest cases**, run on the Intel and GNU builds. The core
+`test/CMakeLists.txt` registers **176 ctest cases**, run on the Intel and GNU builds. The core
 infrastructure cases:
 
 | Test | Ranks | Checks |
@@ -130,7 +130,9 @@ infrastructure cases:
 | `dump_diff_selftest` | — | the comparison tool itself (synthetic perturbation detection) |
 | `fesom_analytic` | 1, 2 | end-to-end analytic driver runs clean |
 | `test_shared_elem` (+ `_corrupt`, `_badknob`, `_off`) | pi 1/2/8, pi_w 2/4, cut-outs 2, core2_w 8 | shared elements: the list `com_elem2D_shared` vs an allgather oracle (S1), its exchange and the copy-spread probe (S2), the mechanism through `update_vel` + `compute_hbar_ale` with the sync on and off (S3: divergence-sum ratio ~1e-17 vs 1e-5..4e-4); the error stops and `FESOM3_SHARED_SYNC=0` |
+| `fesom_conserve_linfs_ts` (+ `_wsplit`, `_badvalue`, `_zstar`) | 1, 2 | `linfs` with `FESOM3_LINFS_CONSERVE=TS`: heat and salt conserve to `1e-12` (§6a); an unknown value and `zstar` stop the run |
 | `fesom_conserve_linfs_vinv_shsync` | 2 | linfs, vector invariant with `rvo_upwind` 1, sea ice: divergence-sum ratio < 1e-12 and zero shared-copy spreads in every step (`FESOM3_DIVSUM_TOL`) |
+| `fesom_icgather_det_{piw,mixcut}`, `fesom_icgather_hist_piw` | pi_w 1/2/8, nemo025mix_cut 1/2/4 | the cold-start T/S gathered by global id (`fesom_icgather`): with `FESOM3_IC_EXTRAP_DET` the np 2/4/8 IC is the np 1 one bit for bit (triangles; triangles + quads); with the historical fill the pi_w np 2 IC differs (the test's teeth) |
 
 Kernel tests from the bottom-at-vertices and momentum work (`test_vert_spline`, `test_vinv`,
 `test_muscl_onthefly`, `test_ivertvisc`, `test_wsplit`, `test_wimpl_tra`, `test_minlayers`, the
@@ -156,9 +158,22 @@ The mesh-dependent hybrid cases read meshes from the hard-coded root `/work/ab09
 (`test/CMakeLists.txt`). Whether a mesh exists is decided at configure time
 (`if(EXISTS <meshes>/<mesh>/nod2d.out)`): a case whose mesh is absent is registered as DISABLED
 (ctest prints "Not Run (Disabled)"); a missing `dist_N`/`com_info` file in an existing mesh
-directory FAILS. "167/167 passed" therefore holds on a filesystem that has these meshes. The
+directory FAILS. "176/176 passed" therefore holds on a filesystem that has these meshes. The
 shared-element guards live in existing tests: `test_vinv` V13 (`uv_rhsAB` copies bitwise equal with
 the upwind blend on) and `test_ice_dyn_mixed` D6 (EVP/mEVP sigma copies bitwise equal), at np>1.
+
+**Split-explicit barotropic solver** ([IMPLEMENTATION.md](IMPLEMENTATION.md) §14; pi rotated,
+`FESOM3_SSH_SE=1 FESOM3_SE_M=40`):
+
+| Test | Ranks | Checks |
+|---|---|---|
+| `test_ssh_se` C1–C4 | 1, 2, 8 | SM coefficients against hand-computed literals; knob parsing (every rejected and accepted value per knob, the defaults, incl. `FESOM3_SE_BOTTDRAG`); CFL guard (a_crit, the Schur–Cohn radius against numpy, A self-adjoint, ω_max on pi equal at np 1/2/8 bitwise, M_min, the real substep loop stable at 0.97 and unstable at 1.03 a_crit); `se_init` extents and cold-start rings |
+| `test_ssh_se` C5–C12 | 1, 2, 8 | F = 0 for a pure pressure and a pure Coriolis state through the real `compute_vel_rhs` (the stored transport sums: the lfirst weight, s_old, the AB2 blend); the substep tendency equals G/τ at U\* = šⁿ, η = ηⁿ, Ūᵐ = Ūⁿ; the bottom-drag rate C_d·\|u_b\|/Hⁿ (F bitwise the same with the drag off), and D(Ūᵐ − Ūⁿ) is 0 at Ūᵐ = Ūⁿ (bitwise the drag-off tendency), −kdrag·X and linear otherwise; viscosity sums to 0 and vanishes for uniform flow; substeps: rest stays at rest, volume and η compatibility to rounding, convergence order ≥ 2 in dtbt; the trim Σhelemⁿuv = ⟨⟨Ū⟩⟩; the `SE_CHECK` values and their response to a planted perturbation and a NaN |
+| `test_ssh_se` P1–P4 | 2, 8 | F and the drag rate before and after the one-owner sync; copy spreads of the Ū ring, ⟨⟨Ū⟩⟩, `uv`, `uv_rhsAB` exactly 0 over 6 steps (and nonzero with the syncs off); inflow-sum ratio ≤ 1.4e-17; np 2 bitwise equal to np 1, np 8 to 3.9e-16 of max\|Ū\| (Intel; the test allows 1e-12) |
+| `test_ssh_se` Z1–Z6 | 1, 2 (+8) | zstar: the depth-law weights c, H_e(ηⁿ) = Σhelemⁿ bitwise, Σhelem^{n+1} = H_e(η^{n+1}) through the real `vert_vel_ale` + `update_thickness_ale` (4.5e-12 m of 5650 m), freshwater in η, one full zstar step with every invariant; c ≡ 0 under linfs |
+| `test_ssh_se` R1 | 1, 2, 8 | the restart registry: with SE on exactly the 10 SE stores (`se_eta1/2`, `se_ubt{0,1,2}_{u,v}`, `se_sbar_old_{u,v}`); with SE off none, the rest unchanged |
+| `fesom_conserve_se_{badswitch,badm,cfl}` | 1 | the driver stops for a bad switch, a bad M and M below the CFL-guard minimum |
+| `fesom_conserve_se_linfs`, `fesom_conserve_se_zstar` | 1; 1, 2 | 20 SE steps on pi with `FESOM3_SE_CHECK=1`: linfs invariants; zstar with the hard conservation gate (1e-12) |
 
 These run in under a minute on a login node (`ctest -j 8`):
 
@@ -177,7 +192,8 @@ cd build_intel_dp && ctest --output-on-failure
 >
 > The **self-consistency** gates are not oracle-dependent and remain the live net:
 > `run_conserve_pi.sh` (§6a), `run_restartroundtrip.sh`, `run_output_gate.sh` (partition
-> independence), the restart straight-vs-resume gates, and `run_bottom_audit.sh` (§6a).
+> independence), the restart straight-vs-resume gates, `run_bottom_audit.sh` (§6a), and the
+> split-explicit gates of §6c.
 > The table below documents the gates as they were built; treat the oracle rows as history.
 
 Beyond the self-tests, byte-gates cover each subsystem as it was built. They live in `tools/` as
@@ -217,6 +233,9 @@ The conservation part gates on **zstar only**, at a relative tolerance of `1e-12
 | zstar | 2 | `+1.34e-14` | `-1.43e-14` |
 | zstar + Redi | 1 | `-1.07e-15` | `-6.91e-16` |
 | linfs | 1 | `-2.17e-04` | `-1.09e-06` |
+| linfs + `FESOM3_LINFS_CONSERVE=TS` | 1 | `-6.82e-15` | `-1.07e-14` |
+| linfs + `FESOM3_LINFS_CONSERVE=TS` | 2 | `+1.96e-14` | `-2.38e-14` |
+| linfs + `FESOM3_LINFS_CONSERVE=TS`, production ocean set + w split | 8 | `+8.52e-16` | `-1.90e-15` |
 
 **The Redi case is not optional coverage.** `diff_ver_part_redi_expl` is the only caller of the
 `tr_xynodes` node-average whose denominator the depth-independent area changed, and it runs only
@@ -233,9 +252,17 @@ linear tracer field produces), averaging over the elements that actually contrib
 **`linfs` is not tracer-conserving and cannot be gated on drift.** The linear free surface freezes
 `hnode`, so the surface vertical advective flux `-w*T*area` at `nzmin` (`oce_adv_tra_ver.F90:66`) is
 a real source/sink with no thickness change to balance it — the textbook reason `zlevel`/`zstar`
-exist. Its drift is also non-monotone, i.e. a free-surface adjustment transient. So `linfs` runs for
-the invariants only, with drift reported and never gated. `zstar` is the production mode, so the
-gate covers the path that matters.
+exist. Its drift is also non-monotone, i.e. a free-surface adjustment transient. So plain `linfs` runs for
+the invariants only, with drift reported and never gated.
+
+**`FESOM3_LINFS_CONSERVE=TS` makes `linfs` conserve, and gates it like `zstar`.** `linfs_surface_flux`
+(`src/oce/oce_ale_tracer.F90`) sums, per tracer and step, the flux the FCT advection put through the top
+interface (low-order explicit with `w_e` and `T^n`, implicit with `w_i` and the new `fct_LO`, plus the limited
+antidiffusive `adv_flux_ver` at the top) and returns it as a uniform surface flux (`relax_salt` for S,
+`heat_flux` for T). The drift then stays at round-off (table above; `run_conserve_pi.sh` runs it at np 1, 2
+and 8, with the w split and with the production ocean set). In a forced CORE2 JRA55-do cold-start year (Dmitry's
+setup, np 512) plain `linfs` lowers the whole-ocean salinity by `5.5e-5`, a third of it in the first four steps;
+with `FESOM3_LINFS_CONSERVE=TS` the salt content after the year equals the initial one to 13 digits.
 
 **`tools/run_bottom_audit.sh` — mesh delta.** Dumps the built geometry on pi and core2 and checks
 the element-bottom shift against numbers measured from the mesh files *before* any code was
@@ -271,6 +298,66 @@ for hybrid meshes"):
   partitions).
 - The Python mesh tools have their own suites: `tools/mesh/test_nemo_meshq.sh`,
   `tools/mesh/test_mesh_tools.sh`.
+
+### 6c. The split-explicit gates
+
+The split-explicit solver ([IMPLEMENTATION.md](IMPLEMENTATION.md) §14) is not bitwise to the CG
+solve, so it is gated by invariants, determinism and restart exactness, and the default CG path by a
+byte diff (plan `docs/plans/completed/2026-10-17-split-explicit.md`):
+
+- **G0, `tools/run_g0_se.sh` — SE off is byte-identical.** `NEW_BIN=<bin dir> tools/run_g0_se.sh`
+  reruns three cases and compares them with references written once by the frozen pre-SE binaries
+  (`/work/ab0995/a270088/fesom3_se_ref/`): CORE2 with the production physics of `tools/prod_env.sh`,
+  linfs and zstar, np 2, 20 steps (end-of-run checkpoint, 99 variables; node dumps of the last step,
+  1,649,154 records; the `FESOM3_STEP_DIAG` lines), and the `run_conserve_pi.sh` log (a frozen copy
+  of the script, 26 configs). Everything must be `max|Δ| = 0`; the case environment is compared too.
+  It writes into a fresh run directory and deletes nothing.
+- **`FESOM3_SE_CHECK=1` — the invariant line.** Rank 0 prints one `SE_CHECK` line per step:
+  `etacomp` = max|η^{n+1} − ηⁿ − τ·ssh_rhs_old/areasvol| (η compatibility), `trim` =
+  max|Σₖhelemⁿuv − ⟨⟨Ū⟩⟩|, `msl` (mean-sea-level change since the process start, net of the
+  freshwater), the copy spreads `spreadU`, `spreadUm`, and max|η|, max|Ū|. A non-finite value
+  stops the run. zstar adds `SE_CHECK_TAIL` after the ALE tail: `laysum` = max|Σhnode − (H0 + η)|,
+  `w1` = max|w(1)|, `hlaw` = max|Σhelem^{n+1} − H_e(η^{n+1})|.
+- **`tools/run_conserve_pi.sh` SE blocks** (pi, `fesom_conserve`, 20 steps): linfs at np 1, 2 and 8
+  (default; vector invariant with `rvo_upwind` 1 and sea ice, at np > 1 with the divergence-sum
+  gate) and zstar at np 1, 2 and 8 (default; vector invariant with ice; GM + Redi + TKE + w split,
+  with the hard heat/salt/volume gate). The run maxima of the `SE_CHECK` tokens are gated at about
+  100 times the levels measured over 1000 steps, the spreads at exactly 0.
+- **Restart.** `run_restart_gate_core2.sh` with `FESOM3_SSH_SE=1`, linfs and zstar, np 1 and 2,
+  mid-run and month-boundary splits: the checkpoint (37 stores including the 10 SE stores; the interim
+  code of plan Task 5.4 had 35 and 8, without `se_sbar_old_{u,v}`, and its checkpoints do not resume)
+  and the live dumps `max|Δ| = 0`, and the resumed segment's `SE_CHECK` lines equal the straight run's
+  (without `msl`, which counts from the process start). `run_restart_gate_multirank.sh` (np 2 → 8):
+  `max|Δ| = 0`. `run_restartroundtrip.sh` adds `FESOM3_RESTARTRT_SE=1` (38 fields round-trip at
+  `max|Δ| = 0`) and `FESOM3_RESTARTRT_SE=2` (a checkpoint without SE state, read with SE on, must
+  stop with the message).
+- **Determinism.** The same binary at the same np is bitwise reproducible (CORE2 np 8, 480 steps:
+  1,395,438 dump records and 99 checkpoint variables `max|Δ| = 0`); np 1 and np 8 differ about as
+  much as they do with the CG solve (CORE2, 48 steps: max|Δη| 4.6e-2 m vs 4.9e-2 m).
+
+Measured invariant levels and thresholds (pi over 1000 steps, np 1/2/8; CORE2 production physics, np
+1 for 48 steps at χ = 0.1 and np 8 for 480 steps at χ = 0.25):
+
+| invariant | pi linfs | pi zstar | pi threshold linfs / zstar | CORE2 linfs | CORE2 zstar |
+|---|---|---|---|---|---|
+| etacomp [m] | 6.3e-15 | 4.9e-15 | 5e-13 / 5e-13 | 6.6e-14 | 7.2e-14 |
+| trim [m²/s] | 5.7e-13 | 5.7e-13 | 6e-11 / 6e-11 | 3.2e-12 | 2.7e-12 |
+| \|msl\| [m] | 7.4e-16 | 6.9e-16 | 4e-14 / 7e-14 | 1.6e-15 | 2.1e-15 |
+| laysum [m] | — | 1.8e-11 | — / 2e-9 | — | 1.3e-11 |
+| w1 [m/s] | — | 3.1e-18 | — / 4e-16 | — | 4.3e-17 |
+| hlaw [m] | — | 7.3e-12 | — / 8e-10 | — | 8.2e-12 |
+| spreadU, spreadUm | 0 | 0 | 0 exactly | 0 | 0 |
+
+The CORE2 480-step runs used χ = 0.25 because at χ = 0.1 without the barotropic drag a
+cold-started CORE2 run blows up near step 335 ([IMPLEMENTATION.md](IMPLEMENTATION.md) §14). With the
+drag (on by default since plan Task 5.4) χ = 0.1 is stable for a CORE2 zstar year and is the default
+again since Task 5.8 (0.25 from Task 5.0 to Task 5.8); the pi levels and thresholds in the table were
+measured at χ = 0.1. The 3000-step physics screens
+(plan Task 5.1: CORE2 production physics, np 128, the defaults, M = 48, no barotropic viscosity, zstar,
+and SI linfs/zstar baselines) all run stably; after the cold-start transient SE's max|η| stays within
+3–6 cm of SI's, and the SE_CHECK maxima over 3000 steps are etacomp ≤ 7.2e-14 m, trim ≤ 3.6e-12
+m²/s, |msl| ≤ 2.6e-16 m, laysum ≤ 2.6e-11 m, spreads 0. The 1-year SE-vs-SI twins and the SSH-phase
+timing (plan Tasks 5.2, 5.3, 5.5–5.8) are in [IMPLEMENTATION.md](IMPLEMENTATION.md) §14.
 
 ### 7. Multi-rank and partition independence
 
@@ -373,7 +460,7 @@ byte-faithful but well-behaved.
 | Build | Status |
 |---|---|
 | Intel + double | **anchor** — byte-exact vs FESOM2; all gate results |
-| GNU + double | portability — all 21 `ctest` cases pass; pure-data fields bit-identical to Intel (only rotation-derived coordinates differ at ~1e-13, expected libm differences) |
+| GNU + double | portability — 170 of the 176 `ctest` cases pass; the 6 failures (`test_wimpl_tra_np1/np2`, `meshdiag_mixed/quad/pi_w`, `test_shared_elem_np1`) are deterministic and older than the split-explicit work. Pure-data fields bit-identical to Intel at the M-milestones (only rotation-derived coordinates differ at ~1e-13, expected libm differences) |
 | single precision | builds (scaffolding, §IMPLEMENTATION 6); not a byte-gate target |
 
 ### 10. Scalability and performance
@@ -407,7 +494,7 @@ On a Levante login node:
 
 ```bash
 ./configure.sh --compiler intel --precision dp --clean --build   # build the anchor
-cd build_intel_dp && ctest -j 8 --output-on-failure              # 153 self-tests
+cd build_intel_dp && ctest -j 8 --output-on-failure              # 176 self-tests
 cd .. && bash tools/run_conserve_pi.sh                           # conservation gate → GATE OK
 bash tools/run_tri_regression.sh                                 # triangle roundoff gate (§6b)
 ```

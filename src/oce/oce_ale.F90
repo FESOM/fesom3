@@ -47,8 +47,6 @@ module oce_ale
     ! at M2.8); update_thickness_ale is the linfs thickness commit (a no-op for which_ale=
     ! 'linfs'). Both join the faithful oce_timestep sequence assembled in mod_step_oce.
     public :: compute_vel_nodes, update_thickness_ale
-    ! zstar exact resume (FESOM3_RESTART_ZSTAR_EXACT): the derived geometry from a restored hnode.
-    public :: rebuild_thickness_ale
     ! The vertical-CFL / w-split pair at the end of vert_vel_ale, exported for
     ! test/test_wsplit.F90 (parts S and X drive them on prescribed w) and
     ! test/test_wimpl_tra.F90 (C2-C6 build their split with them).
@@ -637,23 +635,5 @@ contains
 
         if (is_multirank(partit)) call exchange_elem(mesh%helem, partit)   ! FESOM2 :1440
     end subroutine update_thickness_ale
-
-    !===========================================================================
-    subroutine rebuild_thickness_ale(mesh, partit)
-        ! zstar exact resume (FESOM3_RESTART_ZSTAR_EXACT=1, fesom_lifecycle_native_mr). The
-        ! checkpoint holds hnode (owned + exchange_nod halo) but not the geometry derived from
-        ! it, so a resume would start from the cold full-cell zbar_3d_n / Z_3d_n / helem /
-        ! hnode_new. Rebuild them with update_thickness_ale itself after hnode_new = hnode:
-        ! at the end of every straight-run step hnode_new == hnode at owned+halo nodes
-        ! (update_thickness_ale copies the stretched layers, the others are never written),
-        ! and GM (init_Redi_GM, fer_solve_Gamma) reads hnode_new before vert_vel_ale. The
-        ! node loop runs from the fixed anchor zbar_3d_n(nlevels_nod2D-1), the element loop
-        ! and its exchange_elem(helem) as in the step, so the result is bitwise the straight
-        ! run's. Call once, after restart_read and before the first step; zstar only.
-        type(t_mesh),   intent(inout), target :: mesh
-        type(t_partit), intent(in), optional  :: partit
-        mesh%hnode_new = mesh%hnode
-        call update_thickness_ale(mesh, partit)
-    end subroutine rebuild_thickness_ale
 
 end module oce_ale

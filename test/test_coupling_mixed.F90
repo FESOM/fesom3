@@ -190,7 +190,8 @@ contains
         allocate(atm%virtual_salt(nn), atm%relax_salt(nn), atm%Ssurf(nn))
         allocate(atm%evaporation(nn), atm%ice_sublimation(nn))
         allocate(atm%prec_rain(nn), atm%prec_snow(nn), atm%runoff(nn))
-        allocate(tracers%data(2), tracers%data(2)%values(nl-1, nn))
+        allocate(tracers%data(2))
+        allocate(tracers%data(2)%values(nl-1, nn))   ! separate statement: an allocate-object may not be a subobject of another in the same ALLOCATE (gfortran rejects it)
         ice%uice = 0.0_WP; ice%vice = 0.0_WP; ice%srfoce_u = 0.0_WP; ice%srfoce_v = 0.0_WP
         ice%stress_iceoce_x = 0.0_WP; ice%stress_iceoce_y = 0.0_WP
         ice%flx_fw = 0.0_WP; ice%flx_h = 0.0_WP
