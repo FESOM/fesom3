@@ -18,7 +18,7 @@ module oce_shortwave_pene
     ! consumes) + the heat_flux visible-removal. The surface heat_flux ITSELF (the
     ! air-sea obudget) is M3; here heat_flux is a prescribed input that the routine
     ! only ADDS the visible band back to.
-    use mod_precision, only: WP
+    use mod_precision, only: WP, WP_full
     use mod_constants, only: vcpw
     use mod_mesh, only: t_mesh
     use mod_partit, only: t_partit
@@ -75,7 +75,16 @@ contains
             nzmin = mesh%ulevels_nod2D(n2)
             sw_3d(nzmin, n2) = swsurf
             do k = nzmin+1, nzmax
+#if defined(USE_SINGLE_PRECISION)
+                ! single precision: the attenuation exp(z/sc) leaves the real32 normal range
+                ! (exp(-88) ~ 5e-39) above the aux < 1e-5 cut-off; Intel's expf then traps
+                ! (-fpe0, FTZ on) on pi at step 1. Evaluated in WP_full and rounded once; in
+                ! double precision this is the expression below.
+                aux = real(v1*exp(real(mesh%zbar_3d_n(k,n2)/sc1, WP_full)) &
+                         + v2*exp(real(mesh%zbar_3d_n(k,n2)/sc2, WP_full)), WP)
+#else
                 aux = (v1*exp(mesh%zbar_3d_n(k,n2)/sc1) + v2*exp(mesh%zbar_3d_n(k,n2)/sc2))
+#endif
                 sw_3d(k, n2) = swsurf*aux
                 if (aux < 1.e-5_WP .or. k == nzmax) then
                     sw_3d(k, n2) = 0.0_WP

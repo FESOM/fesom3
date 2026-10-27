@@ -33,7 +33,7 @@ module mod_mesh_areas
     ! (the partition guarantees an owned node's full element-neighbourhood is owned), so
     ! the area/elem_area halo exchanges (FESOM2 mesh_areas:2220/2322) are NOT needed for
     ! the owned-entry gate and are deferred to M2.12b (where the dynamics consume halos).
-    use mod_precision,   only: WP, MP
+    use mod_precision,   only: WP, MP, WP_full
     use mod_constants,   only: r_earth, omega, pi
     use mod_mesh,        only: t_mesh, MAX_NV
     use mod_partit,      only: t_partit
@@ -531,24 +531,26 @@ contains
         ! partial sums are summed across ranks by allreduce_sum (FESOM2 oce_mesh.F90:2389
         ! MPI_AllREDUCE(vol/vol2, MPI_SUM, MPI_DOUBLE_PRECISION) — the reduction is over the
         ! SAME owned-node partial sums in the same comm, so it is byte-identical, L6/L33).
+        ! Single precision: the area sums are global integrals and accumulate + reduce in
+        ! WP_full (upstream FESOM/fesom2#993/#1026); identical arithmetic in double precision.
         block
-            real(kind=MP) :: vol, vol2
-            real(kind=WP) :: gvol, gvol2
-            vol = 0.0_MP; vol2 = 0.0_MP
+            real(kind=WP_full) :: vol, vol2
+            real(kind=WP_full) :: gvol, gvol2
+            vol = 0.0_WP_full; vol2 = 0.0_WP_full
             do n = 1, nNodO
                 vol2 = vol2 + mesh%areasvol(n)
                 if (mesh%ulevels_nod2D(n) > 1) cycle
                 vol  = vol + mesh%areasvol(n)
             end do
             if (partit%npes > 1) then
-                gvol = real(vol, WP); gvol2 = real(vol2, WP)
+                gvol = vol; gvol2 = vol2
                 call allreduce_sum(gvol,  partit)     ! ocean_area      (surface, no cavity)
                 call allreduce_sum(gvol2, partit)     ! ocean_areawithcav (incl. cavity)
                 mesh%ocean_area        = real(gvol,  MP)
                 mesh%ocean_areawithcav = real(gvol2, MP)
             else
-                mesh%ocean_area        = vol
-                mesh%ocean_areawithcav = vol2
+                mesh%ocean_area        = real(vol,  MP)
+                mesh%ocean_areawithcav = real(vol2, MP)
             end if
         end block
     end subroutine compute_node_areas

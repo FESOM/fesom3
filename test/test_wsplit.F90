@@ -165,7 +165,7 @@ program test_wsplit
     !      bitwise" check was dropped: with w_e = 0 the QR4C flux is identically zero, so
     !      the chain IS the TDMA by construction and the check could not fail.)
     use mpi
-    use mod_precision,    only: WP, MP
+    use mod_precision,    only: WP, MP, WP_full
     use mod_mesh,         only: t_mesh
     use mod_dyn,          only: t_dyn
     use mod_tracer,       only: t_tracer
@@ -221,7 +221,8 @@ program test_wsplit
     real(kind=WP), parameter :: bq = cq*h0*(2.0_WP*real(kprobe, WP) + 3.0_WP)
     real(kind=WP), parameter :: jkink = cq*h0*h0*(1.0_WP + x_maxcfl)/2.0_WP   ! X0
     real(kind=WP), allocatable :: tref(:,:), tsplit(:,:), tother(:,:)
-    real(kind=WP), allocatable :: flux_v(:,:), flux_h(:,:), dttf_h(:,:), dttf_v(:,:)
+    real(kind=WP), allocatable :: flux_v(:,:), flux_h(:,:)
+    real(kind=WP_full), allocatable :: dttf_h(:,:), dttf_v(:,:)
     real(kind=WP), allocatable :: heat_flux(:), water_flux(:), virtual_salt(:), relax_salt(:), real_salt_flux(:)
     real(kind=WP), allocatable :: delta(:,:)
     ! ---- part S5 ----

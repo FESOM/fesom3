@@ -21,7 +21,7 @@ module oce_fer_gm
     !  - fer_gamma2vel `zinv=1/helem` and init_Redi_GM `bvfreq/bvref` (dead) /
     !    GMzexp exp-divide are scalar per node/level; gated, add !DIR$ NOVECTOR only if a
     !    field drifts ~1 ULP.
-    use mod_precision,   only: WP
+    use mod_precision,   only: WP, WP_full
     use mod_mesh,        only: t_mesh, MAX_NV
     use mod_constants,   only: density_0, g, pi
     use mod_param_phys,  only: Fer_GM, Redi, Redi_Kmax, Redi_Kmin, Redi_Ktaper, K_hor, &
@@ -123,7 +123,17 @@ contains
                 if     (K_GM_resscalorder==1) then
                     Ki(nzmin,n) = K_hor*(reso/refscalresol)**K_GM_resscalorder
                 elseif (K_GM_resscalorder==2) then
+#if defined(USE_SINGLE_PRECISION)
+                    ! FESOM2's literal K_hor**(...) (see above) exceeds the real32 range on coarse
+                    ! cells (pi, step 1: floating overflow trap); evaluated in WP_full and clamped
+                    ! to huge(WP). Only the Redi-without-GM template reads it (the Redi.and.Fer_GM
+                    ! coupling below overwrites it).
+                    Ki(nzmin,n) = real(min(real(K_hor, WP_full)**(real(mesh%area(n), WP_full) &
+                                  /(real(refscalresol, WP_full)**2)*2)**(1/real(K_GM_resscalorder, WP_full)), &
+                                  real(huge(1.0_WP), WP_full)), WP)
+#else
                     Ki(nzmin,n) = K_hor**(mesh%area(n)/(refscalresol**2)*2)**(1/K_GM_resscalorder)
+#endif
                 end if
             end if
         end do

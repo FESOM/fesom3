@@ -45,10 +45,11 @@ program fesom_lifecycle_native_mr
     use mod_timer           ! permanent per-component wall-clock timing (TMR_* ids, timer_start/stop/report)
     use, intrinsic :: ieee_arithmetic   ! M8c Step-3 fix: control flush-to-zero (denormal) underflow mode
     use, intrinsic :: iso_fortran_env, only: int32, real64
-    use mod_precision,      only: WP, MP, MPI_WP
+    use mod_precision,      only: WP, MP, MPI_WP, WP_full, MPI_WP_FULL
     use mod_constants,      only: density_0
     use mod_halo,           only: shared_copy_max_elem   ! FESOM3_STEP_DIAG shared-element spreads
     use mod_param_phys,     only: N2smth_h, alpha, theta, scale_area, shear_splines, N2_splines, rvo_upwind
+    use mod_param_phys,     only: use_salt_anomaly, S_ref_anomaly
     use mod_param_phys,     only: mix_coeff_PP, A_ver, K_ver, Kv0_const, mix_scheme_nmb
     use mod_param_phys,     only: use_instabmix, instabmix_kv, use_momix, use_windmix
     ! M4f: GM bolus (FESOM3_FER_GM) + Redi isopycnal diffusion (FESOM3_REDI) at MULTI-RANK —
@@ -140,7 +141,7 @@ program fesom_lifecycle_native_mr
     ! M8a: model clock (cold start from FESOM3_START_CLOCK) + run-length driver
     integer            :: clk_d0, clk_y0, clk_unit, idx, ierr
     real(kind=WP)      :: clk_t0, dstat(10)  ! dstat: M8c Step-3 global per-step physical diagnostics
-    real(kind=WP)      :: dsum(2)            ! [sum ssh_rhs_old, sum|ssh_rhs_old|] over owned nodes
+    real(kind=WP_full) :: dsum(2)            ! [sum ssh_rhs_old, sum|ssh_rhs_old|] over owned nodes
     logical            :: ftz_supported   ! M8c Step-3: flush-to-zero (denormal) underflow control (match FESOM2)
     logical            :: step_diag        ! perf: per-step global MPI_MAX stability diagnostic (env FESOM3_STEP_DIAG; default OFF — FESOM2 has no per-step collective)
     integer            :: mon_every        ! perf monitoring: emit a per-component timing report every mon_every steps (env FESOM3_TIMING_EVERY; 0 = only the final report)
@@ -175,7 +176,7 @@ program fesom_lifecycle_native_mr
     character(len=16)   :: forc_set, forc_calendar
     type(t_atm_forcing) :: frc
     integer             :: fld, fyear
-    real(kind=WP)       :: rdate_cold
+    real(kind=WP_full)  :: rdate_cold   ! absolute Julian day: real64 in every build
     real(kind=WP), allocatable :: nuw(:), nvw(:), nta(:), nsh(:), nswr(:), nlw(:), npr(:), nps(:)
     real(kind=WP), allocatable :: ncd(:), nch(:), nce(:), nsx(:), nsy(:), nix(:), niy(:)
     real(kind=WP), allocatable :: nro(:), nss(:)
@@ -199,6 +200,11 @@ program fesom_lifecycle_native_mr
     use_fer_gm = (ios == 0 .and. env_len > 0)
     call get_environment_variable('FESOM3_REDI', env, length=env_len, status=ios)
     use_redi = (ios == 0 .and. env_len > 0)
+    ! FESOM3_SALT_ANOMALY=1: store salinity as S - 35 (upstream use_salt_anomaly, #986/#940).
+    ! S_ref_anomaly is set after the initial conditions are read (they arrive absolute).
+    call get_environment_variable('FESOM3_SALT_ANOMALY', env, length=env_len, status=ios)
+    use_salt_anomaly = (ios == 0 .and. env_len > 0)
+    if (use_salt_anomaly) use_salt_anomaly = (trim(env) /= '0')
     call get_environment_variable('FESOM3_MIX_KPP', env, length=env_len, status=ios)
     use_kpp = (ios == 0 .and. env_len > 0)
     call get_environment_variable('FESOM3_MIX_TKE', env, length=env_len, status=ios)
@@ -317,6 +323,15 @@ program fesom_lifecycle_native_mr
         nElemO = partit%myDim_elem2D
         nElemF = partit%myDim_elem2D + partit%eDim_elem2D + partit%eXDim_elem2D
     end if
+    ! working-precision banner (upstream #940 prints the same in fesom_init)
+    if (partit%mype == 0) then
+#if defined(USE_SINGLE_PRECISION)
+        write(*,'(a,i0,a)') 'fesom_lifecycle_native_mr: working precision WP=', WP, &
+            ' bytes (SINGLE PRECISION MODE; WP_full=8 for time axis, integrals, CG, accumulators, hnode, TKE)'
+#else
+        write(*,'(a,i0,a)') 'fesom_lifecycle_native_mr: working precision WP=', WP, ' bytes (DOUBLE PRECISION MODE)'
+#endif
+    end if
     if (partit%mype == 0) &
         write(*,'(a,i0,a,i0,a,i0,a,i0)') 'fesom_lifecycle_native_mr: nod2D=', mesh%nod2D, &
             ' elem2D=', mesh%elem2D, ' nl=', nl, ' CW swaps=', nsw
@@ -423,6 +438,14 @@ program fesom_lifecycle_native_mr
     ic%ic_cyclic   = .true.
     ic%dummy       = 1.e10_WP
     call do_ic3d(tracers, ic, mesh, partit)
+    ! use_salt_anomaly: the IC arrives absolute (insitu2pot has used it) -> convert ONCE here,
+    ! before the AB copies below (upstream ocean_setup). Restarts are converted after the read.
+    if (use_salt_anomaly) then
+        S_ref_anomaly = 35.0_WP
+        tracers%data(2)%values = tracers%data(2)%values - S_ref_anomaly
+        if (partit%mype == 0) write(*,'(a,f6.2)') &
+            'fesom_lifecycle_native_mr: use_salt_anomaly: salinity state = S - ', S_ref_anomaly
+    end if
     if (partit%mype == 0) &
         write(*,'(a,2es12.4,a,2es12.4)') 'fesom_lifecycle_native_mr: IC(rank0 owned) T=', &
             minval(tracers%data(1)%values(:,1:nNodO)), maxval(tracers%data(1)%values(:,1:nNodO)), &
@@ -774,8 +797,7 @@ program fesom_lifecycle_native_mr
         frc%f(7)%file_base = trim(forcing_dir)//'/ncar_precip.'; frc%f(7)%varname = 'RAIN'
         frc%f(8)%file_base = trim(forcing_dir)//'/ncar_precip.'; frc%f(8)%varname = 'SNOW'
     end if
-    rdate_cold = real(forcing_julday(yearnew,1,1,forc_calendar),WP) &  ! cold-start rdate, NO half-step
-               + real(daynew-1,WP) + timenew/86400._WP                 ! (FESOM2 nc_sbc_ini:643-644)
+    rdate_cold = forcing_rdate(forc_calendar, .false.)   ! cold-start rdate, NO half-step (nc_sbc_ini:643-644)
     call forcing_alloc(frc)
     do fld = 1, frc%nfld
         call forcing_read_grid(frc, fld, fyear)
@@ -944,6 +966,25 @@ program fesom_lifecycle_native_mr
             if (partit%mype == 0) write(*,'(a,f9.1,a,i0,a,i0)') &
                 'restart: state restored (resumed run) at clock time=', timenew, ' day=', daynew, &
                 ' year=', yearnew
+            ! use_salt_anomaly (upstream fesom_init): a restart may hold ABSOLUTE salinity (from a run
+            ! without the anomaly) or the anomaly. Detect by the global maximum (absolute peaks near
+            ! 41 psu, the anomaly near 41-S_ref) and convert once; every AB level shifts alike.
+            if (use_salt_anomaly) then
+                block
+                    real(kind=WP) :: smax_g
+                    smax_g = maxval(tracers%data(2)%values(:,1:nNodO))
+                    call MPI_Allreduce(MPI_IN_PLACE, smax_g, 1, MPI_WP, MPI_MAX, partit%MPI_COMM_FESOM, ierr)
+                    if (smax_g > 20.0_WP) then
+                        tracers%data(2)%values    = tracers%data(2)%values    - S_ref_anomaly
+                        tracers%data(2)%valuesAB  = tracers%data(2)%valuesAB  - S_ref_anomaly
+                        tracers%data(2)%valuesold = tracers%data(2)%valuesold - S_ref_anomaly
+                        if (partit%mype == 0) write(*,'(a)') &
+                            'restart: use_salt_anomaly: absolute-salinity restart -> converted to S - S_ref'
+                    else if (partit%mype == 0) then
+                        write(*,'(a)') 'restart: use_salt_anomaly: anomaly-salinity restart -> no conversion'
+                    end if
+                end block
+            end if
         end if
     end if
 
@@ -993,12 +1034,13 @@ program fesom_lifecycle_native_mr
         if (do_output) then
             if (means_has(oio,'ssh'))    call means_accumulate(oio,'ssh',    dyn%eta_n(1:nNodO))
             if (means_has(oio,'sst'))    call means_accumulate(oio,'sst',    tracers%data(1)%values(1,1:nNodO))
-            if (means_has(oio,'sss'))    call means_accumulate(oio,'sss',    tracers%data(2)%values(1,1:nNodO))
+            ! salinity output stays absolute (S_ref=0 unless use_salt_anomaly)
+            if (means_has(oio,'sss'))    call means_accumulate(oio,'sss',    tracers%data(2)%values(1,1:nNodO) + S_ref_anomaly)
             if (means_has(oio,'a_ice'))  call means_accumulate(oio,'a_ice',  ice%data(1)%values(1:nNodO))
             if (means_has(oio,'m_ice'))  call means_accumulate(oio,'m_ice',  ice%data(2)%values(1:nNodO))
             if (means_has(oio,'m_snow')) call means_accumulate(oio,'m_snow', ice%data(3)%values(1:nNodO))
             if (means_has(oio,'temp'))   call means_accumulate(oio,'temp',   tracers%data(1)%values(1:nl-1, 1:nNodO))
-            if (means_has(oio,'salt'))   call means_accumulate(oio,'salt',   tracers%data(2)%values(1:nl-1, 1:nNodO))
+            if (means_has(oio,'salt'))   call means_accumulate(oio,'salt',   tracers%data(2)%values(1:nl-1, 1:nNodO) + S_ref_anomaly)
             if (means_has(oio,'w'))      call means_accumulate(oio,'w',      dyn%w(1:nl, 1:nNodO))
             if (means_has(oio,'unod'))   call means_accumulate(oio,'unod',   dyn%uvnode(1, 1:nl-1, 1:nNodO))
             if (means_has(oio,'vnod'))   call means_accumulate(oio,'vnod',   dyn%uvnode(2, 1:nl-1, 1:nNodO))
@@ -1054,7 +1096,7 @@ program fesom_lifecycle_native_mr
         dstat(3) = maxval(ice%data(1)%values(1:nNodO))            ! a_ice  (area fraction, >=0)
         dstat(4) = maxval(ice%data(2)%values(1:nNodO))            ! m_ice  (effective thickness, >=0)
         dstat(5) = maxval(tracers%data(1)%values(:,1:nNodO))      ! T max  (tropical SST ceiling)
-        dstat(6) = maxval(tracers%data(2)%values(:,1:nNodO))      ! S max  (evaporative-basin salinity)
+        dstat(6) = maxval(tracers%data(2)%values(:,1:nNodO)) + S_ref_anomaly  ! S max (absolute)
         ! Shared elements (docs/plans/completed/20261012-shared-element-sync.md): the copy spreads
         ! max|copy - designated owner's copy| of uv (0 with FESOM3_SHARED_SYNC=1; the drift
         ! without it), uv_rhsAB and sigma (0 by construction, guarded by test_vinv V13 and
@@ -1073,14 +1115,14 @@ program fesom_lifecycle_native_mr
         ! step line stays byte-identical (G0 and run_cutout_short.sh read its fields).
         dstat(10) = maxval(dyn%cfl_z(:,1:nNodO))
         call MPI_Allreduce(MPI_IN_PLACE, dstat, 10, MPI_WP, MPI_MAX, partit%MPI_COMM_FESOM, ierr)
-        dsum = [sum(dyn%ssh_rhs_old(1:nNodO)), sum(abs(dyn%ssh_rhs_old(1:nNodO)))]
-        call MPI_Allreduce(MPI_IN_PLACE, dsum, 2, MPI_WP, MPI_SUM, partit%MPI_COMM_FESOM, ierr)
+        dsum = [sum(real(dyn%ssh_rhs_old(1:nNodO), WP_full)), sum(abs(real(dyn%ssh_rhs_old(1:nNodO), WP_full)))]
+        call MPI_Allreduce(MPI_IN_PLACE, dsum, 2, MPI_WP_FULL, MPI_SUM, partit%MPI_COMM_FESOM, ierr)
         if (partit%mype == 0) &
             write(*,'(a,i0,10(a,es12.4))') 'fesom_lifecycle_native_mr: step ', n, &
                 '  max|eta|=', dstat(1), '  max|uv|=', dstat(2), &
                 '  a_ice=', dstat(3), '  m_ice=', dstat(4), &
                 '  Tmax=', dstat(5), '  Smax=', dstat(6), &
-                '  divsum=', abs(dsum(1))/max(dsum(2), tiny(1.0_WP)), &
+                '  divsum=', abs(dsum(1))/max(dsum(2), tiny(1.0_WP_full)), &
                 '  dUV=', dstat(7), '  dAB=', dstat(8), '  dsig=', dstat(9)
         if (partit%mype == 0) &
             write(*,'(a,i0,a,es12.4)') 'fesom_lifecycle_native_mr: CFL_z step ', n, '  max CFL_z=', dstat(10)
@@ -1258,7 +1300,7 @@ contains
     ! once at setup. Every routine threads partit -> the OWNED+HALO nodes are filled.
     subroutine compute_native_forcing(n)
         integer, intent(in) :: n                       ! step index -> per-step forcing rdate (rcur)
-        real(kind=WP) :: rcur
+        real(kind=WP_full) :: rcur
         ! M8b: refresh interp coefficients on record/day crossings (forcing_sbc_do reads the model
         ! clock yearnew/daynew/timenew), THEN evaluate atmdata at the per-step rdate. rcur MUST equal
         ! forcing_sbc_do's per-field rdate (same formula, same clock; forc_calendar matches the file
@@ -1267,8 +1309,7 @@ contains
         call timer_start(TMR_FRC_SBC)
         call forcing_sbc_do(frc, mesh, partit)
         call timer_stop(TMR_FRC_SBC)
-        rcur = real(forcing_julday(yearnew,1,1,forc_calendar),WP) + real(daynew-1,WP) &
-             + timenew/86400._WP - dt/86400._WP/2._WP
+        rcur = forcing_rdate(forc_calendar, .true.)
         call timer_start(TMR_FRC_INTERP)
         call forcing_timeinterp(frc, rcur, partit)
         nuw = frc%atmdata(1,1:nNodL);  nvw = frc%atmdata(2,1:nNodL);  nsh = frc%atmdata(3,1:nNodL)

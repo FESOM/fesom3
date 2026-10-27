@@ -33,7 +33,7 @@ module oce_adv_tra_driver
     !  * the DVD (downgradient-variance-decomposition) diagnostic blocks are dropped (not v1).
     !  * work arrays live in tracers%work (MP); kernels take WP. At the DP/SP anchor
     !    MP==WP so the pointers/args bind by kind value; revisit for FP16 (D3).
-    use mod_precision,    only: WP
+    use mod_precision,    only: WP, WP_full
     use mod_mesh,         only: t_mesh
     use mod_dyn,          only: t_dyn
     use mod_tracer,       only: t_tracer
@@ -68,7 +68,8 @@ contains
 
         ! pointers into the per-tracer data / shared work (mirrors FESOM2 lines 92-106)
         real(kind=WP), pointer :: ttf(:,:), ttfAB(:,:), fct_LO(:,:)
-        real(kind=WP), pointer :: adv_flux_hor(:,:), adv_flux_ver(:,:), dttf_h(:,:), dttf_v(:,:)
+        real(kind=WP), pointer :: adv_flux_hor(:,:), adv_flux_ver(:,:)
+        real(kind=WP_full), pointer :: dttf_h(:,:), dttf_v(:,:), fct_LO_tend(:,:)
         real(kind=WP), pointer :: fct_ttf_min(:,:), fct_ttf_max(:,:), fct_plus(:,:), fct_minus(:,:)
         real(kind=WP), pointer :: tr_xy(:,:,:)
         integer,       pointer :: edge_up_dn_tri(:,:)
@@ -96,6 +97,14 @@ contains
         fct_minus       => tracers%work%fct_minus
         dttf_h          => tracers%work%del_ttf_advhoriz
         dttf_v          => tracers%work%del_ttf_advvert
+#if defined(USE_SINGLE_PRECISION)
+        ! allocated on first use, shaped as fct_LO, so every driver gets it
+        if (.not. allocated(tracers%work%fct_LO_tend)) then
+            allocate(tracers%work%fct_LO_tend(size(fct_LO,1), size(fct_LO,2)))
+            tracers%work%fct_LO_tend = 0.0_WP_full
+        end if
+        fct_LO_tend     => tracers%work%fct_LO_tend
+#endif
 
         !_______________________________________________________________________
         ! FCT: low-order horizontal+vertical solution + low-order antidiffusive part
@@ -103,6 +112,52 @@ contains
             ! low-order upwind horizontal flux (zero the flux first)
             call adv_tra_hor_upw1(vel, ttf, mesh, adv_flux_hor, o_init_zero=.true., partit=partit)
 
+#if defined(USE_SINGLE_PRECISION)
+            ! SINGLE PRECISION (upstream #1054/#1056/#1206): the low-order tendency is kept in
+            ! FLUX form in the WP_full fct_LO_tend. Recovering it as LO*hnode_new - ttf*hnode
+            ! from the real32 LO loses every per-step change below half an ulp of the tracer,
+            ! and the vertical advection stops telescoping (upstream: -0.5 W/m2 heat in SP).
+            ! Double precision keeps the reconstruction below (upstream changed it in DP too,
+            ! #1056, which changes the DP rounding; FESOM_F keeps DP bit-identical).
+            do n = 1, nNodL
+                do nz = 1, mesh%nl-1
+                    fct_LO_tend(nz,n) = 0.0_WP_full
+                    fct_LO(nz,n)      = 0.0_WP      ! as the DP path: no stale entries off the column
+                end do
+            end do
+            do e = 1, nEdgeO
+                enodes = mesh%edges(:, e)
+                el     = mesh%edge_tri(:, e)
+                nl1 = mesh%nlevels(el(1))-1
+                nu1 = mesh%ulevels(el(1))
+                nl2 = 0; nu2 = 0
+                if (el(2) /= el(1)) then
+                    nl2 = mesh%nlevels(el(2))-1
+                    nu2 = mesh%ulevels(el(2))
+                end if
+                nl12 = max(nl1, nl2)
+                nu12 = nu1
+                if (nu2 > 0) nu12 = min(nu1, nu2)
+                do nz = nu12, nl12
+                    fct_LO_tend(nz, enodes(1)) = fct_LO_tend(nz, enodes(1)) + adv_flux_hor(nz, e)
+                    fct_LO_tend(nz, enodes(2)) = fct_LO_tend(nz, enodes(2)) - adv_flux_hor(nz, e)
+                end do
+            end do
+            call adv_tra_ver_upw1(we, ttf, mesh, adv_flux_ver, o_init_zero=.true., partit=partit)
+            do n = 1, nNodO
+                nu1 = mesh%ulevels_nod2D(n)
+                nl1 = mesh%nlevels_nod2D(n)
+                do nz = nu1, nl1-1
+                    fct_LO_tend(nz,n) = (fct_LO_tend(nz,n) + (real(adv_flux_ver(nz,n), WP_full) &
+                                       - adv_flux_ver(nz+1,n)))*dt/mesh%areasvol(n)
+                    fct_LO(nz,n) = (ttf(nz,n)*mesh%hnode(nz,n) + fct_LO_tend(nz,n))/mesh%hnode_new(nz,n)
+                end do
+            end do
+            if (dynamics%use_wsplit) then
+                call adv_tra_vert_impl(dt, wi, fct_LO, mesh, partit=partit, tend=fct_LO_tend)
+                call adv_tra_ver_upw1(w, ttf, mesh, adv_flux_ver, o_init_zero=.true., partit=partit)
+            end if
+#else
             ! fct_LO = scatter of the LO horizontal flux over edges
             do n = 1, nNodL
                 do nz = 1, mesh%nl-1
@@ -149,6 +204,7 @@ contains
                 call adv_tra_vert_impl(dt, wi, fct_LO, mesh, partit=partit)
                 call adv_tra_ver_upw1(w, ttf, mesh, adv_flux_ver, o_init_zero=.true., partit=partit)
             end if
+#endif
             ! M2.12b: share the low-order solution to the halo (FESOM2 :294) — the FCT
             ! limiter's a1 reads fct_LO at owned+halo nodes.
             if (is_multirank(partit)) call exchange_nod(fct_LO, partit)
@@ -192,8 +248,13 @@ contains
         if (trim(tracers%data(tr_num)%tra_adv_lim) == 'FCT') then
             call oce_tra_adv_fct(dt, ttf, fct_LO, adv_flux_hor, adv_flux_ver, &
                                  fct_ttf_min, fct_ttf_max, fct_plus, fct_minus, mesh, partit=partit)
+#if defined(USE_SINGLE_PRECISION)
+            call oce_tra_adv_flux2dtracer(dt, dttf_h, dttf_v, adv_flux_hor, adv_flux_ver, mesh, &
+                                          partit=partit, lo_tend=fct_LO_tend)
+#else
             call oce_tra_adv_flux2dtracer(dt, dttf_h, dttf_v, adv_flux_hor, adv_flux_ver, mesh, &
                                           use_lo=.true., ttf=ttf, lo=fct_LO, partit=partit)
+#endif
         else
             call oce_tra_adv_flux2dtracer(dt, dttf_h, dttf_v, adv_flux_hor, adv_flux_ver, mesh, partit=partit)
         end if

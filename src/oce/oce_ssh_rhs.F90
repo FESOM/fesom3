@@ -68,7 +68,7 @@ module oce_ssh_rhs
     !  - myDim_nod2D -> nod2D, myDim_edge2D -> edge2D, eDim_nod2D -> 0. The
     !    row<=myDim_nod2D / n1<=myDim_nod2D guards are always true at 1-rank (kept for
     !    multi-rank faithfulness). exchange_nod(ssh_rhs) at the tail is a no-op, dropped.
-    use mod_precision,  only: WP, MP
+    use mod_precision,  only: WP, MP, WP_full
     use mod_constants,  only: g
     use mod_param_phys, only: alpha, theta
     use mod_config,     only: which_ALE          ! M6a-3: 'linfs'/'zlevel'/'zstar'
@@ -245,12 +245,25 @@ contains
 
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
         allocate(rev(nNodL))
+#if defined(USE_SINGLE_PRECISION)
+        ! single precision (upstream #997): seed the real64 accumulator on the first update (a
+        ! cold start and a restart alike: init_stiff_mat_ale has run by then), accumulate the
+        ! increments in it, and refresh the WP matrix the solver reads once per step
+        if (.not. allocated(mesh%ssh_stiff%values_full)) then
+            allocate(mesh%ssh_stiff%values_full(size(mesh%ssh_stiff%values)))
+            mesh%ssh_stiff%values_full = real(mesh%ssh_stiff%values, WP_full)
+        end if
+        call add_edge_stiffness(mesh, nNodO, nEdgeO, -mesh%dhe(1:nElemO), g*dt*alpha*theta, rev, &
+                                acc=mesh%ssh_stiff%values_full)
+        mesh%ssh_stiff%values = real(mesh%ssh_stiff%values_full, MP)
+#else
         call add_edge_stiffness(mesh, nNodO, nEdgeO, -mesh%dhe(1:nElemO), g*dt*alpha*theta, rev)
+#endif
         deallocate(rev)
     end subroutine update_stiff_mat_ale
 
     !===========================================================================
-    subroutine add_edge_stiffness(mesh, nNodO, nEdgeO, depth_e, factor, rev)
+    subroutine add_edge_stiffness(mesh, nNodO, nEdgeO, depth_e, factor, rev, acc)
         ! The edge assembly of init_stiff_mat_ale (d) and update_stiff_mat_ale: for every
         ! OWNED edge and each of its elements (both OWNED, invariant ii; a boundary edge
         ! has one), fy(k) = depth_e(el)*(gradient_sca_x(k)*edge_cross_dy -
@@ -262,6 +275,8 @@ contains
         integer,       intent(in)            :: nNodO, nEdgeO
         real(kind=WP), intent(in)            :: depth_e(:), factor
         integer,       intent(inout)         :: rev(:)
+        ! single precision only: accumulate into this real64 shadow instead of values (#997)
+        real(kind=WP_full), intent(inout), optional :: acc(:)
         integer       :: ed, el(2), elnodes(MAX_NV), i, j, k, n, row, npos(MAX_NV)
         real(kind=WP) :: fy(MAX_NV)
         associate(ssh_stiff => mesh%ssh_stiff)
@@ -282,6 +297,20 @@ contains
                         rev(ssh_stiff%colind_loc(n)) = n
                     end do
                     npos = rev(elnodes)
+#if defined(USE_SINGLE_PRECISION)
+                    if (present(acc)) then
+                        if (j == 1) then
+                            do k = 1, MAX_NV
+                                acc(npos(k)) = acc(npos(k)) + real(fy(k)*factor, WP_full)
+                            end do
+                        else
+                            do k = 1, MAX_NV
+                                acc(npos(k)) = acc(npos(k)) - real(fy(k)*factor, WP_full)
+                            end do
+                        end if
+                        cycle
+                    end if
+#endif
                     if (j == 1) then
                         do k = 1, MAX_NV
                             ssh_stiff%values(npos(k)) = ssh_stiff%values(npos(k)) + fy(k)*factor

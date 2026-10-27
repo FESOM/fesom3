@@ -29,7 +29,7 @@ module oce_adv_tra_ver
     ! column is 4 layers, so neither the 1-layer ttf(0) read nor the QR4C 2-layer
     ! double-write (2nd-layer and bottom-1 both hitting interface nzmin+1) occurs; the
     ! statement order below still reproduces both faithfully for deeper-min meshes.
-    use mod_precision,   only: WP
+    use mod_precision,   only: WP, WP_full
     use mod_mesh,        only: t_mesh
     use mod_partit,      only: t_partit
     use mod_part_bounds, only: owned_bounds
@@ -140,7 +140,7 @@ contains
     end subroutine adv_tra_ver_qr4c
 
     !===========================================================================
-    subroutine adv_tra_vert_impl(dt, w, ttf, mesh, partit)
+    subroutine adv_tra_vert_impl(dt, w, ttf, mesh, partit, tend)
         ! Implicit (backward-Euler) 1st-order upwind vertical advection of the OWNED
         ! columns with the implicit part w_i of the split vertical velocity (use_wsplit,
         ! oce_wsplit / compute_Wvel_split), applied IN PLACE to the FCT low-order solution
@@ -196,8 +196,11 @@ contains
         real(kind=WP), intent(in)    :: w  (mesh%nl,   mesh%nod2D)
         real(kind=WP), intent(inout) :: ttf(mesh%nl-1, mesh%nod2D)
         type(t_partit), intent(in), optional :: partit
-        real(kind=WP) :: a(mesh%nl), b(mesh%nl), c(mesh%nl), tr(mesh%nl), cp(mesh%nl), tp(mesh%nl)
-        real(kind=WP) :: v, m, hn
+        ! single precision: the low-order tendency in flux form gets the implicit increment
+        ! tr*hnode_new too (upstream #1056 tend argument); the column scratch is WP_full (#1206)
+        real(kind=WP_full), intent(inout), optional :: tend(mesh%nl-1, mesh%nod2D)
+        real(kind=WP_full) :: a(mesh%nl), b(mesh%nl), c(mesh%nl), tr(mesh%nl), cp(mesh%nl), tp(mesh%nl)
+        real(kind=WP_full) :: v, m, hn
         integer :: n, nz, nzmax, nzmin
         integer :: nNodO, nNodL, nEdgeO, nElemO
 
@@ -205,7 +208,7 @@ contains
         do n = 1, nNodO
             nzmax = mesh%nlevels_nod2D(n)
             nzmin = mesh%ulevels_nod2D(n)
-            v = dt*mesh%area(n)/mesh%areasvol(n)
+            v = real(dt, WP_full)*mesh%area(n)/mesh%areasvol(n)
 
             ! coefficients: surface layer
             nz = nzmin
@@ -254,6 +257,11 @@ contains
             do nz = nzmin, nzmax-1
                 ttf(nz,n) = ttf(nz,n) + tr(nz)
             end do
+            if (present(tend)) then
+                do nz = nzmin, nzmax-1
+                    tend(nz,n) = tend(nz,n) + tr(nz)*mesh%hnode_new(nz,n)
+                end do
+            end if
         end do
     end subroutine adv_tra_vert_impl
 

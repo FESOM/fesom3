@@ -26,7 +26,7 @@ module oce_ale_tracer
     ! terms (use_wsplit, non-FCT tracers) are pinned by test_wsplit part X (QR4C + this
     ! TDMA, Kv = 0) and are off for FCT tracers. 1-rank only; the FESOM2
     ! exchange_nod(values) loop tail is a no-op here (M2.12).
-    use mod_precision,      only: WP, MP
+    use mod_precision,      only: WP, MP, WP_full, use_tracer_carry
     use mod_constants,      only: vcpw
     use mod_mesh,           only: t_mesh
     use mod_dyn,            only: t_dyn
@@ -35,7 +35,7 @@ module oce_ale_tracer
     use mod_part_bounds,    only: owned_bounds, is_multirank, local_dims
     use mod_halo,           only: exchange_nod
     use mod_param_phys,     only: Fer_GM, Redi, use_kpp_nonlclflx, &
-                                  mix_scheme_nmb, ref_sss, ref_sss_local
+                                  mix_scheme_nmb, ref_sss, ref_sss_local, S_ref_anomaly
     use mod_config,         only: use_sw_pene
     use oce_tracer_mod,     only: init_tracers_AB
     use oce_tracer_grad,    only: tracer_gradient_z
@@ -183,8 +183,9 @@ contains
         do node = 1, nNodL
             nzmax = mesh%nlevels_nod2D(node) - 1
             nzmin = mesh%ulevels_nod2D(node)
-            where (Svalues(nzmin:nzmax,node) > 45.0_WP) Svalues(nzmin:nzmax,node) = 45.0_WP
-            where (Svalues(nzmin:nzmax,node) <  3.0_WP) Svalues(nzmin:nzmax,node) =  3.0_WP
+            ! clip bounds in anomaly space (S_ref=0 unless use_salt_anomaly)
+            where (Svalues(nzmin:nzmax,node) > 45.0_WP - S_ref_anomaly) Svalues(nzmin:nzmax,node) = 45.0_WP - S_ref_anomaly
+            where (Svalues(nzmin:nzmax,node) <  3.0_WP - S_ref_anomaly) Svalues(nzmin:nzmax,node) =  3.0_WP - S_ref_anomaly
         end do
 
     end subroutine solve_tracers_ale
@@ -215,11 +216,24 @@ contains
         integer :: n, nzmin, nzmax
         integer :: nNodO, nNodL, nEdgeO, nElemO
         real(kind=WP), dimension(:,:), pointer :: trarr
-        real(kind=MP), dimension(:,:), pointer :: del_ttf
+        real(kind=WP_full), dimension(:,:), pointer :: del_ttf
+#if defined(USE_SINGLE_PRECISION)
+        integer :: nz
+        real(kind=WP_full) :: acc
+        real(kind=WP)      :: tnew
+#endif
 
         trarr   => tracers%data(tr_num)%values
         del_ttf => tracers%work%del_ttf
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
+#if defined(USE_SINGLE_PRECISION)
+        ! the tracer carry, allocated on first use (zero = no residual yet; not in the restart,
+        ! as upstream: a restarted single-precision run starts from a zero carry)
+        if (.not. allocated(tracers%work%carry)) then
+            allocate(tracers%work%carry(size(trarr,1), size(trarr,2), tracers%num_tracers))
+            tracers%work%carry = 0.0_WP
+        end if
+#endif
 
         ! horizontal diffusion: del_ttf += R_T^n (+ M4d Redi K13/K23 isoneutral terms if Redi)
         call diff_part_hor_redi(tr_xy, Ki, dt, dynamics, tracers, mesh, partit)
@@ -236,6 +250,24 @@ contains
         ! is complete (advection over owned nodes + diff_part_hor_redi over owned edges, both
         ! invariant-i complete), so T* is correct at owned nodes — the halo is filled by
         ! solve_tracers_ale's exchange_nod(values).
+#if defined(USE_SINGLE_PRECISION)
+        ! SINGLE PRECISION, tracer carry (upstream FESOM/fesom2#1206 use_tracer_carry): the
+        ! content h^n*T^n + del_ttf + carry is formed in WP_full, the new state rounded once to
+        ! WP, and the thickness-weighted rounding residual kept in carry for the next write.
+        ! The re-rounding of the state is biased; the carry (error feedback, as in Kahan
+        ! summation) makes the content exact to real64 while the state stays real32.
+        do n = 1, nNodO
+            nzmax = mesh%nlevels_nod2D(n) - 1
+            nzmin = mesh%ulevels_nod2D(n)
+            do nz = nzmin, nzmax
+                acc  = trarr(nz,n)*mesh%hnode(nz,n) + del_ttf(nz,n) + tracers%work%carry(nz,n,tr_num)
+                tnew = real(acc/mesh%hnode_new(nz,n), WP)
+                tracers%work%carry(nz,n,tr_num) = real(acc - tnew*mesh%hnode_new(nz,n), WP)
+                del_ttf(nz,n) = del_ttf(nz,n) + trarr(nz,n)*(mesh%hnode(nz,n)-mesh%hnode_new(nz,n))
+                trarr(nz,n)   = tnew
+            end do
+        end do
+#else
         do n = 1, nNodO
             nzmax = mesh%nlevels_nod2D(n) - 1
             nzmin = mesh%ulevels_nod2D(n)
@@ -244,6 +276,7 @@ contains
             trarr(nzmin:nzmax,n)   = trarr(nzmin:nzmax,n) + &
                                      del_ttf(nzmin:nzmax,n)/mesh%hnode_new(nzmin:nzmax,n)
         end do
+#endif
 
         !_______________________________________________________________________
         ! implicit vertical diffusion (i_vert_diff=.true.): the TDMA, consumes dyn%work%Kv
@@ -283,7 +316,7 @@ contains
         real(kind=WP) :: deltaX1, deltaY1, deltaX2, deltaY2, c, Fx, Fy, Tx, Ty, Kh, dz
         real(kind=WP) :: Tz(2), SxTz, SyTz
         real(kind=WP) :: rhs1(mesh%nl-1), rhs2(mesh%nl-1)
-        real(kind=MP), dimension(:,:), pointer :: del_ttf
+        real(kind=WP_full), dimension(:,:), pointer :: del_ttf
 
         del_ttf => tracers%work%del_ttf
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
@@ -424,7 +457,7 @@ contains
         real(kind=WP) :: Tx, Ty, vd_flux(mesh%nl)
         real(kind=WP) :: zbar_n(mesh%nl), z_n(mesh%nl-1)
         real(kind=WP), allocatable :: tr_xynodes(:,:,:)
-        real(kind=MP), dimension(:,:), pointer :: del_ttf
+        real(kind=WP_full), dimension(:,:), pointer :: del_ttf
         real(kind=WP), dimension(:,:),   pointer :: Ki
         real(kind=WP), dimension(:,:,:), pointer :: slope_tapered
 
@@ -529,12 +562,18 @@ contains
         real(kind=WP),  intent(in)            :: real_salt_flux(mesh%nod2D), is_nonlinfs
         type(t_partit), intent(in), optional  :: partit
         !
-        real(kind=WP) :: a(mesh%nl), b(mesh%nl), c(mesh%nl), tr(mesh%nl)
-        real(kind=WP) :: cp(mesh%nl), tp(mesh%nl)
-        real(kind=WP) :: zbar_n(mesh%nl), Z_n(mesh%nl-1)
+        ! column scratch of the implicit solve in WP_full (upstream #1206): the TDMA solves for
+        ! the increment of a real32 state; in double precision WP_full == WP
+        real(kind=WP_full) :: a(mesh%nl), b(mesh%nl), c(mesh%nl), tr(mesh%nl)
+        real(kind=WP_full) :: cp(mesh%nl), tp(mesh%nl)
+        real(kind=WP_full) :: zbar_n(mesh%nl), Z_n(mesh%nl-1)
         integer       :: nz, n, nzmax, nzmin, id
         integer       :: nNodO, nNodL, nEdgeO, nElemO
-        real(kind=WP) :: m, zinv, dz, zinv1, zinv2, v_adv, Ty, Ty1, rsss
+        real(kind=WP_full) :: m, zinv, dz, zinv1, zinv2, v_adv, Ty, Ty1, rsss
+#if defined(USE_SINGLE_PRECISION)
+        real(kind=WP_full) :: acc
+        real(kind=WP)      :: tnew
+#endif
         logical       :: do_wimpl
         real(kind=WP), dimension(:,:), pointer :: trarr, Wvel_i
 
@@ -663,7 +702,7 @@ contains
                                         *(mesh%area(n)/mesh%areasvol(n)) ) * heat_flux(n) / vcpw * dt
                 else if (id == 2) then      ! salinity
                     rsss = ref_sss
-                    if (ref_sss_local) rsss = trarr(1,n)   ! FESOM2 values(1,n): level 1 (=nzmin, no cavity)
+                    if (ref_sss_local) rsss = trarr(1,n) + S_ref_anomaly   ! FESOM2 values(1,n); absolute S
                     nz = nzmin
                     tr(nz) = tr(nz) - ( -MIN(dynamics%work%ghats(nz+1,n)*dynamics%work%blmc(nz+1,n,3), 1.0_WP) &
                                         *(mesh%area(n)/mesh%areasvol(n)) ) * rsss * water_flux(n) * dt
@@ -711,9 +750,21 @@ contains
             end do
             !___________________________________________________________________
             ! update tracer: trarr (=T*) + dTnew
+#if defined(USE_SINGLE_PRECISION)
+            ! single precision: round the new state once and keep the thickness-weighted
+            ! residual in the carry (upstream #1206)
+            do nz = nzmin, nzmax-1
+                acc  = trarr(nz,n) + tr(nz)
+                tnew = real(acc, WP)
+                tracers%work%carry(nz,n,tr_num) = tracers%work%carry(nz,n,tr_num) &
+                                                + real((acc - tnew)*mesh%hnode_new(nz,n), WP)
+                trarr(nz,n) = tnew
+            end do
+#else
             do nz = nzmin, nzmax-1
                 trarr(nz,n) = trarr(nz,n) + tr(nz)
             end do
+#endif
         end do
     end subroutine diff_ver_part_impl_ale
 
@@ -730,7 +781,10 @@ contains
         case (1)  ! temperature
             bc_surface = -dt*(heat_flux/vcpw + sval*water_flux*is_nonlinfs)
         case (2)  ! salinity (virtual_salt is 0 for zlevel/zstar; nonzero for linfs)
-            bc_surface =  dt*(virtual_salt + relax_salt + real_salt_flux*is_nonlinfs)
+            ! use_salt_anomaly background-dilution term (upstream #940/#986; S_ref=0 unless enabled,
+            ! reducing to the original BC): S_ref*water_flux cancels most of the constancy error of
+            ! the offset S_ref in the free-surface advection (upstream: ~99.4 %).
+            bc_surface =  dt*(virtual_salt + relax_salt + (real_salt_flux + S_ref_anomaly*water_flux)*is_nonlinfs)
         case default
             bc_surface = 0.0_WP
         end select

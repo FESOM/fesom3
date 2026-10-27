@@ -3,7 +3,7 @@ module mod_tracer
     ! Per-tracer scheme config rides inside t_tracer_data (D4/D6). DVD-diagnostic
     ! fields dropped (not v1). Tracer DATA = WP (precision under test); tracer WORK
     ! = MP (D3); MP == WP at the DP anchor.
-    use mod_precision, only: WP, MP
+    use mod_precision, only: WP, MP, WP_full
     use, intrinsic :: iso_fortran_env, only: int32
     use mod_binary_arrays, only: write_bin_array, read_bin_array
     implicit none
@@ -27,8 +27,20 @@ module mod_tracer
     end type t_tracer_data
 
     type t_tracer_work
-        real(kind=MP), allocatable, dimension(:,:) :: del_ttf
-        real(kind=MP), allocatable, dimension(:,:) :: del_ttf_advhoriz, del_ttf_advvert
+        ! Thickness-integrated tendencies accumulate in WP_full (real64 also in a single-
+        ! precision build, upstream FESOM/fesom2#1206): an edge or interface flux enters its
+        ! two cells with opposite signs, and the sums only telescope if the products are not
+        ! rounded to real32 before they are added. The fluxes themselves stay WP. In double
+        ! precision WP_full == MP == WP.
+        real(kind=WP_full), allocatable, dimension(:,:) :: del_ttf
+        real(kind=WP_full), allocatable, dimension(:,:) :: del_ttf_advhoriz, del_ttf_advvert
+        ! Single precision only (allocated when use_tracer_carry):
+        !  fct_LO_tend: the FCT low-order tendency in flux form (tracer*thickness per step),
+        !    upstream #1054/#1056/#1206 -- LO*hnode_new - ttf*hnode cannot resolve it in real32;
+        !  carry: the thickness-weighted rounding residual of each write of the tracer state,
+        !    fed into the next write (upstream use_tracer_carry, #1206), (nl-1, nod, ntracer).
+        real(kind=WP_full), allocatable, dimension(:,:) :: fct_LO_tend
+        real(kind=WP),      allocatable, dimension(:,:,:) :: carry
         ! FCT (Zalesak)
         real(kind=MP), allocatable, dimension(:,:) :: fct_LO            ! low-order solution
         real(kind=MP), allocatable, dimension(:,:) :: adv_flux_hor      ! antidiffusive horiz.
