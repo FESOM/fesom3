@@ -60,6 +60,33 @@
 #   Every driver run prints one shared-element line after the drift block, so every tail
 #   below is one line longer than before.
 #
+#   linfs + split-explicit (SE), np 1 -> the split-explicit barotropic solver (FESOM3_SSH_SE=1,
+#       docs/plans/completed/2026-10-17-split-explicit.md, Tasks 1.3-1.5) with FESOM3_SE_CHECK=1. The driver's
+#       linfs invariants as above (drift reported, not gated) plus the per-step SE_CHECK line of
+#       src/oce/oce_ssh_se.F90, whose run maxima are gated: eta-compatibility (etacomp, m), trim
+#       (m^2/s) and |mean-sea-level change| (msl, m) below SE_TOL_* = the Task 1.5 levels x 100,
+#       the copy spreads of U and <<U>> exactly 0, and one SE_CHECK line per step. Two configs: the
+#       default physics, and vector-invariant momentum with rvo_upwind 1 + sea ice (the SHARED
+#       configuration below). The np 2/8 SE configs come with Task 2.2. Measured 2026-10-18 (pi,
+#       1000 steps, np 1, M = 50; Task 1.5, job 28217370): max etacomp 5.0e-15 m, trim 5.7e-13 m^2/s,
+#       |msl| 3.5e-16 m (default; vinv+ice 4.8e-15, 4.5e-13, 2.9e-16), spreads 0. Heat/salt drift
+#       -3.68e-4/-1.59e-6 (SI linfs: -3.69e-4/-1.60e-6).
+#   The SE blocks run at the solver's DEFAULT knobs (no FESOM3_SE_CHI etc.): chi = 0.1, which the levels quoted
+#   here were measured at (plan Task 5.8; from Task 5.0 to Task 5.8 the default was 0.25, and the chi = 0.25 20-step
+#   maxima are at the same level (job 28220536: etacomp <= 2.1e-15 m, trim <= 2.3e-13 m^2/s, |msl| <= 1.3e-16 m).
+#
+#   zstar + split-explicit (SE), np 1/2/8 -> the split-explicit solver under zstar (Task 3.1/3.2): the HARD
+#       conservation gate of the zstar cases (FESOM3_CONSERVE_TOL=$TOL; heat, salt and volume) plus the SE_CHECK
+#       gate of the linfs SE block (etacomp, trim, msl net of the freshwater -- 0 here, the run is unforced --,
+#       spreads exactly 0) and the run maxima of the SE_CHECK_TAIL line the zstar run prints after the ALE tail:
+#       the layer sum max|sum hnode - (H0 + eta)| (laysum, m), max|w(1)| (w1, m/s, 0 to rounding under SE) and the
+#       depth law max|sum helem^{n+1} - H_e(eta^{n+1})| (hlaw, m), each below SE_Z_TOL_* = the Task 3.2 levels
+#       x 100; one SE_CHECK and one SE_CHECK_TAIL line per step. Configs: default np 1/2/8, vector-invariant
+#       momentum with rvo_upwind 1 + sea ice np 1/8, GM + Redi + TKE + w split np 1. Measured 2026-10-18 (pi,
+#       1000 steps, M = 50, chi = 0.1; Task 3.2, job 28218186), max over the six configs: etacomp 4.9e-15 m, trim
+#       5.7e-13 m^2/s, |msl| 6.9e-16 m, laysum 1.8e-11 m, w1 3.1e-18 m/s, hlaw 7.3e-12 m, spreads 0; heat/salt/volume
+#       drift <= 6e-15 / 1.6e-14 / 4.3e-14 (SI zstar: 1.1e-14 / 1.0e-14 / 1.4e-14).
+#
 # Measured zstar baseline on pi, 20 steps, before any bottom change:
 #   np=1  heat -4.87e-15  salt -1.66e-14
 #   np=2  heat  0.00e+00  salt -7.80e-15
@@ -217,6 +244,81 @@ if env $SHARED_ENV FESOM3_MOMADV_OPT=1 FESOM3_RVO_UPWIND=1.0 FESOM3_SHARED_SYNC=
 else
     echo "run_conserve_pi: FAILED (linfs+ice+momadv-vinv-upw1 np=2 sync off)"; fail=1
 fi
+
+# SE: linfs + split-explicit with the SE_CHECK gate (header). Levels measured over 1000 steps on
+# pi (Task 1.5: 5.0e-15 m, 5.7e-13 m^2/s, 3.5e-16 m); the tolerances are those levels x 100.
+SE_TOL_ETACOMP="${SE_TOL_ETACOMP:-5e-13}"   # m
+SE_TOL_TRIM="${SE_TOL_TRIM:-6e-11}"         # m^2/s
+SE_TOL_MSL="${SE_TOL_MSL:-4e-14}"           # m
+SE_ENV="FESOM3_WHICH_ALE=linfs FESOM3_SSH_SE=1 FESOM3_SE_CHECK=1"
+while read -r -u 3 label np vars; do
+    [ -z "$label" ] && continue
+    echo "=== linfs + SE + $label, np=$np, $NSTEPS steps (SE_CHECK gate) ==="
+    rc=0
+    out=$(env $SE_ENV $vars mpirun $MPIFLAGS -n "$np" "$BIN" < /dev/null 2>&1) || rc=$?
+    { echo "$out" | grep -v '^SE_CHECK ' || true; } | tail -8
+    # run maxima of the SE_CHECK tokens (|value|); fails unless every step printed a line
+    echo "$out" | awk -v ns="$NSTEPS" -v te="$SE_TOL_ETACOMP" -v tt="$SE_TOL_TRIM" -v tm="$SE_TOL_MSL" '
+        /^SE_CHECK / { n++
+                       for (i = 3; i <= NF; i++) { split($i, kv, "="); v = kv[2] + 0; if (v < 0) v = -v
+                                                   if (v > mx[kv[1]]) mx[kv[1]] = v } }
+        END { printf "run_conserve_pi: SE_CHECK max over %d steps: etacomp=%.3e trim=%.3e |msl|=%.3e " \
+                     "spreadU=%.3e spreadUm=%.3e maxeta=%.3e maxU=%.3e (tol %s %s %s)\n", n, mx["etacomp"], \
+                     mx["trim"], mx["msl"], mx["spreadU"], mx["spreadUm"], mx["maxeta"], mx["maxU"], te, tt, tm
+              exit !(n == ns && mx["etacomp"] <= te + 0 && mx["trim"] <= tt + 0 && mx["msl"] <= tm + 0 &&
+                     mx["spreadU"] == 0 && mx["spreadUm"] == 0) }' || rc=1
+    if [ "$rc" -ne 0 ]; then
+        echo "run_conserve_pi: FAILED (linfs+SE+$label np=$np)"; fail=1
+    fi
+done 3<<CFG
+default 1
+momadv-vinv-upw1+ice 2 FESOM3_MOMADV_OPT=1 FESOM3_RVO_UPWIND=1.0 FESOM3_CONSERVE_ICE=1 FESOM3_DIVSUM_TOL=$TOL
+momadv-vinv-upw1+ice 8 FESOM3_MOMADV_OPT=1 FESOM3_RVO_UPWIND=1.0 FESOM3_CONSERVE_ICE=1 FESOM3_DIVSUM_TOL=$TOL
+momadv-vinv-upw1+ice 1 FESOM3_MOMADV_OPT=1 FESOM3_RVO_UPWIND=1.0 FESOM3_CONSERVE_ICE=1
+CFG
+
+# SE ZSTAR: zstar + split-explicit with the hard conservation gate and the SE checks (header). Its own
+# block (the linfs SE list above gets the Stage 2 np 2/8 lines). Levels: plan Task 3.2; the tolerances
+# are those levels x 100.
+SE_Z_TOL_ETACOMP="${SE_Z_TOL_ETACOMP:-5e-13}"   # m
+SE_Z_TOL_TRIM="${SE_Z_TOL_TRIM:-6e-11}"            # m^2/s
+SE_Z_TOL_MSL="${SE_Z_TOL_MSL:-7e-14}"               # m, net of the freshwater (0 here: unforced)
+SE_Z_TOL_LAYSUM="${SE_Z_TOL_LAYSUM:-2e-9}"      # m
+SE_Z_TOL_W1="${SE_Z_TOL_W1:-4e-16}"                  # m/s
+SE_Z_TOL_HLAW="${SE_Z_TOL_HLAW:-8e-10}"            # m
+SE_Z_ENV="FESOM3_WHICH_ALE=zstar FESOM3_SSH_SE=1 FESOM3_SE_CHECK=1"
+while read -r -u 3 label np vars; do
+    [ -z "$label" ] && continue
+    echo "=== zstar + SE + $label, np=$np, $NSTEPS steps (conservation gate, tol=$TOL; SE_CHECK gate) ==="
+    rc=0
+    out=$(env $SE_Z_ENV $vars FESOM3_CONSERVE_TOL="$TOL" mpirun $MPIFLAGS -n "$np" "$BIN" < /dev/null 2>&1) || rc=$?
+    { echo "$out" | grep -v '^SE_CHECK' || true; } | tail -9
+    # run maxima of the SE_CHECK and SE_CHECK_TAIL tokens (|value|); one line of each per step
+    echo "$out" | awk -v ns="$NSTEPS" -v te="$SE_Z_TOL_ETACOMP" -v tt="$SE_Z_TOL_TRIM" -v tm="$SE_Z_TOL_MSL" \
+                      -v tl="$SE_Z_TOL_LAYSUM" -v tw="$SE_Z_TOL_W1" -v th="$SE_Z_TOL_HLAW" '
+        /^SE_CHECK / || /^SE_CHECK_TAIL / {
+                       if ($1 == "SE_CHECK") n++; else nt++
+                       for (i = 3; i <= NF; i++) { split($i, kv, "="); v = kv[2] + 0; if (v < 0) v = -v
+                                                   if (v > mx[kv[1]]) mx[kv[1]] = v } }
+        END { printf "run_conserve_pi: SE_CHECK max over %d steps: etacomp=%.3e trim=%.3e |msl|=%.3e " \
+                     "spreadU=%.3e spreadUm=%.3e maxeta=%.3e maxU=%.3e |fw|=%.3e (tol %s %s %s)\n", n, mx["etacomp"], \
+                     mx["trim"], mx["msl"], mx["spreadU"], mx["spreadUm"], mx["maxeta"], mx["maxU"], mx["fw"], te, tt, tm
+              printf "run_conserve_pi: SE_CHECK_TAIL max over %d steps: laysum=%.3e w1=%.3e hlaw=%.3e (tol %s %s %s)\n", \
+                     nt, mx["laysum"], mx["w1"], mx["hlaw"], tl, tw, th
+              exit !(n == ns && nt == ns && mx["etacomp"] <= te + 0 && mx["trim"] <= tt + 0 && mx["msl"] <= tm + 0 &&
+                     mx["spreadU"] == 0 && mx["spreadUm"] == 0 && mx["laysum"] <= tl + 0 && mx["w1"] <= tw + 0 &&
+                     mx["hlaw"] <= th + 0) }' || rc=1
+    if [ "$rc" -ne 0 ]; then
+        echo "run_conserve_pi: FAILED (zstar+SE+$label np=$np)"; fail=1
+    fi
+done 3<<CFG
+default 1
+default 2
+default 8
+momadv-vinv-upw1+ice 1 FESOM3_MOMADV_OPT=1 FESOM3_RVO_UPWIND=1.0 FESOM3_CONSERVE_ICE=1
+momadv-vinv-upw1+ice 8 FESOM3_MOMADV_OPT=1 FESOM3_RVO_UPWIND=1.0 FESOM3_CONSERVE_ICE=1
+GM+Redi+TKE+wsplit 1 FESOM3_FER_GM=1 FESOM3_REDI=1 FESOM3_MIX_TKE=1 $WSPLIT_CFG
+CFG
 
 if [ "$fail" -ne 0 ]; then
     echo "run_conserve_pi: GATE FAILED"
