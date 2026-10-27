@@ -54,7 +54,11 @@ export FESOM3_SSS_FILE="$POOL/PHC2_salx.nc"
 export FESOM3_WHICHEVP=0          # EVP (sigma carries across steps; the hard case for F-C)
 ulimit -s unlimited
 MPIRUN=(mpirun --mca pml ob1 --mca btl self,vader --mca btl_vader_single_copy_mechanism none --oversubscribe)
-GREP='nod2D|INITIALISATION|RESTART MODE|RESTART RUN|state restored|registered|checkpoint written|final checkpoint|roll_monthly|done'
+GREP='nod2D|INITIALISATION|RESTART MODE|RESTART RUN|state restored|registered|checkpoint written|final checkpoint|roll_monthly|done|oce_ssh_se:   M ='
+# Every leg inherits the caller's environment (a leg sets only its restart, run-length and dump variables), so
+# FESOM3_WHICH_ALE, FESOM3_SSH_SE and FESOM3_SE_* reach all of them; with SE on, each leg's se_init
+# line (M, dtbt, chi, visc_ah) is echoed below.
+echo "case env (inherited by every leg): $(env | grep -E '^FESOM3_(WHICH_ALE|SSH_SE|SE_[A-Z_]+|SHARED_SYNC)=' | sort | tr '\n' ' ')"
 rc=0
 
 # run one lifecycle segment. UNIT=off => exactly one (end-of-run) checkpoint at the segment's last step.

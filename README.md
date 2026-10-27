@@ -65,6 +65,21 @@ conservation, mesh-delta, regression and self-consistency gates take its place
   - A run resumed from a restart now matches a straight run bit for bit at np > 1.
 - **Zarr I/O:** the chunk writer and reader no longer copy through `transfer()`. This fixes the
   end-of-run restart crash on large meshes.
+- **Split-explicit barotropic solver (`FESOM3_SSH_SE=1`, branch `split-explicit`):**
+  - Shchepetkin–McWilliams AB3–AM4 subcycling of the 2-D system after Sergey Danilov's notes, in place
+    of the CG solve; linfs and zstar, any rank count, exact restarts. Off by default, and with it off
+    the results are byte-identical to the build before it.
+  - The barotropic substeps carry their own bottom drag (on by default, since 2026-10-18, after
+    Sergey Danilov's answers). The Coriolis term stays out of the barotropic forcing (removed with
+    stored transport sums, as Banerjee et al. 2024 omit it); the first-substep form tried on
+    2026-10-18 blew up and was reverted.
+  - The dissipation parameter χ is mesh-dependent: use the smallest value that is stable on the
+    mesh. The default is 0.1, the smallest value with a clean zstar year on CORE2 with the drag.
+    χ = 0.05 passes 3000-step screens (linfs and zstar) and a linfs year, but its zstar year blew
+    up on day 229 (a grid-scale mode on one 30 m Kara-shelf node), and 0.07 is marginal there.
+    Without the drag χ = 0.1 blows up a cold-started CORE2 run after about 7 days (a shelf mode fed
+    through the sea ice).
+  - See [IMPLEMENTATION.md](IMPLEMENTATION.md) §14.
 
 Production runs on Levante with these changes conserve volume to roundoff: CORE2 on 512 ranks (about
 95 model years per day) and the NEMO ORCA025 quad mesh on 1280 ranks (about 29 model years per day).
@@ -196,10 +211,10 @@ export FESOM3_STEP_PER_DAY=48                        # 1800 s on CORE2; 72 (1200
 
 > **On/off switches are presence-based.** `FESOM3_FER_GM`, `FESOM3_REDI`, `FESOM3_MIX_TKE`,
 > `FESOM3_MIX_KPP`, `FESOM3_SW_PENE`, `FESOM3_CHL_SWEENEY`, `FESOM3_WSPLIT`, `FESOM3_SHEAR_SPLINES`,
-> `FESOM3_N2_SPLINES`, `FESOM3_IC_EXTRAP_DET` and `FESOM3_STEP_DIAG` are on whenever the variable is set
-> and not empty, also for `=0`; leave it unset to turn the option off. `FESOM3_MOMADV_OPT`,
-> `FESOM3_RVO_UPWIND`, `FESOM3_WSPLIT_MAXCFL`/`_MINCFL`, `FESOM3_IC_EXTRAP_TOL` and `FESOM3_SHARED_SYNC`
-> take values.
+> `FESOM3_N2_SPLINES` and `FESOM3_STEP_DIAG` are on whenever the variable is set and not empty, also
+> for `=0`; leave it unset to turn the option off. `FESOM3_MOMADV_OPT`, `FESOM3_RVO_UPWIND`,
+> `FESOM3_WSPLIT_MAXCFL`/`_MINCFL`, `FESOM3_SHARED_SYNC`, `FESOM3_SSH_SE` and the `FESOM3_SE_*`
+> knobs take values.
 
 **Where the knobs are defined.** The authoritative, always-current list of run variables is the
 environment block at the top of **`src/drivers/fesom_lifecycle_native_mr.F90`** (each is read with
@@ -230,6 +245,13 @@ examples. The most common variables:
 | `FESOM3_SHARED_SYNC` | shared border elements: `1` (default) = every step the other owners take the designated owner's `uv` (no volume leak, exact np>1 restarts); `0` = off, the old unsynced copies (A/B comparisons only). Read in `src/infra/mod_shared_elem.F90` |
 | `FESOM3_STEP_DIAG` | per-step global diagnostic line (max\|eta\|, max\|uv\|, ice, Tmax, Smax, and the shared-element numbers `divsum=`, `dUV=`, `dAB=`, `dsig=`); two extra collectives per step, off by default |
 | `FESOM3_SSH_SOLTOL`, `FESOM3_SSH_MAXITER` | SSH solver tolerance and iteration cap — test/diagnostic only, read in `src/oce/oce_ssh_solve.F90` (defaults `1e-5`, `2000`) |
+| `FESOM3_SSH_SE` | free surface: `0` (default) = semi-implicit CG solve, `1` = split-explicit barotropic subcycling (production driver and `fesom_conserve` only; AB2, no cavities). Read in `src/oce/oce_ssh_se.F90`, like the knobs below |
+| `FESOM3_SE_M`, `FESOM3_SE_M_FORCE` | substeps per baroclinic step (default `50`); the run stops if M is below the CFL-guard minimum printed at startup (CORE2 at 1800 s: 40 at the default χ 0.1, 38 at χ 0.05, 48 at χ 0.25) unless `FESOM3_SE_M_FORCE=1` |
+| `FESOM3_SE_CHI` | dissipation parameter χ in [0, 0.25] (default `0.1`). Mesh-dependent: use the smallest value stable on the mesh; the default is that value for CORE2 with the barotropic drag (`0.05` blew up a zstar year, `0.07` is marginal; see "Changes since v1") |
+| `FESOM3_SE_VISC_AH` | barotropic viscosity A_h = value × edge length, the value in m/s (default `0.01`; `0` = off) |
+| `FESOM3_SE_VISC_FLOW` | `1` = the flow-dependent barotropic viscosity of the Zenodo SE code in place of A_h (`FESOM3_SE_VISC_GAMMA0`/`_GAMMA1`, default `10` / `2750`); default `0` |
+| `FESOM3_SE_BOTTDRAG` | barotropic bottom drag in the substeps, r = C_d·\|u_bottom\| frozen over the step: `1` (default) = on, `0` = off (the 3-D drag stays in the forcing either way) |
+| `FESOM3_SE_CHECK` | `1` = one `SE_CHECK` invariant line per step (η compatibility, trim, mean sea level, shared-copy spreads; zstar adds `SE_CHECK_TAIL`); default `0` |
 
 > **Configuration today vs. intent.** The production drivers are configured by these `FESOM3_*`
 > variables plus in-code defaults. A write-once configuration *module* (`mod_config`, reading a
@@ -336,7 +358,7 @@ src/            Fortran source
   types/          mesh / partition / dynamics / tracers / ice    (5)
   infra/          MPI halo layer, partitioning, clock, timers    (10)
   mesh/           mesh read, geometry, rotation                  (4)
-  oce/            ocean physics kernels                          (27)
+  oce/            ocean physics kernels                          (28)
   ice/            sea-ice dynamics, thermodynamics, coupling     (6)
   forcing/        atmospheric forcing read + bulk fluxes         (3)
   io/             Zarr output, decomposition, restart            (8)
