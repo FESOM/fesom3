@@ -218,14 +218,15 @@ export FESOM3_STEP_PER_DAY=48                        # 1800 s on CORE2; 72 (1200
 
 **Where the knobs are defined.** The authoritative, always-current list of run variables is the
 environment block at the top of **`src/drivers/fesom_lifecycle_native_mr.F90`** (each is read with
-`get_environment_variable`); the SSH solver knobs and `FESOM3_SHARED_SYNC` in the table below are read
-where they act (the solver, `src/infra/mod_shared_elem.F90`). The `tools/*.sbatch` and `tools/run_lifecycle_*.sh` scripts are working
+`get_environment_variable`); the SSH solver knobs, `FESOM3_SHARED_SYNC` and `FESOM3_LINFS_CONSERVE` in the table
+below are read where they act (the solver, `src/infra/mod_shared_elem.F90`, `src/oce/oce_ale_tracer.F90`). The `tools/*.sbatch` and `tools/run_lifecycle_*.sh` scripts are working
 examples. The most common variables:
 
 | Variable | Meaning |
 |---|---|
 | `FESOM3_MESH_DIR` | mesh directory (must contain `dist_<NP>/`) |
 | `FESOM3_IC_FILE` | initial T/S netCDF |
+| `FESOM3_IC_EXTRAP_DET`, `FESOM3_IC_EXTRAP_TOL` | cold start: fill the land-masked points of the initial T/S with FESOM2's deterministic fill (`ic_extrap_det`, PR #979): the same initial state on every `dist_<NP>`. Off by default (the historical fill, whose result depends on the partition and the node numbering); the tolerance of its relaxation defaults to `1e-3`. Read in `src/oce/oce_initial_state.F90` |
 | `FESOM3_FORCING_DIR`, `FESOM3_FORCING` | atmospheric forcing directory and set (`JRA55`/`CORE2`) |
 | `FESOM3_RUNOFF_FILE`, `FESOM3_SSS_FILE` | runoff and sea-surface-salinity restoring climatologies |
 | `FESOM3_START_CLOCK` | cold-start clock, `"timeofday day year"` |
@@ -233,6 +234,7 @@ examples. The most common variables:
 | `FESOM3_STEP_PER_DAY` | time steps per day (default `48` = 1800 s; CORE2 uses 48, finer meshes need more) |
 | `FESOM3_WHICHEVP` | sea-ice solver: `0` = EVP, `1` = mEVP |
 | `FESOM3_WHICH_ALE` | vertical coordinate: `linfs` (default) or `zstar`. `zlevel` is not ported, and the driver does not reject it: do not use it |
+| `FESOM3_LINFS_CONSERVE` | `S`, `T` or `TS` (unset = FESOM2): with `linfs` the layers are fixed while `w` at the surface is not zero, so the vertical advection moves tracer through the surface and the ocean's salt and heat content drift (CORE2 JRA55-do, Dmitry's setup: whole-ocean S -5.5e-5 in the cold-start year, ~-2e-6 a year later). This returns that flux, summed over the ocean, as a uniform surface flux of S and/or T every step (MITgcm's `linFSConserveTr`). `linfs` and the FCT limiter only. Read in `src/oce/oce_ale_tracer.F90` |
 | `FESOM3_FER_GM`, `FESOM3_REDI` | Gent–McWilliams bolus advection, Redi isopycnal diffusion |
 | `FESOM3_MIX_KPP`, `FESOM3_MIX_TKE`, `FESOM3_SW_PENE` | vertical mixing and shortwave penetration |
 | `FESOM3_SHEAR_SPLINES`, `FESOM3_N2_SPLINES` | cubic-spline shear and N² at the interfaces (set both) |

@@ -39,6 +39,10 @@ program fesom_lifecycle_native_mr
     !   FESOM3_NSTEPS       number of steps                     (default: 3)
     !   FESOM3_SHARED_SYNC  1 = one owner per shared element: update_vel syncs uv (default);
     !                       0 = off (unsynced copies, A/B only). Read in src/infra/mod_shared_elem.F90.
+    !   FESOM3_IC_EXTRAP_DET  presence: deterministic, decomposition-independent IC hole filling
+    !                       (FESOM2 ic_extrap_det, PR #979; default off = the historical fill).
+    !   FESOM3_IC_EXTRAP_TOL  its relaxation tolerance (FESOM2 ic_extrap_tol)  (default: 1e-3)
+    !                       Both read in oce_initial_state::ic3d_extrap_from_env.
     !   FESOM3_SSH_SE       1 = split-explicit barotropic solver (knobs FESOM3_SE_*); default 0 =
     !                       the semi-implicit CG solve. Read in src/oce/oce_ssh_se.F90.
     use mpi
@@ -94,7 +98,7 @@ program fesom_lifecycle_native_mr
     use mod_forcing_read    ! native CORE2 atmospheric forcing read
     use mod_forcing_bulk,   only: forcing_bulk_ncar, forcing_wind_stress, forcing_ice_stress
     use mod_forcing_other,  only: read_other_NetCDF   ! runoff + SSS climatology read
-    use oce_initial_state,  only: t_ic3d_config, do_ic3d
+    use oce_initial_state,  only: t_ic3d_config, do_ic3d, ic3d_extrap_from_env
     use oce_muscl_adv,      only: muscl_adv_init
     use oce_ssh_rhs,        only: init_stiff_mat_ale
     use mod_step_oce,       only: step_oce
@@ -437,6 +441,9 @@ program fesom_lifecycle_native_mr
     ic%t_insitu    = .true.
     ic%ic_cyclic   = .true.
     ic%dummy       = 1.e10_WP
+    call ic3d_extrap_from_env(ic)       ! FESOM3_IC_EXTRAP_DET / FESOM3_IC_EXTRAP_TOL
+    if (partit%mype == 0 .and. ic%extrap_det) write(*,'(a,es10.3,a)') &
+        'fesom_lifecycle_native_mr: IC hole filling DETERMINISTIC (ic_extrap_det; tol=', ic%extrap_tol, ')'
     call do_ic3d(tracers, ic, mesh, partit)
     ! use_salt_anomaly: the IC arrives absolute (insitu2pot has used it) -> convert ONCE here,
     ! before the AB copies below (upstream ocean_setup). Restarts are converted after the read.

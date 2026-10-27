@@ -33,10 +33,10 @@ module oce_ale_tracer
     use mod_tracer,         only: t_tracer
     use mod_partit,         only: t_partit
     use mod_part_bounds,    only: owned_bounds, is_multirank, local_dims
-    use mod_halo,           only: exchange_nod
+    use mod_halo,           only: exchange_nod, allreduce_sum
     use mod_param_phys,     only: Fer_GM, Redi, use_kpp_nonlclflx, &
                                   mix_scheme_nmb, ref_sss, ref_sss_local, S_ref_anomaly
-    use mod_config,         only: use_sw_pene
+    use mod_config,         only: use_sw_pene, which_ALE
     use oce_tracer_mod,     only: init_tracers_AB
     use oce_tracer_grad,    only: tracer_gradient_z
     use oce_adv_tra_driver, only: do_oce_adv_tra
@@ -46,6 +46,12 @@ module oce_ale_tracer
     ! M2.9b (step assembly): solve_tracers_ale is the full per-tracer wrapper
     ! (advection + diffusion solve + salinity clamp) the ocean step calls.
     public :: solve_tracers_ale
+
+    ! FESOM3_LINFS_CONSERVE (not in FESOM2): 'S', 'T' or 'TS' returns the tracer that the vertical advection moves
+    ! out through the linear free surface (linfs_surface_flux); unset = FESOM2. Read at the first
+    ! solve_tracers_ale call (linfs_conserve_env).
+    character(len=2) :: linfs_conserve = ''
+    logical          :: linfs_conserve_read = .false.
 
 contains
 
@@ -121,6 +127,7 @@ contains
         integer :: tr_num, node, elem, nzmin, nzmax
         integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
         real(kind=WP), dimension(:,:), pointer :: Svalues
+        real(kind=WP), allocatable :: hf(:), rs(:)      ! FESOM3_LINFS_CONSERVE: the corrected heat_flux, relax_salt
 
         ! The elemental tracer gradient for the horizontal diffusion / Redi is
         ! tracers%work%tr_xy, built by init_tracers_AB (called inside advect_tracer) from
@@ -147,6 +154,9 @@ contains
             end do
         end if
 
+        if (.not. linfs_conserve_read) call linfs_conserve_env(partit)
+        if (len_trim(linfs_conserve) > 0) allocate(hf(nNodL), rs(nNodL))   ! local nodes (the dummies are nod2D-shaped)
+
         do tr_num = 1, tracers%num_tracers
             ! advection: del_ttf = advhoriz + advvert (del_ttf zeroed in init_tracers_AB)
             call advect_tracer(dt, tr_num, dynamics, tracers, mesh, partit)
@@ -155,9 +165,19 @@ contains
             ! M4d Redi: vertical gradient tr_z of the same T^n (feeds diff_part_hor_redi K13/K23)
             if (Redi) call tracer_gradient_z(tracers%data(tr_num)%values, tracers%work%tr_z, mesh, partit)
             ! horizontal diffusion + ALE reconstruct + implicit vertical-diffusion TDMA
-            call diff_tracers_ale(tr_num, dt, dynamics, tracers, mesh, tracers%work%tr_xy, Ki, &
-                                  heat_flux, water_flux, virtual_salt, relax_salt, &
-                                  real_salt_flux, is_nonlinfs, partit)
+            if (len_trim(linfs_conserve) > 0) then
+                ! FESOM3_LINFS_CONSERVE: this tracer's flux through the linear free surface returned uniformly
+                hf = heat_flux(1:nNodL)
+                rs = relax_salt(1:nNodL)
+                call linfs_corrected_fluxes(tr_num, dynamics, tracers, mesh, hf, rs, partit)
+                call diff_tracers_ale(tr_num, dt, dynamics, tracers, mesh, tracers%work%tr_xy, Ki, &
+                                      hf, water_flux, virtual_salt, rs, &
+                                      real_salt_flux, is_nonlinfs, partit)
+            else
+                call diff_tracers_ale(tr_num, dt, dynamics, tracers, mesh, tracers%work%tr_xy, Ki, &
+                                      heat_flux, water_flux, virtual_salt, relax_salt, &
+                                      real_salt_flux, is_nonlinfs, partit)
+            end if
             ! relax_to_clim (clim_relax=0): no-op. exchange_nod(values) (FESOM2 :268): the
             ! owned values are complete (diff over owned nodes/edges); this fills the halo
             ! for the NEXT step's init_tracers_AB / advection (and for the salinity clamp's
@@ -189,6 +209,99 @@ contains
         end do
 
     end subroutine solve_tracers_ale
+
+    !===========================================================================
+    subroutine linfs_conserve_env(partit)
+        ! FESOM3_LINFS_CONSERVE (not in FESOM2; unset = FESOM2): 'S', 'T' or 'TS', the tracers whose flux
+        ! through the linear free surface solve_tracers_ale returns (linfs_corrected_fluxes). linfs only: zstar
+        ! and zlevel move the surface layer with the free surface, so there that flux changes no content.
+        type(t_partit), intent(in), optional :: partit
+        character(len=64) :: env
+        integer :: env_len, ios
+        logical :: root
+
+        root = .true.
+        if (present(partit)) root = (partit%mype == 0)
+        linfs_conserve_read = .true.
+        call get_environment_variable('FESOM3_LINFS_CONSERVE', env, length=env_len, status=ios)
+        if (ios > 0 .or. env_len == 0) return
+        select case (env(1:min(env_len, 64)))
+        case ('S', 'T', 'TS')
+            linfs_conserve = env(1:env_len)
+        case default
+            write(*,'(a)') 'solve_tracers_ale: FESOM3_LINFS_CONSERVE: expected S, T or TS, not "'// &
+                env(1:min(env_len, 64))//'"'
+            error stop 1
+        end select
+        if (trim(which_ALE) /= 'linfs') then
+            write(*,'(a)') 'solve_tracers_ale: FESOM3_LINFS_CONSERVE needs which_ALE linfs, not '//trim(which_ALE)
+            error stop 1
+        end if
+        if (root) write(*,'(a)') ' solve_tracers_ale: FESOM3_LINFS_CONSERVE='//trim(linfs_conserve)// &
+            ': the tracer the linear free surface advects out is returned as a uniform surface flux'
+    end subroutine linfs_conserve_env
+
+    !===========================================================================
+    real(kind=WP) function linfs_surface_flux(tr_num, dynamics, tracers, mesh, partit)
+        ! Not in FESOM2 (FESOM3_LINFS_CONSERVE): the tracer that this tracer's vertical advection (its
+        ! do_oce_adv_tra, just run) moved out through the linear free surface, per unit ocean area (tracer*m/s).
+        ! With linfs hnode is frozen while w at the surface is not zero, so the top-interface flux changes the
+        ! tracer content every step (CORE2 JRA55-do cycles: whole-ocean S -2e-6 a year; MITgcm's
+        ! linFSConserveTr returns it the same way). Under FCT that flux is the low-order one, explicit with w_e
+        ! and T^n and implicit with w_i and the new fct_LO (adv_tra_vert_impl; w_i = 0 without the split), plus
+        ! the limited antidiffusive adv_flux_ver at the top. Owned nodes, then the global sum, over ocean_area
+        ! (the sum of areasvol without cavities, as oce_fluxes' balancing).
+        integer,        intent(in)           :: tr_num
+        type(t_dyn),    intent(in)           :: dynamics
+        type(t_tracer), intent(in)           :: tracers
+        type(t_mesh),   intent(in)           :: mesh
+        type(t_partit), intent(in), optional :: partit
+        integer       :: n, nz, nNodO, nNodL, nEdgeO, nElemO
+        real(kind=WP) :: s
+
+        call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
+        s = 0.0_WP
+        do n = 1, nNodO
+            nz = mesh%ulevels_nod2D(n)
+            s = s + mesh%area(n)*(dynamics%w_e(nz,n)*tracers%data(tr_num)%values(nz,n) &
+                                + dynamics%w_i(nz,n)*tracers%work%fct_LO(nz,n)) &
+                  - tracers%work%adv_flux_ver(nz,n)
+        end do
+        if (is_multirank(partit)) call allreduce_sum(s, partit)
+        linfs_surface_flux = s/mesh%ocean_area
+    end function linfs_surface_flux
+
+    !===========================================================================
+    subroutine linfs_corrected_fluxes(tr_num, dynamics, tracers, mesh, heat_flux, relax_salt, partit)
+        ! heat_flux (tracer 1, T) or relax_salt (tracer 2, S) plus this tracer's linfs_surface_flux c on every
+        ! node without a cavity, when FESOM3_LINFS_CONSERVE names the tracer. bc_surface then adds dt*c to each
+        ! top layer (T: -dt*heat_flux/vcpw), dt*c*ocean_area of content in all, what the surface flux took.
+        ! heat_flux, relax_salt: the local (owned + halo) nodes.
+        integer,        intent(in)           :: tr_num
+        type(t_dyn),    intent(in)           :: dynamics
+        type(t_tracer), intent(in)           :: tracers
+        type(t_mesh),   intent(in)           :: mesh
+        real(kind=WP),  intent(inout)        :: heat_flux(:), relax_salt(:)
+        type(t_partit), intent(in), optional :: partit
+        integer       :: n
+        real(kind=WP) :: c
+
+        if (.not. ((tr_num == 1 .and. index(linfs_conserve, 'T') > 0) .or. &
+                   (tr_num == 2 .and. index(linfs_conserve, 'S') > 0))) return
+        if (trim(tracers%data(tr_num)%tra_adv_lim) /= 'FCT') then
+            write(*,'(a)') 'solve_tracers_ale: FESOM3_LINFS_CONSERVE needs the FCT limiter (tra_adv_lim)'
+            error stop 1
+        end if
+        c = linfs_surface_flux(tr_num, dynamics, tracers, mesh, partit)
+        do n = 1, size(heat_flux)
+            if (mesh%ulevels_nod2D(n) > 1) cycle  ! cavity node
+            if (tr_num == 1) then
+                heat_flux(n) = heat_flux(n) - vcpw*c
+            else
+                relax_salt(n) = relax_salt(n) + c
+            end if
+        end do
+    end subroutine linfs_corrected_fluxes
 
     !===========================================================================
     subroutine diff_tracers_ale(tr_num, dt, dynamics, tracers, mesh, tr_xy, Ki, &
