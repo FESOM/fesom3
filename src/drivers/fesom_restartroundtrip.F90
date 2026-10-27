@@ -26,6 +26,10 @@ program fesom_restartroundtrip
     !   FESOM3_RESTARTRT_DIR   checkpoint dir (default: ./restartroundtrip)
     !   FESOM3_AB_ORDER        1|2|3 Adams-Bashforth order (default 2; 3 adds *_AB3 + <tr>_M2 stores)
     !   FESOM3_CHUNK_HORIZ     horizontal chunk (default 1000 => multiple chunks + writer subset)
+    !   FESOM3_RESTARTRT_SE    0 (default) | 1 = also the split-explicit fields (dyn%use_ssh_se, the shapes
+    !                          of se_init: +10 stores) | 2 = the SE read pre-check: write WITHOUT the SE
+    !                          fields, then read with them registered -> must abort with "checkpoint has
+    !                          no split-explicit state" (the caller checks the nonzero exit + message)
     use mpi
     use, intrinsic :: iso_fortran_env, only: real64
     use mod_precision,    only: WP, MP, MPI_WP
@@ -47,18 +51,18 @@ program fesom_restartroundtrip
         real(WP), allocatable :: a3(:,:)
     end type refbuf
 
-    character(len=512) :: mesh_dir, out_dir, abbuf
+    character(len=512) :: mesh_dir, out_dir, abbuf, sebuf
     type(t_partit)         :: partit
     type(t_mesh),   target :: mesh
     type(t_dyn),    target :: dyn
     type(t_tracer), target :: tracers
     type(t_ice),    target :: ice
-    type(t_restart)        :: R
+    type(t_restart)        :: R, R2
     type(refbuf)           :: ref(64)
     logical :: mr
     integer :: nsw, i, j, L, gid, nl, ab, ios, k, ierr, nfail
     integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
-    integer :: full, rext
+    integer :: full, rext, se_mode
     real(WP) :: vn, ve, v3, d, maxd
     real(WP), parameter :: SENT = -9.99e30_WP
 
@@ -72,6 +76,12 @@ program fesom_restartroundtrip
     if (len_trim(abbuf) > 0) then
         read(abbuf, *, iostat=ios) i
         if (ios == 0 .and. (i == 1 .or. i == 2 .or. i == 3)) ab = i
+    end if
+    se_mode = 0
+    call get_environment_variable('FESOM3_RESTARTRT_SE', sebuf)
+    if (len_trim(sebuf) > 0) then
+        read(sebuf, *, iostat=ios) i
+        if (ios == 0 .and. (i == 1 .or. i == 2)) se_mode = i
     end if
 
     call par_init(partit)
@@ -114,6 +124,8 @@ program fesom_restartroundtrip
     allocate(ice%uice(nNodL), ice%vice(nNodL))
     allocate(ice%thermo%t_skin(nNodL))                     ! carried thermo skin temp (NODE 2-D)
     allocate(ice%work%sigma11(nElemF), ice%work%sigma12(nElemF), ice%work%sigma22(nElemF))
+    ! split-explicit carried state, with se_init's shapes (node rings nNodL; element rings nElemL)
+    allocate(dyn%se_eta(nNodL, 2), dyn%se_ubt(2, nElemL, 0:2), dyn%se_sbar_old(2, nElemL))
 
     ! ---- zero-init the WHOLE arrays (halo + eXDim start finite at 0 = the fresh-allocate baseline) -----
     dyn%eta_n = 0; dyn%d_eta = 0; dyn%ssh_rhs_old = 0
@@ -127,6 +139,7 @@ program fesom_restartroundtrip
     end do
     ice%uice = 0; ice%vice = 0; ice%thermo%t_skin = 0
     ice%work%sigma11 = 0; ice%work%sigma12 = 0; ice%work%sigma22 = 0
+    dyn%se_eta = 0; dyn%se_ubt = 0; dyn%se_sbar_old = 0
 
     ! ---- fill OWNED nodes (value = g for 2-D ; g + 0.5*L for 3-D) -------------------------------------
     do i = 1, nNodO
@@ -139,6 +152,7 @@ program fesom_restartroundtrip
         ice%data(1)%values(i) = vn; ice%data(2)%values(i) = vn; ice%data(3)%values(i) = vn
         ice%uice(i)           = vn; ice%vice(i)           = vn
         ice%thermo%t_skin(i)  = vn
+        dyn%se_eta(i,1)       = vn + 0.25_WP; dyn%se_eta(i,2) = vn + 0.75_WP   ! distinct ring levels
         do L = 1, nl-1
             v3 = vn + 0.5_WP*real(L, WP)
             mesh%hnode(L,i)               = real(gid, MP) + 0.5_MP*real(L, MP)
@@ -157,6 +171,11 @@ program fesom_restartroundtrip
         gid = i; if (mr) gid = partit%myList_elem2D(i)
         ve  = real(gid, WP)
         ice%work%sigma11(i) = ve; ice%work%sigma12(i) = ve; ice%work%sigma22(i) = ve
+        do L = 0, 2                                                 ! distinct component / ring level
+            dyn%se_ubt(1,i,L) = ve + 0.125_WP + 0.25_WP*real(L, WP)
+            dyn%se_ubt(2,i,L) = ve + 0.25_WP  + 0.25_WP*real(L, WP)
+        end do
+        dyn%se_sbar_old(1,i) = ve + 0.0625_WP; dyn%se_sbar_old(2,i) = ve + 0.1875_WP
         do L = 1, nl-1
             v3 = ve + 0.5_WP*real(L, WP)
             dyn%uv(:,L,i)        = v3
@@ -164,11 +183,26 @@ program fesom_restartroundtrip
         end do
     end do
 
+    dyn%use_ssh_se = (se_mode == 1)
     call restart_register_state(R, dyn, tracers, ice, mesh, mix_scheme=5)
 
     ! ===== (2) write a checkpoint from the pristine OWNED values =======================================
     call restart_write(R, trim(out_dir), 2000, 1, 3600.0_real64, globalstep=1)
     call restart_finalize(R)
+
+    ! ===== SE read pre-check (FESOM3_RESTARTRT_SE=2): the checkpoint above has no SE fields; reading it
+    ! with them registered must abort inside restart_read before any field is read.
+    if (se_mode == 2) then
+        dyn%use_ssh_se = .true.
+        call restart_init(R2, mesh, partit, chunk_horiz=1000)
+        call restart_register_state(R2, dyn, tracers, ice, mesh, mix_scheme=5)
+        if (partit%mype == 0) write(*,'(a,i0,a,i0,a)') 'fesom_restartroundtrip: SE pre-check: wrote ', R%nf, &
+            ' fields without SE, reading with ', R2%nf, ' registered (expect an abort)'
+        call restart_read(R2, trim(out_dir), mesh, partit, &
+                          clock_year=2000, clock_day=1, clock_time_sec=3600.0_real64)
+        if (partit%mype == 0) write(*,'(a)') 'SE PRECHECK FAIL: restart_read did not abort'
+        error stop 2
+    end if
 
     ! ===== (3) halo-exchange the ORIGINALS so their halos are owner-derived (reference baseline) =======
     call restart_halo_exchange_all(R, partit)
@@ -187,8 +221,12 @@ program fesom_restartroundtrip
     ! ===== (5) CORRUPT: reconstructed region -> sentinel ; un-owned tail -> 0 (fresh-allocate) =========
     do k = 1, R%nf
         associate(f => R%f(k))
-        if (f%entity == DECOMP_NODE) then; full = nNodL
-        else;                              full = nElemF; end if
+        ! the array's own extent: nNodL / nElemF for the model fields, nElemL for the SE element rings
+        if (f%ndim == 2) then
+            if (f%mp_src) then; full = size(f%pmp2d);   else; full = size(f%p2d);   end if
+        else
+            if (f%mp_src) then; full = size(f%pmp3d,2); else; full = size(f%p3d,2); end if
+        end if
         select case (f%halo)
         case (RESTART_HALO_NODE, RESTART_HALO_ELEM_FULL); rext = full      ! whole array reconstructed
         case (RESTART_HALO_ELEM);                         rext = nElemL    ! owned + eDim

@@ -35,6 +35,15 @@ module oce_initial_state
     !   nod_in_elem2D order match FESOM2's global order (geometry-gate proven, L9), so
     !   the sweep is deterministic and byte-identical.
     !
+    ! OPTIONAL DETERMINISTIC FILL (ic%extrap_det, FESOM3_IC_EXTRAP_DET; default off): the
+    ! historical extrap_nod3D above depends on the decomposition and on the node numbering
+    ! (each rank fills its owned nodes in local order, halo refreshed once per pass). With
+    ! extrap_det the holes are filled by extrap_nod3D_det, the port of FESOM2 PR #979
+    ! (gen_support.F90 extrap_nod3D_det; ic_extrap_det / ic_extrap_tol in &tracer_init3d):
+    ! Jacobi ring fill + relaxation of the filled nodes, neighbour sums in ascending global
+    ! node id order, halo exchange after every sweep, global termination. Its result is the
+    ! same on every dist_<NP>. Off, the code path is the historical one, unchanged.
+    !
     ! SCOPE: no cavity (use_cavity=.false. on CORE2), no RECOM, T/S only. M2.12-MVP added
     ! the MULTI-RANK path via an OPTIONAL partit (absent => the proven 1-rank path verbatim;
     ! present+npes>1 => owned / owned+halo loop bounds + the FESOM2 extrap_nod3D exchange_nod
@@ -56,7 +65,7 @@ module oce_initial_state
     use oce_pressure_bv,  only: insitu2pot
     implicit none
     private
-    public :: t_ic3d_config, do_ic3d
+    public :: t_ic3d_config, do_ic3d, ic3d_extrap_from_env
     public :: extrap_nod3D   ! also exercised by test_pgf_mixed (E1)
 
     integer, parameter :: IC_MAX = 10
@@ -69,6 +78,12 @@ module oce_initial_state
         logical            :: t_insitu  = .true.
         logical            :: ic_cyclic = .true.
         real(WP)           :: dummy     = 1.e10_WP    ! FESOM2 g_config default
+        ! FESOM2 PR #979 &tracer_init3d ic_extrap_det / ic_extrap_tol (FESOM2 defaults):
+        ! .true. = the deterministic, decomposition-independent hole filling
+        ! (extrap_nod3D_det); extrap_tol = its relaxation stopping tolerance. Set from
+        ! FESOM3_IC_EXTRAP_DET / FESOM3_IC_EXTRAP_TOL by ic3d_extrap_from_env.
+        logical            :: extrap_det = .false.
+        real(WP)           :: extrap_tol = 1.e-3_WP
     end type t_ic3d_config
 
     ! Module-saved netCDF grid + per-node bilinear indices (mirrors g_ic3d module
@@ -252,6 +267,12 @@ contains
         logical  :: success
         real(WP) :: val, glob_max, dummy
         real(WP), allocatable :: work_array(:)
+        ! FESOM2 PR #979 (gen_support.F90 extrap_nod3D): ic_extrap_det switches to the
+        ! deterministic fill; the default keeps the historical fill below bit for bit.
+        if (ic%extrap_det) then
+            call extrap_nod3D_det(arr, ic, mesh, partit)
+            return
+        end if
         dummy = ic%dummy
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
         allocate(work_array(nNodL))
@@ -312,6 +333,194 @@ contains
         if (is_multirank(partit)) call exchange_nod(arr, partit)   ! FESOM2 final exchange
         deallocate(work_array)
     end subroutine extrap_nod3D
+
+    !===========================================================================
+    ! Deterministic, decomposition-independent hole filling (ic%extrap_det). Port of
+    ! FESOM2 PR #979, gen_support.F90 extrap_nod3D_det (commits c7283ee5 + fad9f218).
+    ! Two phases per layer, both Jacobi (source values frozen to the previous sweep), the
+    ! neighbour sum accumulated in ASCENDING GLOBAL NODE ID order, so the floating-point
+    ! result does not depend on the partitioning or on the local numbering; halo exchange
+    ! after every sweep, global termination by allreduce:
+    !   phase 1 - ring fill: every still-dummy node with at least one valid neighbour
+    !     takes the multiplicity-weighted mean of its valid neighbours (stencil and
+    !     eligibility as in the historical fill: the vertices of the node's element ring,
+    !     element deep enough at this level, neighbour column deep enough at this level).
+    !   phase 2 - relaxation: the FILLED nodes (original valid data fixed as boundary
+    !     values) are relaxed with the same neighbour mean until the global max per-sweep
+    !     change is <= ic%extrap_tol (cap: 20000 sweeps per level). Phase 1 alone meets in
+    !     an equidistant front wherever two water masses fill one basin; the relaxation
+    !     replaces it with the smooth interior interpolation of the valid data.
+    ! The vertical fill and the final exchange are the historical routine's.
+    ! FESOM_F differences from the FESOM2 code (none in the arithmetic): the element loop
+    ! runs over elem2D_nnodes(el) vertices (quads: 3 non-self vertices), so the scratch
+    ! bound is (MAX_NV-1) per ring element instead of FESOM2's 2; without a partit (or
+    ! at npes == 1) the global id is the local index (FESOM_F's 1-rank identity
+    ! partition) and the exchanges / allreduces are skipped.
+    subroutine extrap_nod3D_det(arr, ic, mesh, partit)
+        type(t_ic3d_config), intent(in)    :: ic
+        type(t_mesh),        intent(in)    :: mesh
+        real(WP),            intent(inout) :: arr(:,:)   ! (nl-1, nNodL)
+        type(t_partit),      intent(in), optional :: partit
+        real(WP), allocatable :: cur(:), nxt(:)
+        logical,  allocatable :: filled(:)
+        integer,  allocatable :: gid(:)
+        integer  :: n, nz, nl1, cnt, loc_prog
+        integer  :: nNodO, nNodL, nEdgeO, nElemO
+        integer  :: relax_sweeps, relax_cap
+        real(WP) :: val, dmax, dummy
+        logical  :: mr, root
+        dummy = ic%dummy
+        mr = is_multirank(partit)
+        root = .true.
+        if (present(partit)) root = (partit%mype == 0)
+        call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
+        allocate(cur(nNodL), nxt(nNodL), filled(nNodL), gid(nNodL))
+        if (mr) then
+            gid = partit%myList_nod2D(1:nNodL)
+        else
+            gid = [(n, n = 1, nNodL)]
+        end if
+        relax_sweeps = 0
+
+        do nz = 1, mesh%nl-1
+            cur(1:nNodL) = arr(nz, 1:nNodL)
+            if (mr) call exchange_nod(cur, partit)
+            filled(:) = (cur(:) > 0.99_WP*dummy)      ! dummy at entry = to be filled
+
+            ! phase 1 - ring fill
+            do
+                nxt(1:nNodL) = cur(1:nNodL)
+                loc_prog = 0
+                do n = 1, nNodO
+                    if ((cur(n) > 0.99_WP*dummy) .and. (mesh%nlevels_nod2D(n) > nz)) then
+                        call det_ring_mean(n, nz, cur, val, cnt)
+                        if (cnt > 0) then
+                            nxt(n) = val
+                            loc_prog = 1
+                        end if
+                    end if
+                end do
+                if (mr) call allreduce_max(loc_prog, partit)
+                if (loc_prog == 0) exit
+                cur(1:nNodL) = nxt(1:nNodL)
+                if (mr) call exchange_nod(cur, partit)
+            end do
+
+            ! nodes with no source at this level stay dummy for the vertical fill
+            do n = 1, nNodL
+                if (cur(n) > 0.99_WP*dummy) filled(n) = .false.
+            end do
+
+            ! phase 2 - relaxation of the filled nodes toward the smooth interior
+            ! interpolation of the fixed original data
+            relax_cap = relax_sweeps + 20000
+            do
+                nxt(1:nNodL) = cur(1:nNodL)
+                dmax = 0._WP
+                do n = 1, nNodO
+                    if (filled(n) .and. (mesh%nlevels_nod2D(n) > nz)) then
+                        call det_ring_mean(n, nz, cur, val, cnt)
+                        if (cnt > 0) then
+                            nxt(n) = val
+                            dmax = max(dmax, abs(val - cur(n)))
+                        end if
+                    end if
+                end do
+                if (mr) call allreduce_max(dmax, partit)
+                if (dmax <= ic%extrap_tol) exit
+                relax_sweeps = relax_sweeps + 1
+                if (relax_sweeps >= relax_cap) then
+                    if (root) write(*,*) 'extrap_nod3D_det: relaxation sweep cap at level ', nz, &
+                                         ' (max change ', dmax, ') - proceeding'
+                    exit
+                end if
+                cur(1:nNodL) = nxt(1:nNodL)
+                if (mr) call exchange_nod(cur, partit)
+            end do
+
+            arr(nz, 1:nNodL) = cur(1:nNodL)
+        end do
+
+        ! vertical fill - identical to the historical routine (owned nodes)
+        do n = 1, nNodO
+            nl1 = mesh%nlevels_nod2D(n) - 1
+            do nz = 2, nl1
+                if (arr(nz,n) > 0.99_WP*dummy) arr(nz,n) = arr(nz-1,n)
+            end do
+        end do
+        if (mr) call exchange_nod(arr, partit)
+        deallocate(cur, nxt, filled, gid)
+
+    contains
+
+        subroutine det_ring_mean(n, nz, layer, val, cnt)
+            ! Multiplicity-weighted mean of the eligible valid neighbours of node n at
+            ! level nz, summed in ascending global-id order (stable insertion sort; the
+            ! ring holds at most a few tens of entries). Scratch sized by the exact bound:
+            ! MAX_NV-1 non-self vertices per ring element.
+            integer,  intent(in)  :: n, nz
+            real(WP), intent(in)  :: layer(:)
+            real(WP), intent(out) :: val
+            integer,  intent(out) :: cnt
+            integer  :: k, j, el, a, b, g, m
+            integer  :: ngid((MAX_NV-1)*mesh%nod_in_elem2D_num(n))
+            real(WP) :: nval((MAX_NV-1)*mesh%nod_in_elem2D_num(n)), w
+            cnt = 0
+            val = 0._WP
+            do k = 1, mesh%nod_in_elem2D_num(n)
+                el = mesh%nod_in_elem2D(k, n)
+                if (nz > mesh%nlevels(el)) cycle
+                do j = 1, mesh%elem2D_nnodes(el)   ! UNIQUE vertices (a triangle's slot 4 repeats slot 1)
+                    m = mesh%elem2D_nodes(j, el)
+                    if (m == 0) cycle
+                    if (m == n) cycle
+                    if ((layer(m) < 0.99_WP*dummy) .and. (mesh%nlevels_nod2D(m) > nz)) then
+                        cnt = cnt + 1
+                        ngid(cnt) = gid(m)
+                        nval(cnt) = layer(m)
+                    end if
+                end do
+            end do
+            if (cnt == 0) return
+            do a = 2, cnt
+                g = ngid(a)
+                w = nval(a)
+                b = a - 1
+                do while (b >= 1)
+                    if (ngid(b) <= g) exit
+                    ngid(b+1) = ngid(b)
+                    nval(b+1) = nval(b)
+                    b = b - 1
+                end do
+                ngid(b+1) = g
+                nval(b+1) = w
+            end do
+            do a = 1, cnt
+                val = val + nval(a)
+            end do
+            val = val / real(cnt, WP)
+        end subroutine det_ring_mean
+
+    end subroutine extrap_nod3D_det
+
+    !===========================================================================
+    ! Run switches of the IC hole filling (read where they act, like the SSH solver
+    ! knobs): FESOM3_IC_EXTRAP_DET (presence: set and not empty => ic%extrap_det, also
+    ! for =0) and FESOM3_IC_EXTRAP_TOL (value: the relaxation tolerance, default 1e-3,
+    ! must be > 0). Leaves ic unchanged when neither is set.
+    subroutine ic3d_extrap_from_env(ic)
+        type(t_ic3d_config), intent(inout) :: ic
+        character(len=64) :: env
+        integer :: env_len, ios
+        call get_environment_variable('FESOM3_IC_EXTRAP_DET', env, length=env_len, status=ios)
+        if (ios == 0 .and. env_len > 0) ic%extrap_det = .true.
+        call get_environment_variable('FESOM3_IC_EXTRAP_TOL', env, length=env_len, status=ios)
+        if (ios == 0 .and. env_len > 0) then
+            read(env, *, iostat=ios) ic%extrap_tol
+            if (ios /= 0) error stop 'FESOM3_IC_EXTRAP_TOL: not a real'
+            if (.not. (ic%extrap_tol > 0._WP)) error stop 'FESOM3_IC_EXTRAP_TOL must be > 0'
+        end if
+    end subroutine ic3d_extrap_from_env
 
     !===========================================================================
     ! Orchestrate: per (file,var) read+interp+extrap into the matching tracer; zero

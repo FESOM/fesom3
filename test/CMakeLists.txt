@@ -283,6 +283,42 @@ foreach(_np 1 2)
         SKIP_REGULAR_EXPRESSION "cannot open;No such file")
 endforeach()
 
+# linfs with FESOM3_LINFS_CONSERVE=TS (oce_ale_tracer linfs_surface_flux): the tracer the linear free surface
+# advects out returned as a uniform surface flux, so heat and salt conserve to round-off like zstar (plain linfs
+# drifts, -2e-4 heat and -1e-6 salt over these 20 steps, and is not gated). np 2 runs the flux's global sum, the
+# wsplit variant its implicit w_i part (the cap of _wsplit_cfg below). Then the switch's teeth: an unknown value
+# and a non-linfs coordinate must stop the run before the drift report.
+foreach(_np 1 2)
+    add_test(NAME fesom_conserve_linfs_ts_np${_np}
+             COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np ${_np}
+                     $<TARGET_FILE:fesom_conserve>)
+    set_tests_properties(fesom_conserve_linfs_ts_np${_np} PROPERTIES
+        ENVIRONMENT "FESOM3_MESH_DIR=/home/a/a270088/port2/fesom2/tests/data/MESHES/pi;FESOM3_IC_FILE=/pool/data/AWICM/FESOM2/INITIAL/phc3.0/phc3.0_winter.nc;FESOM3_NSTEPS=20;FESOM3_WHICH_ALE=linfs;FESOM3_LINFS_CONSERVE=TS;FESOM3_CONSERVE_TOL=1e-12"
+        SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+    add_test(NAME fesom_conserve_linfs_ts_wsplit_np${_np}
+             COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np ${_np}
+                     $<TARGET_FILE:fesom_conserve>)
+    set_tests_properties(fesom_conserve_linfs_ts_wsplit_np${_np} PROPERTIES
+        ENVIRONMENT "FESOM3_MESH_DIR=/home/a/a270088/port2/fesom2/tests/data/MESHES/pi;FESOM3_IC_FILE=/pool/data/AWICM/FESOM2/INITIAL/phc3.0/phc3.0_winter.nc;FESOM3_NSTEPS=20;FESOM3_WHICH_ALE=linfs;FESOM3_LINFS_CONSERVE=TS;FESOM3_WSPLIT=1;FESOM3_WSPLIT_MAXCFL=0.005;FESOM3_WSPLIT_EXPECT_SPLIT=1000;FESOM3_CONSERVE_TOL=1e-12"
+        SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+endforeach()
+add_test(NAME fesom_conserve_linfs_ts_badvalue_np1
+         COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np 1
+                 $<TARGET_FILE:fesom_conserve>)
+set_tests_properties(fesom_conserve_linfs_ts_badvalue_np1 PROPERTIES
+    ENVIRONMENT "FESOM3_MESH_DIR=/home/a/a270088/port2/fesom2/tests/data/MESHES/pi;FESOM3_IC_FILE=/pool/data/AWICM/FESOM2/INITIAL/phc3.0/phc3.0_winter.nc;FESOM3_NSTEPS=20;FESOM3_WHICH_ALE=linfs;FESOM3_LINFS_CONSERVE=ST"
+    PASS_REGULAR_EXPRESSION "FESOM3_LINFS_CONSERVE: expected S, T or TS"
+    FAIL_REGULAR_EXPRESSION "relative drift over the run"
+    SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+add_test(NAME fesom_conserve_linfs_ts_zstar_np1
+         COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np 1
+                 $<TARGET_FILE:fesom_conserve>)
+set_tests_properties(fesom_conserve_linfs_ts_zstar_np1 PROPERTIES
+    ENVIRONMENT "FESOM3_MESH_DIR=/home/a/a270088/port2/fesom2/tests/data/MESHES/pi;FESOM3_IC_FILE=/pool/data/AWICM/FESOM2/INITIAL/phc3.0/phc3.0_winter.nc;FESOM3_NSTEPS=20;FESOM3_WHICH_ALE=zstar;FESOM3_LINFS_CONSERVE=TS"
+    PASS_REGULAR_EXPRESSION "FESOM3_LINFS_CONSERVE needs which_ALE linfs"
+    FAIL_REGULAR_EXPRESSION "relative drift over the run"
+    SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+
 # Redi variant: diff_ver_part_redi_expl is the only caller of the tr_xynodes node-average
 # whose denominator this change touched, and it runs only when Redi is on.
 add_test(NAME fesom_conserve_zstar_redi_np1
@@ -503,3 +539,105 @@ set_tests_properties(fesom_conserve_linfs_vinv_shsync_np2 PROPERTIES
     PASS_REGULAR_EXPRESSION "shared elements \\(sync ON\\).* -- OK within tol"
     FAIL_REGULAR_EXPRESSION "VIOLATED"
     SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+
+# Deterministic IC hole filling (FESOM3_IC_EXTRAP_DET, the port of FESOM2 PR #979 ic_extrap_det;
+# src/oce/oce_initial_state.F90 extrap_nod3D_det). fesom_icgather builds the cold-start T/S as
+# the lifecycle driver does and gathers it by global id: the np 1 run writes it (fixture), the
+# np 2 / np 8 runs must reproduce it bit for bit (pi_w: triangles; nemo025mix_cut: triangles +
+# quads). Teeth: with the historical fill (switch unset) the np 2 IC of pi_w differs from np 1.
+foreach(_case piw:${_mesh_piw}:8 mixcut:${_mesh_mix}:4)
+    string(REPLACE ":" ";" _pair ${_case})
+    list(GET _pair 0 _tag)
+    list(GET _pair 1 _mesh)
+    list(GET _pair 2 _npmax)
+    set(_ref ${CMAKE_CURRENT_BINARY_DIR}/icgather_det_${_tag}_np1.bin)
+    add_mesh_test(fesom_icgather_det_${_tag}_np1 fesom_icgather ${_mesh} 1
+                  FESOM3_IC_FILE=${_icf} FESOM3_IC_EXTRAP_DET=1 FESOM3_IC_OUT=${_ref})
+    set_tests_properties(fesom_icgather_det_${_tag}_np1 PROPERTIES FIXTURES_SETUP icdet_${_tag})
+    require_files(fesom_icgather_det_${_tag}_np1 ${_icf})
+    foreach(_np 2 ${_npmax})
+        add_mesh_test(fesom_icgather_det_${_tag}_np${_np} fesom_icgather ${_mesh} ${_np}
+                      FESOM3_IC_FILE=${_icf} FESOM3_IC_EXTRAP_DET=1 FESOM3_IC_REF=${_ref}
+                      FESOM3_IC_EXPECT=identical)
+        set_tests_properties(fesom_icgather_det_${_tag}_np${_np} PROPERTIES
+            FIXTURES_REQUIRED icdet_${_tag}
+            PASS_REGULAR_EXPRESSION "IC IDENTICAL"
+            FAIL_REGULAR_EXPRESSION "IC DIFFER")
+        require_files(fesom_icgather_det_${_tag}_np${_np} ${_icf})
+    endforeach()
+endforeach()
+set(_ref ${CMAKE_CURRENT_BINARY_DIR}/icgather_hist_piw_np1.bin)
+add_mesh_test(fesom_icgather_hist_piw_np1 fesom_icgather ${_mesh_piw} 1
+              FESOM3_IC_FILE=${_icf} FESOM3_IC_OUT=${_ref})
+set_tests_properties(fesom_icgather_hist_piw_np1 PROPERTIES FIXTURES_SETUP ichist_piw)
+require_files(fesom_icgather_hist_piw_np1 ${_icf})
+add_mesh_test(fesom_icgather_hist_piw_np2 fesom_icgather ${_mesh_piw} 2
+              FESOM3_IC_FILE=${_icf} FESOM3_IC_REF=${_ref} FESOM3_IC_EXPECT=differ)
+set_tests_properties(fesom_icgather_hist_piw_np2 PROPERTIES
+    FIXTURES_REQUIRED ichist_piw
+    PASS_REGULAR_EXPRESSION "IC DIFFER"
+    FAIL_REGULAR_EXPRESSION "IC IDENTICAL")
+require_files(fesom_icgather_hist_piw_np2 ${_icf})
+# Split-explicit barotropic solver (docs/plans/completed/2026-10-17-split-explicit.md), test_ssh_se on the
+# rotated pi: the SM coefficients against literal numbers, knob parsing, the CFL guard (M_min
+# identical on all ranks at np 2, the decision for M = 1) and se_init's cold start under
+# FESOM3_SSH_SE=1 FESOM3_SE_M=40.
+set(_se_env FESOM3_TEST_ROTATE=1 FESOM3_SSH_SE=1 FESOM3_SE_M=40)
+# Stage 2 (P1-P4, many ranks; plan Task 2.1): np 8 too, and the partition-independence check P4:
+# np 1 writes eta and U after 6 SE steps by global id to FESOM3_TEST_SE_P4REF (fixture setup), np 2
+# and np 8 compare with it.
+list(APPEND _se_env FESOM3_TEST_SE_P4REF=${CMAKE_CURRENT_BINARY_DIR}/test_ssh_se_p4_np1.bin)
+add_fesom_test(test_ssh_se 1)
+set_tests_properties(test_ssh_se_np1 PROPERTIES ENVIRONMENT "FESOM3_MESH_DIR=${_mesh_pi};${_se_env}")
+require_files(test_ssh_se_np1 ${_mesh_pi}/nod2d.out)
+add_mesh_test(test_ssh_se_np2 test_ssh_se ${_mesh_pi} 2 ${_se_env})
+add_mesh_test(test_ssh_se_np8 test_ssh_se ${_mesh_pi} 8 ${_se_env})
+set_tests_properties(test_ssh_se_np1 PROPERTIES FIXTURES_SETUP se_p4_ref)
+set_tests_properties(test_ssh_se_np2 test_ssh_se_np8 PROPERTIES FIXTURES_REQUIRED se_p4_ref)
+# The driver-facing stops in fesom_conserve's se_init (the regex pair of the wsplit guards: the
+# message, and the step-0 line the driver prints only if it went on): a bad FESOM3_SSH_SE, a bad
+# FESOM3_SE_M, and M = 1 below the CFL-guard minimum.
+set(_se_conserve "FESOM3_MESH_DIR=${_mesh_pi};FESOM3_IC_FILE=${_icf};FESOM3_NSTEPS=1")
+foreach(_case badswitch badm cfl)
+    if(_case STREQUAL "badswitch")
+        set(_knobs "FESOM3_SSH_SE=2")
+        set(_msg "FESOM3_SSH_SE must be 0 or 1: \"2\"")
+    elseif(_case STREQUAL "badm")
+        set(_knobs "FESOM3_SSH_SE=1;FESOM3_SE_M=0")
+        set(_msg "FESOM3_SE_M must be an integer >= 1: \"0\"")
+    else()
+        set(_knobs "FESOM3_SSH_SE=1;FESOM3_SE_M=1")
+        set(_msg "M = 1 is below the CFL-guard minimum M_min = [0-9]+")
+    endif()
+    add_test(NAME fesom_conserve_se_${_case}_np1
+             COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np 1 $<TARGET_FILE:fesom_conserve>)
+    set_tests_properties(fesom_conserve_se_${_case}_np1 PROPERTIES
+        ENVIRONMENT "${_se_conserve};${_knobs}"
+        PASS_REGULAR_EXPRESSION "${_msg}"
+        FAIL_REGULAR_EXPRESSION "fesom_conserve: step "
+        SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+endforeach()
+# The split-explicit step in fesom_conserve (step_oce's SE branch): pi, linfs, 20 steps with the
+# per-step SE_CHECK line; the driver's linfs invariants (T10, helem, finiteness) stop the run on a
+# violation, SE_CHECK on a non-finite value. The zstar tests below add the zstar depth law and the
+# hard conservation.
+add_test(NAME fesom_conserve_se_linfs_np1
+         COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np 1 $<TARGET_FILE:fesom_conserve>)
+set_tests_properties(fesom_conserve_se_linfs_np1 PROPERTIES
+    ENVIRONMENT "FESOM3_MESH_DIR=${_mesh_pi};FESOM3_IC_FILE=${_icf};FESOM3_NSTEPS=20;FESOM3_WHICH_ALE=linfs;FESOM3_SSH_SE=1;FESOM3_SE_CHECK=1"
+    PASS_REGULAR_EXPRESSION "SE_CHECK step=20 etacomp=.*fesom_conserve: done \\(20 steps, which_ALE=linfs\\)"
+    FAIL_REGULAR_EXPRESSION "VIOLATED;non-finite"
+    SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+# zstar (plan Task 3.1): the same 20 SE steps under zstar at np 1 and 2 with the hard heat/salt/volume
+# conservation of the zstar conserve tests (FESOM3_CONSERVE_TOL=1e-12), the per-step SE_CHECK line and
+# the SE_CHECK_TAIL line of the zstar checks after the ALE tail (layer sum, w(1), depth law); their
+# levels are gated by tools/run_conserve_pi.sh, a non-finite value stops the run.
+foreach(_np 1 2)
+    add_test(NAME fesom_conserve_se_zstar_np${_np}
+             COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np ${_np} $<TARGET_FILE:fesom_conserve>)
+    set_tests_properties(fesom_conserve_se_zstar_np${_np} PROPERTIES
+        ENVIRONMENT "FESOM3_MESH_DIR=${_mesh_pi};FESOM3_IC_FILE=${_icf};FESOM3_NSTEPS=20;FESOM3_WHICH_ALE=zstar;FESOM3_SSH_SE=1;FESOM3_SE_CHECK=1;FESOM3_CONSERVE_TOL=1e-12"
+        PASS_REGULAR_EXPRESSION "SE_CHECK_TAIL step=20 laysum=.*fesom_conserve: CONSERVATION OK within tol"
+        FAIL_REGULAR_EXPRESSION "VIOLATED;non-finite"
+        SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+endforeach()

@@ -40,6 +40,12 @@ program fesom_lifecycle_native_mr
     !   FESOM3_NSTEPS       number of steps                     (default: 3)
     !   FESOM3_SHARED_SYNC  1 = one owner per shared element: update_vel syncs uv (default);
     !                       0 = off (unsynced copies, A/B only). Read in src/infra/mod_shared_elem.F90.
+    !   FESOM3_IC_EXTRAP_DET  presence: deterministic, decomposition-independent IC hole filling
+    !                       (FESOM2 ic_extrap_det, PR #979; default off = the historical fill).
+    !   FESOM3_IC_EXTRAP_TOL  its relaxation tolerance (FESOM2 ic_extrap_tol)  (default: 1e-3)
+    !                       Both read in oce_initial_state::ic3d_extrap_from_env.
+    !   FESOM3_SSH_SE       1 = split-explicit barotropic solver (knobs FESOM3_SE_*); default 0 =
+    !                       the semi-implicit CG solve. Read in src/oce/oce_ssh_se.F90.
     use mpi
     use mod_timer           ! permanent per-component wall-clock timing (TMR_* ids, timer_start/stop/report)
     use, intrinsic :: ieee_arithmetic   ! M8c Step-3 fix: control flush-to-zero (denormal) underflow mode
@@ -92,10 +98,11 @@ program fesom_lifecycle_native_mr
     use mod_forcing_read    ! native CORE2 atmospheric forcing read
     use mod_forcing_bulk,   only: forcing_bulk_ncar, forcing_wind_stress, forcing_ice_stress
     use mod_forcing_other,  only: read_other_NetCDF   ! runoff + SSS climatology read
-    use oce_initial_state,  only: t_ic3d_config, do_ic3d
+    use oce_initial_state,  only: t_ic3d_config, do_ic3d, ic3d_extrap_from_env
     use oce_muscl_adv,      only: muscl_adv_init
     use oce_ssh_rhs,        only: init_stiff_mat_ale
     use mod_step_oce,       only: step_oce
+    use oce_ssh_se,         only: se_init
     use mod_io_meshdiag,    only: meshdiag_write
     use mod_io_means,       only: t_io_means, t_io_config, t_io_entry, t_means_clock, MEANS_MAXF, &
                                   means_init, means_read_namelist, means_define_node2d, &
@@ -106,6 +113,7 @@ program fesom_lifecycle_native_mr
     ! Restart Stage 5: checkpoint registry + register/write/read hooks (the lifecycle wiring of mod_io_restart).
     use mod_io_restart,     only: t_restart, restart_init, restart_register_state, restart_write, &
                                   restart_read, restart_finalize, restart_resolve_latest
+    use oce_ale,            only: update_thickness_ale   ! zstar restart: rebuild the derived thicknesses
     implicit none
 
     ! Model timestep, from step_per_day (env FESOM3_STEP_PER_DAY; default 48 => dt = 1800 s = 30 min,
@@ -136,7 +144,7 @@ program fesom_lifecycle_native_mr
     character(len=4096) :: out_env, out_dir_o, nml_io_path
     ! M8a: model clock (cold start from FESOM3_START_CLOCK) + run-length driver
     integer            :: clk_d0, clk_y0, clk_unit, idx, ierr
-    real(kind=WP)      :: clk_t0, dstat(9)   ! dstat: M8c Step-3 global per-step physical diagnostics
+    real(kind=WP)      :: clk_t0, dstat(10)  ! dstat: M8c Step-3 global per-step physical diagnostics
     real(kind=WP)      :: dsum(2)            ! [sum ssh_rhs_old, sum|ssh_rhs_old|] over owned nodes
     real(kind=WP)      :: sbud(3)            ! FESOM3_STEP_DIAG zstar ocean + ice salt budget (salt_budget)
     real(kind=WP), allocatable :: salt_col(:)   ! its per-node ocean + ice salt of the previous step
@@ -437,6 +445,9 @@ program fesom_lifecycle_native_mr
     ic%t_insitu    = .true.
     ic%ic_cyclic   = .true.
     ic%dummy       = 1.e10_WP
+    call ic3d_extrap_from_env(ic)       ! FESOM3_IC_EXTRAP_DET / FESOM3_IC_EXTRAP_TOL
+    if (partit%mype == 0 .and. ic%extrap_det) write(*,'(a,es10.3,a)') &
+        'fesom_lifecycle_native_mr: IC hole filling DETERMINISTIC (ic_extrap_det; tol=', ic%extrap_tol, ')'
     call do_ic3d(tracers, ic, mesh, partit)
     if (partit%mype == 0) &
         write(*,'(a,2es12.4,a,2es12.4)') 'fesom_lifecycle_native_mr: IC(rank0 owned) T=', &
@@ -933,6 +944,12 @@ program fesom_lifecycle_native_mr
     end if
 
     !===========================================================================
+    ! Split-explicit barotropic solver (FESOM3_SSH_SE; a silent no-op when unset): knobs, SE
+    ! state, cold-start rings from eta_n/uv, CFL guard. After the whole cold init, before the
+    ! restart block, so that a restart read overwrites the cold rings.
+    call se_init(dyn, mesh, partit, dt)
+
+    !===========================================================================
     ! Restart Stage 5 (Task 5.3 REGISTER + Task 5.1 READ). When FESOM3_RESTART=<dir> is set, register the
     ! FULL prognostic state (live pointers — oce + ice incl. EVP sigma + MP hbar/hnode) so the in-loop /
     ! end-of-run hooks below can checkpoint it. When this is a RESTART launch (r_restart, set by clock_init
@@ -950,6 +967,15 @@ program fesom_lifecycle_native_mr
         if (r_restart) then
             call restart_read(rst, trim(RestartInPath), mesh, partit, &
                               clock_year=yearnew, clock_day=daynew, clock_time_sec=real(timenew, real64))
+            ! zstar: the checkpoint holds hnode only. At the top of a straight-run step hnode_new == hnode
+            ! and zbar_3d_n / Z_3d_n / helem are what update_thickness_ale built from them (bottom-up from
+            ! the fixed anchor; helem over owned elements + exchange_elem), so rerun it with
+            ! hnode_new = hnode: the same loops give the same bits (hnode is rewritten with itself).
+            ! linfs keeps its cold, never-changing thicknesses.
+            if (trim(which_ALE) == 'zstar') then
+                mesh%hnode_new(:, 1:nNodL) = mesh%hnode(:, 1:nNodL)
+                call update_thickness_ale(mesh, partit)
+            end if
             if (partit%mype == 0) write(*,'(a,f9.1,a,i0,a,i0)') &
                 'restart: state restored (resumed run) at clock time=', timenew, ' day=', daynew, &
                 ' year=', yearnew
@@ -1081,7 +1107,11 @@ program fesom_lifecycle_native_mr
         if (allocated(ice%work%sigma11)) dstat(9) = max(shared_copy_max_elem(ice%work%sigma11, partit), &
                                                         shared_copy_max_elem(ice%work%sigma12, partit), &
                                                         shared_copy_max_elem(ice%work%sigma22, partit))
-        call MPI_Allreduce(MPI_IN_PLACE, dstat, 9, MPI_WP, MPI_MAX, partit%MPI_COMM_FESOM, ierr)
+        ! max CFL_z of the step (vert_vel_ale's cfl_z, owned nodes): the vertical Courant number the
+        ! split-explicit screens compare with the semi-implicit runs. Its own line below, so that the
+        ! step line stays byte-identical (G0 and run_cutout_short.sh read its fields).
+        dstat(10) = maxval(dyn%cfl_z(:,1:nNodO))
+        call MPI_Allreduce(MPI_IN_PLACE, dstat, 10, MPI_WP, MPI_MAX, partit%MPI_COMM_FESOM, ierr)
         dsum = [sum(dyn%ssh_rhs_old(1:nNodO)), sum(abs(dyn%ssh_rhs_old(1:nNodO)))]
         call MPI_Allreduce(MPI_IN_PLACE, dsum, 2, MPI_WP, MPI_SUM, partit%MPI_COMM_FESOM, ierr)
         if (partit%mype == 0) &
@@ -1091,6 +1121,8 @@ program fesom_lifecycle_native_mr
                 '  Tmax=', dstat(5), '  Smax=', dstat(6), &
                 '  divsum=', abs(dsum(1))/max(dsum(2), tiny(1.0_WP)), &
                 '  dUV=', dstat(7), '  dAB=', dstat(8), '  dsig=', dstat(9)
+        if (partit%mype == 0) &
+            write(*,'(a,i0,a,es12.4)') 'fesom_lifecycle_native_mr: CFL_z step ', n, '  max CFL_z=', dstat(10)
         ! zstar (.not. use_virt_salt): the ocean + sea-ice salt budget of the step (salt_budget).
         ! resid = change of ocean + ice salt - dt*sum(areasvol*relax_salt): roundoff when the step
         ! conserves; with FESOM2's cut_off it is minus the ice salt cut_off deleted. cut = the ice

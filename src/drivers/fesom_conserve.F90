@@ -42,6 +42,7 @@ program fesom_conserve
     !   FESOM3_CONSERVE_ICE  presence -> sea ice ON (see below)
     !   FESOM3_WHICHEVP    0=EVP / 1=mEVP (with FESOM3_CONSERVE_ICE)    default: 0
     !   FESOM3_DIVSUM_TOL  shared-element gate (below); unset/0 = report only
+    !   FESOM3_SSH_SE      1 = split-explicit barotropic solver (knobs FESOM3_SE_*, src/oce/oce_ssh_se.F90)
     !
     ! SHARED ELEMENTS (docs/plans/completed/20261012-shared-element-sync.md). A border element is owned by
     ! every rank that owns one of its vertices; update_vel syncs uv to the designated owner's
@@ -109,6 +110,7 @@ program fesom_conserve
     use oce_muscl_adv,      only: muscl_adv_init
     use oce_ssh_rhs,        only: init_stiff_mat_ale
     use mod_step_oce,       only: step_oce
+    use oce_ssh_se,         only: se_init
     use mod_config,         only: which_ALE
     use mod_halo,           only: allreduce_sum, allreduce_max, shared_copy_max_elem
     use oce_wsplit,         only: wsplit_assert_params
@@ -543,6 +545,11 @@ program fesom_conserve
         if (partit%mype == 0) write(*,'(a,i0,a)') 'fesom_conserve: sea ice ON (whichEVP=', whichevp, &
             '; seeded, dynamics + FCT advection + ice-ocean drag, no thermodynamics)'
     end if
+
+    !===========================================================================
+    ! split-explicit barotropic solver (FESOM3_SSH_SE; a silent no-op when unset), after the
+    ! cold init: knobs, SE state, cold-start rings from eta_n/uv, CFL guard.
+    call se_init(dyn, mesh, partit, dt)
 
     !===========================================================================
     ! runloop: N steps, state persists (multi-step AB2 evolution). lfirst=(n==1).

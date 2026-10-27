@@ -2873,3 +2873,246 @@ once and send it, or test that the copies stay bitwise equal. At np>1, test the 
 `|sum ssh_rhs_old| / sum|ssh_rhs_old|` and the copy spreads (`FESOM3_STEP_DIAG`, `fesom_conserve`
 `FESOM3_DIVSUM_TOL`), not only conservation at np 1. When a gate needs a "harmless ULP floor" at
 np>1, find the duplicated state behind it before accepting it.
+
+
+## L71A — FESOM2's deterministic IC fill (`ic_extrap_det`) is decomposition-independent to the bit, but "independent of the node numbering" means the LOCAL numbering: a global renumbering changes the sum order
+
+**Context.** Branch `ic-extrap-det` (2026-10-20): port of FESOM2 PR #979 (`extrap_nod3D_det`) as
+`FESOM3_IC_EXTRAP_DET`, the answer to L60's partition-dependent cold start.
+
+**Lessons.**
+- **Jacobi + a sum in global-id order + an exchange per sweep is enough for bit-identity across
+  ranks.** Every owned node sees its whole element ring (owned elements include every element with an
+  owned vertex), the halo is current after every sweep, and the termination tests are global maxima
+  (exact). Measured: the CORE2 IC is bit-identical at np 1, 2, 8, 128 and 512 (`fesom_icgather`),
+  and the lifecycle driver's cold start (checkpoint `*_M1` after step 1) is that IC.
+- **A renumbered mesh is a different global numbering.** The neighbour sum is ordered by global id;
+  the Hilbert copy `core2_hil` orders the same neighbours differently, so its IC equals CORE2's through
+  the permutation only to roundoff (6.8e-14 degC, 1.6e-13 psu; volume means equal). An order that does
+  not depend on ids makes it exact: sorting the neighbours by their (lon, lat) instead of their id gives
+  core2_hil the CORE2 fill bit for bit (fesom3_jax numpy experiment, 2026-10-20), but that is no longer
+  FESOM2's arithmetic.
+- **Off must mean off.** The switch dispatches at the top of `extrap_nod3D`; with it unset, CORE2
+  dist_512 and pi_w np 2 runs of the branch are bit-identical to main over 3 steps (every store of
+  every checkpoint). Keep new options behind a dispatch that leaves the old code path untouched.
+- **Check the gather tool against the model.** `fesom_icgather` rebuilds the IC outside the lifecycle;
+  it was trusted only after its output matched the lifecycle checkpoint's `temp_M1`/`salt_M1` bit for
+  bit (CORE2 np 512, pi_w np 1 and 2).
+
+## L71B — Under Intel `-no-prec-div` a division by a loop invariant rounds differently in the vectorised body and in the scalar remainder: per-element results then depend on the local index, and the copies of a shared element differ by 1 ULP
+
+**Context.** Split-explicit plan (`docs/plans/completed/2026-10-17-split-explicit.md`), Task 2.1, and Task 3.1
+on a side branch (found twice, independently). The SE design keeps the copies of a shared border
+element bitwise equal without a per-substep sync: every per-element operator is a gather in fixed slot
+order from bitwise-equal inputs (IMPLEMENTATION §14).
+
+**What happened.**
+- `se_subcycle` accumulated the mean transport as `umean += ustar/rM`. U*, the three ring levels and
+  H^A were bitwise equal on all owners at every substep, yet the ⟨⟨Ū⟩⟩ copies differed by 1e-16 to
+  1.8e-15 m²/s (test_ssh_se P2, Intel np 2 and 8; GNU passed).
+- The Intel anchor flags (copied from FESOM2) include `-no-prec-div`. The element loop was vectorised
+  (vector length 2) with a scalar remainder loop (vectorisation report). The division by the
+  loop-invariant `rM` was evaluated one way in the vector body and another way in the remainder, so
+  the result depended on where the element sat in the loop. A shared element has a different local
+  index on each owner.
+- At scale with the old binary: CORE2 np 128, `spreadUm` > 0 in 298 of 340 steps, up to 1.1e-13 m²/s;
+  pi np 2/8 over 1000 steps, 2.8e-14. The `run_conserve_pi.sh` SE lines at np 2/8 would have failed.
+- Fix: `umean += ustar*rMinv` with `rMinv = 1/rM` computed once. A product is correctly rounded on
+  every code path; afterwards every copy spread is 0 at every substep.
+
+**How to apply.** This is L7's trap (`-no-prec-div` turns `x/y` into `x·recip(y)` with a
+1-ULP approximation for a runtime divisor) in a new form: the same source line gives two results in
+one loop. "Gather in fixed slot order" is necessary but not sufficient: the arithmetic of a
+per-element loop must not depend on the element's position in the loop. Multiply by a precomputed
+reciprocal instead of dividing by a loop invariant. Divisions are acceptable only where the result is
+synced afterwards (F's G/τ, the trimmed `uv`) or is a diagnostic. Test copy spreads bitwise at np > 1
+on the Intel anchor; GNU did not show the defect.
+
+
+## L72 — A resolution-based barotropic CFL estimate (0.5·res/√(gH)) underestimated the discrete operator's ω_max by 3.3× on CORE2: take the limit from the operator's spectrum and the scheme's stability polynomial
+
+**Context.** Split-explicit plan, Task 2.2 (M = 35 blew up at step 5), the Task 5.1 diagnosis and
+the guard fix in Task 0.4.
+
+**What happened.**
+- The guard taken from port_kokkos set dtbt ≤ 0.5·res/√(gH) (minimum over the nodes) and gave
+  M_min = 35 on CORE2 at Δt = 1800 s. M = 35 at χ = 0.1 blew up at step 5.
+- A power iteration of the substeps' linear operator A η = −I(H·(−g∇η))/areasvol gave ω_max =
+  3.152e-2 s⁻¹, with the eigenvector in the Kuril–Kamchatka trench. The guard's critical node was in
+  the Aleutian trench with c/res = 9.579e-3 s⁻¹. The ratio 3.29 means that at the guard's limit
+  ω_max·dtbt = 1.645, above the AB3–AM4 limit a_crit = 1.579 at χ = 0.1.
+- The real substep loop agreed with the scalar theory to the substep (unstable at M = 35 with
+  growth 1.24 per substep, theory 1.26; stable from M = 38). At χ = 0.25 the old guard admitted the
+  unstable M = 35–42.
+- The ratio is mesh-dependent: an ideal equilateral P1 mesh gives 2.57. A fixed "safety factor" on
+  res/c does not carry over from one mesh to another.
+
+**How to apply.** Compute the CFL limit of an explicit scheme from the discrete operator, not from a
+continuous estimate: ω_max by power iteration (100 iterations cost 0.06 s on CORE2 at np 8) and
+a_crit from the time scheme's characteristic polynomial (Schur–Cohn, no root finder), with a safety
+factor that covers only what the scalar test ignores (here s = 0.9). Check the guard with the real
+loop just below and just above the limit (0.97 and 1.03 a_crit).
+
+
+## L73 — A zstar restart was never exact: the derived thicknesses were not rebuilt after the read, and the restart gates had only run linfs. SI-zstar still carries one gap, the accumulated stiffness matrix
+
+**Context.** Split-explicit plan review and Task 4.1 (`restart_read` in
+`fesom_lifecycle_native_mr`).
+
+**What happened.**
+- A checkpoint restores `hnode`. `helem`, `zbar_3d_n`, `Z_3d_n` and `hnode_new` stayed at their cold
+  values after `restart_read`. Under linfs these never change, so the linfs-only restart gates could
+  not see it. With `FESOM3_WHICH_ALE=zstar` the gate failed with 26 checkpoint variables different
+  (eta_n 8e-4, temp 2.9e-2 at N4 K2); the first resumed step departed at PRESSURE_BV, which reads the
+  cold `Z_3d_n`.
+- Fix: for zstar, set `hnode_new = hnode` and call `update_thickness_ale` after the read. It rebuilds
+  the derived fields with the straight run's own loops, so the result is bitwise.
+- SI-zstar still fails, now first at SSH_SOLVE of the first resumed step (d_eta 5.5e-4).
+  `update_stiff_mat_ale` adds −dhe of the previous step to `ssh_stiff%values` every step, so the
+  values accumulate from the cold start, and the checkpoint holds neither dhe nor the values. A probe
+  build with that update switched off passed at np 1 and 2, so this is the only remaining gap.
+  (Restoring dhe would also change the Jacobi preconditioner, which is built once at the first
+  solve.) Split-explicit does not use the matrix, and SE-zstar restarts are exact.
+
+**How to apply.** Run the restart gate in every mode production can use, not only the default. For
+each mode, list the state derived incrementally across steps (accumulated matrix updates, solver
+initial guesses, carried diagnostics) and either store it, rebuild it from stored state, or document
+the gap. The diagnostic N = 3, K = 2 split (its final step is the first resumed step) names the
+first diverging substep.
+
+
+## L74 — Split-explicit exposed a shelf-wave/sea-ice feedback that SI's θ = 1 damping hides: the ice reads η once per step and hands its stress to the ocean frozen over the next step
+
+**Context.** Split-explicit plan, Tasks 2.2 and 3.2, and the Task 5.1 diagnosis. CORE2, production
+physics, cold start, χ = 0.1, M = 50: the run blew up at step 331–340 (day 7) at np 8 and np 128,
+under linfs and zstar, while every SE invariant stayed at rounding.
+
+**What happened.**
+- A grid-scale η pattern grew on the 20 m Antarctic shelf at 72–75°W, 71–73°S under compact sea ice
+  (a = 1), from about step 150 at +0.9 % per step, with a period of 3.0 baroclinic steps (ωτ ≈ 2.1).
+  SI's backward Euler damps such a mode to 1/√(1 + (ωτ)²) ≈ 0.43 in amplitude per step; the SM
+  substeps damp it only by about χ(ωτ)²/M ≈ 0.9 % per step. More substeps damp less: M = 100 blew up
+  earlier (step 192), and `se_visc_ah` = 0 at step 298.
+- On/off runs (480 steps) located the loop. Without the ice→ocean stress, or with the ice seeing
+  η = 0, the noise decayed (−0.45 % per step). Without bottom drag the growth was reduced. χ = 0.25 and
+  `se_visc_ah` = 0.1 also decayed.
+- The loop: before each ocean step the ice reads hbar = ηⁿ; the grid-scale tilt −m·g·∇ηⁿ drives the
+  compact ice; the ice→ocean stress enters the barotropic forcing F, frozen over [tⁿ, tⁿ⁺¹]. The
+  explicit bottom drag, also frozen in F from the previous step's velocity, adds to it. A one-mode
+  model of the substeps plus a force of relative size 0.03 taken from the step-start elevation
+  reproduced the growth rates of all runs (`/work/ab0995/a270088/fesom3_se_ref/jobs/dbg_toy_ice.py`).
+  port_kokkos had lost an Antarctic-shelf run the same way at χ = 0.05.
+
+**How to apply.** When a fast mode moves from an implicit, damping treatment to an explicit,
+resolving one, check every slow component that reads it once per step and feeds a force back frozen
+over the next step (sea ice, explicit drag). Screen with the coupled physics and real forcing for
+more than 300 steps; the consistency invariants will not warn. Watch grid-scale noise on shallow
+shelves, and find the loop with on/off runs of each link plus a one-mode model. Remedies to weigh
+(plan Task 5.1): more χ, more barotropic viscosity, a filtered η for the ice, the SM2005 averaging
+filter. More substeps is not one.
+
+## L75 — Without a barotropic filter, "subtract the 2-D right-hand side of the first substep" is safe for the drag but not for Coriolis: the 3-D AB2 Coriolis of the unfiltered fast mode stays in F as a force frozen over the step
+
+**Context.** Split-explicit plan, Task 5.4, after Sergey Danilov's answers Q3/Q5 (2026-10-18): put the bottom
+drag into the substeps and reconcile F with the substeps approximately, by removing the barotropic right-hand
+side of the first substep, for the drag and also for Coriolis (in place of the stored-sum r-term D4).
+
+**What happened.**
+- Implemented as F = G/τ + g·Hⁿ·∇ηⁿ + f e_z×U*⁰ (U*⁰ the first substep's AB3 transport) and a drag
+  D(Ūᵐ − Ūⁿ) = −(C_d|u_b|/Hⁿ)(Ūᵐ − Ūⁿ). Every unit test, G0, the invariants, the copy spreads and the restart
+  gates passed.
+- CORE2 cold starts (np 8, 480 steps) then blew up at every χ: 0.1 at step 171 (109 without the drag), 0.2 at
+  243, 0.25 (the default, stable for 3000 steps before) at 313; f e_z×Ūⁿ in place of U*⁰ at 336. The shelf
+  mode changed its period from 3 to 4.5–5 steps. The same build with the old D4 r-term and the drag decayed
+  at every χ, and at χ = 0.1 faster (−0.34 … −0.51 %/step) than any earlier remedy; D4 without the drag
+  reproduced the old scheme line for line. So the drag stabilises and the Coriolis consistency destabilises.
+- Likely mechanism (not separately tested): the 3-D velocity is trimmed to ⟨⟨Ū⟩⟩, which keeps ~80 % of a
+  mode with ωτ ≈ 2, and the 3-D AB2 Coriolis of that mode is off by a factor ~2 at that frequency. D4 removed
+  that term exactly; U*⁰ (instantaneous, end of the previous substeps) does not match it, so a force of
+  relative size ~f/ω ≈ 0.1 or more, set at the step start, stays frozen in F: L74's lagged force with a
+  larger ε. The drag is different: for a depth-uniform fast mode C_d|u_b|·u_b ≈ (C_d|u_b|/H)·Ū, so the
+  anchored substep drag turns the frozen 3-D drag into a drag that follows Ūᵐ within the step.
+- With the SM2005 averaging filter (as in ROMS) the barotropic state handed to the next step is the filtered
+  one, so the 3-D fields carry little of the fast mode; the notes' no-filter design (plan D1) has no such
+  protection. The Zenodo SE code keeps the stored-transport Coriolis removal.
+
+**How to apply.** An "approximate consistency" of the baroclinic forcing with the barotropic operator is only
+harmless for terms whose 3-D discretisation of the fast mode matches the 2-D one. Before replacing an exact
+removal by an approximate one, ask whether the fast barotropic mode is in the 3-D fields (no filter: yes) and
+how the 3-D time scheme (here AB2 at ωτ ≈ 2) treats it. Screen with production physics for ≥ 480 steps at
+every χ of interest, and separate the changes with debug switches (one change per run) before deciding.
+
+## L76 — Keep Coriolis out of the barotropic forcing (or subtract a stable estimate of it), and pick χ per mesh as the smallest value that survives a full year in every vertical coordinate: 3000-step screens are not enough
+
+**Context.** Split-explicit plan, Tasks 5.5 and 5.6 (2026-10-18), after the Task 5.4 blow-ups (L75) and the scheme
+author's answers (question packet §6): the first-substep Coriolis is expected to be unstable without a filter;
+either subtract a stable AB2 estimate of the barotropic Coriolis or leave Coriolis out of R̄ as Banerjee et al.
+(2024) do; D4 + the barotropic drag is acceptable; use minimal dissipation, χ depends on the mesh.
+
+**What happened.**
+- D4 (the 3-D AB2 Coriolis rebuilt from stored transport sums and removed from F) is exactly "Coriolis out of R̄":
+  the substeps then carry the whole barotropic Coriolis. Restoring it (commit 55f717b) reproduced the Task 5.4
+  debug runs line for line (step, CFL_z, SE_CHECK, DBG_SHELF at χ 0.1 and 0.25, np 8) and, with the drag off, the
+  old scheme; an old checkpoint resumed by the new binary equalled the old binary's straight run.
+- With the drag, the shelf mode of L74 decayed at every χ screened (480 steps, np 8): χ 0.05 / 0.07 / 0.1 / 0.25 at
+  −0.12 / −0.27 / −0.34 / −0.30 %/step over steps 150–330. χ = 0.05 also ran 3000 steps clean under linfs and
+  zstar, with the late shelf noise identical to χ 0.1 and 0.25, and a linfs year as close to SI as χ = 0.25 (SSH
+  rms 0.110 mm).
+- The zstar year at χ = 0.05 blew up on day 229: from one step to the next max|η| began to alternate with a period
+  of two baroclinic steps and grew by ~15 % per step to an overflow 23 steps later. The monthly means point at the
+  equatorial Atlantic (26°W 5°N, 4400 m), where both χ = 0.05 years (linfs and zstar) had a July anomaly of
+  +30–40 mm SSH and +1.6 °C at 85 m against SI, which χ = 0.25 (6 mm) did not. Not located exactly (no diagnostics
+  in the production binary, no checkpoint near the event).
+
+**How to apply.**
+- Treat "approximate consistency" of F with the substeps term by term (L75): drag and viscosity anchored at Ūⁿ are
+  safe; Coriolis needs either the exact removal of the 3-D term (D4) or a stable estimate, never the first
+  substep's instantaneous value.
+- Choose χ per mesh, smallest first, but accept a value only after a full year (seasonal forcing, a cold start
+  transient long gone) in every vertical coordinate production will use; a 480-step screen orders the candidates,
+  3000 steps rules out the shelf mode, neither rules out a late, local event. Give such runs monthly checkpoints
+  and a location printout of max|η| so a blow-up can be replayed from the last month for a few node-minutes.
+- A two-step period in the step diagnostics points to a mode at ωτ ≈ π (for example the AB2 computational mode of
+  the 3-D step, or a barotropic mode that small χ damps too little), not to the three-step shelf mode of L74; this
+  is a hypothesis until the event is located. ➕ Located (L77): a barotropic mode at ωτ ≈ π that χ = 0.05 damps
+  too little, on a 30 m Kara-shelf node, not in the equatorial Atlantic.
+
+## L77 — A two-step blow-up sat on one shelf node far from where the monthly means pointed: replay it from a checkpoint with per-step SSH, and read the step-line "onset" as the moment a local mode overtook the global max|η|
+
+**Context.** Split-explicit plan, Task 5.7 (2026-10-18). The SE zstar year at χ = 0.05 (CORE2, production physics,
+the barotropic drag, D4, M = 50, np 128) overflowed at step 10989 (day 229). From step 10966 its max|η| alternated
+step by step; the July monthly means had their largest SE − SI anomaly at 26°W 5°N, so L76 guessed the equatorial
+Atlantic.
+
+**What happened.**
+- A cold rerun with the failed run's binary and env plus an end-of-run checkpoint reproduced its 21120 step and
+  CFL_z lines to day 220; the restart from that checkpoint reproduced steps 10561–10989 line for line, and a second
+  checkpoint at step 10944 the last 45 steps. Writing a checkpoint does not change the state.
+- Per-step SSH of the replay found the event at once: node 57847, 75.65°E 74.53°N, a 30 m Kara-shelf node (4 layers)
+  in the Ob–Yenisei plume (20 psu at the surface, 33 psu at 25 m) under a = 0.75, 1 m sea ice. η there alternated
+  step by step about −0.5 m, the five neighbours moved against it, u and v were depth-uniform: a grid-scale barotropic
+  mode at the baroclinic Nyquist frequency. Its period-2 part was already 5–6 cm on day 220 and grew 0.5–1 %/step.
+  The step-line "onset" at step 10966 was only where |η| at the node passed the global max|η| (1.93 m, elsewhere);
+  the monthly means average a period-2 mode out, and the equatorial-Atlantic anomaly was a separate χ-dependent feature.
+- From the day-220 checkpoint: χ 0.07 grew +0.1 … +0.3 %/step for 11 days and then decayed, χ 0.1 decayed
+  −0.3 … −0.8 %/step, χ 0.25 −3.4 %/step; drag off and M = 100 blew up sooner. The one-mode toy of L74 at ωτ = π (the
+  SM substeps damp such a mode by ≈ χπ²/M per step, 1 % at χ 0.05) with a force of relative size ε frozen from the
+  step-start elevation, fitted on two runs (ε = +0.8 %), predicted the four others to 0.01 %/step.
+- Unlike L74, the sea ice was not the drive: with the ice-tilt or the ice→ocean stress switched off (debug build)
+  the mode still grew +0.3 … +1 %/step. Hypothesis, not tested by a switch: the zstar baroclinic pressure. The mode
+  stretches the layers and so lifts the plume stratification at the node; the density-Jacobian PGF, computed from the
+  step-start layers and frozen over the step, pushes with the step-start restoring force (ε ≈ +0.5 % estimated from
+  the replay's own T, S, η). The zstar year at χ = 0.1 ran clean, as close to SI zstar as the linfs year at χ 0.05 is
+  to SI linfs.
+
+**How to apply.**
+- Give every long run periodic checkpoints. A replay from the last one before an event is exact and costs minutes;
+  locate with per-step 2-D output of the replay, never with means: a Nyquist mode vanishes from any time mean.
+- Step-line extrema are global: a local mode shows there only once it exceeds everything else. Before calling a
+  start time, find where the mode is and look at its history there.
+- At the baroclinic Nyquist frequency the SM damping is ≈ χπ²/M per step, about 1 % per step per 0.05 of χ at
+  M = 50, so any lagged force of a few per mille to a per cent can beat a small χ, and more substeps make it worse.
+  Pick χ in a replay window from on/off runs, and accept it only if the period-2 part decays there, not merely if the
+  run survives the window. On CORE2 with the drag that is χ = 0.1.
+- Test a suspected feedback with on/off switches before naming it; the obvious suspect here (the ice, after L74) was
+  wrong.
