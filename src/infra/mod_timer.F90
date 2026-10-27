@@ -40,26 +40,34 @@ module mod_timer
     integer, parameter, public :: TMR_OCE_SSH     = 15
     integer, parameter, public :: TMR_OCE_SOLVE   = 16   ! SUBSET of SSH (the CG solve) — not summed
     integer, parameter, public :: TMR_OCE_SHSYNC  = 17   ! SUBSET of SSH (update_vel's shared-element uv sync)
-    integer, parameter, public :: TMR_OCE_GMREDI  = 18
-    integer, parameter, public :: TMR_OCE_TRACER  = 19
-    integer, parameter, public :: NTIMER          = 19
+    integer, parameter, public :: TMR_OCE_SE_BT   = 18   ! SUBSET of SSH (split-explicit barotropic substeps)
+    integer, parameter, public :: TMR_OCE_GMREDI  = 19
+    integer, parameter, public :: TMR_OCE_TRACER  = 20
+    integer, parameter, public :: NTIMER          = 20
 
     character(len=24), parameter :: TNAME(NTIMER) = [character(len=24) :: &
         'ocean2ice', 'forcing', 'sbc / crossing', 'open/reopen', 'read+inflate', 'interp loop', &
         'time-interp', 'bulk NCAR', 'wind/ice stress', &
         'ice', 'oce_fluxes', 'step_oce (ocean)', &
         'mix, pres, EOS', 'dynamics u,v,w', 'dynamics ssh', '(of which) ssh solve', &
-        '(of which) shared sync', 'GM / Redi', 'tracer' ]
+        '(of which) shared sync', '(of which) SE barotropic', 'GM / Redi', 'tracer' ]
     ! parent id for the indented report (0 = top-level component)
     integer, parameter :: TPARENT(NTIMER) = [ 0, 0, TMR_FORCING, TMR_FRC_SBC, TMR_FRC_SBC, TMR_FRC_SBC, &
         TMR_FORCING, TMR_FORCING, TMR_FORCING, &
         0, 0, 0, &
-        TMR_STEP_OCE, TMR_STEP_OCE, TMR_STEP_OCE, TMR_OCE_SSH, TMR_OCE_SSH, TMR_STEP_OCE, TMR_STEP_OCE ]
+        TMR_STEP_OCE, TMR_STEP_OCE, TMR_STEP_OCE, TMR_OCE_SSH, TMR_OCE_SSH, TMR_OCE_SSH, &
+        TMR_STEP_OCE, TMR_STEP_OCE ]
     ! .true. => this timer is a subset of its parent (don't add to the parent's child-sum check)
     logical, parameter :: TSUBSET(NTIMER) = [ .false.,.false.,.false., .true.,.true.,.true., &
         .false.,.false.,.false., &
         .false.,.false.,.false., &
-        .false.,.false.,.false., .true., .true., .false.,.false. ]
+        .false.,.false.,.false., .true., .true., .true., .false.,.false. ]
+    ! .true. => print the line only when the timer ran on some rank: a mode-specific timer (the
+    ! split-explicit loop) adds no zero line to the report of a run that does not use the mode
+    logical, parameter :: TQUIET(NTIMER) = [ .false.,.false.,.false., .false.,.false.,.false., &
+        .false.,.false.,.false., &
+        .false.,.false.,.false., &
+        .false.,.false.,.false., .false., .false., .true., .false.,.false. ]
 
     real(real64) :: tacc(NTIMER) = 0.0_real64   ! accumulated seconds
     real(real64) :: tbeg(NTIMER) = 0.0_real64   ! start stamp of an open interval
@@ -107,6 +115,7 @@ contains
         character(len=*), intent(in) :: label
         real(real64) :: tmean(NTIMER), tmin(NTIMER), tmax(NTIMER), loop_s, denom
         real(real64) :: perstep_ms, pct
+        integer(8)   :: cmax(NTIMER)
         integer :: i, ierr, ns
 
         if (.not. enabled) return
@@ -116,6 +125,7 @@ contains
         tmean = tmean / real(max(npes,1), real64)
         tmin  = tacc; call MPI_Allreduce(MPI_IN_PLACE, tmin,  NTIMER, MPI_DOUBLE_PRECISION, MPI_MIN, comm, ierr)
         tmax  = tacc; call MPI_Allreduce(MPI_IN_PLACE, tmax,  NTIMER, MPI_DOUBLE_PRECISION, MPI_MAX, comm, ierr)
+        cmax  = tcnt; call MPI_Allreduce(MPI_IN_PLACE, cmax,  NTIMER, MPI_INTEGER8,         MPI_MAX, comm, ierr)
 
         if (mype /= 0) return
 
@@ -132,6 +142,7 @@ contains
         write(*,'(a)') '  component                       mean_ms/step    min_ms/step    max_ms/step   %loop'
         write(*,'(a)') '  -----------------------------------------------------------------------------------'
         do i = 1, NTIMER
+            if (TQUIET(i) .and. cmax(i) == 0_8) cycle
             perstep_ms = 1.0e3_real64 * tmean(i) / ns
             pct        = 100.0_real64 * tmean(i) / denom
             if (TPARENT(i) == 0) then

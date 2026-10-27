@@ -1,9 +1,10 @@
 module mod_dyn
     ! Ocean dynamics type (decision D5: EVOLVING; prognostic state split from
     ! work/scratch). Structure from tracer_dwarf MOD_DYN (== FESOM2 v2.7.3 MOD_DYN),
-    ! trimmed to v1 scope: split-explicit SSH (se_*), backscatter/UKE, energy
-    ! diagnostics (ke_*) and iceberg arrays are dropped. fer_uv/fer_w are declared
-    ! (GM, M4) but not yet serialized.
+    ! trimmed to v1 scope: backscatter/UKE, energy diagnostics (ke_*) and iceberg
+    ! arrays are dropped. fer_uv/fer_w are declared (GM, M4) but not yet serialized.
+    ! The split-explicit SSH state (se_*) is FESOM_F's own (src/oce/oce_ssh_se.F90),
+    ! not the dwarf's FB-variant layout.
     !
     ! Aux 3D WORK fields (density/N^2/Kv/Av/hpressure/sw_alpha-beta/GM slopes, D5)
     ! are added to t_dyn_work at M2.1 with verified FESOM2 names.
@@ -134,6 +135,49 @@ module mod_dyn
         logical       :: use_wsplit     = .false.
         real(kind=WP) :: wsplit_mincfl  = 0.5_WP
         real(kind=WP) :: wsplit_maxcfl  = 1.0_WP
+
+        ! ---- split-explicit barotropic solver (FESOM3_SSH_SE, src/oce/oce_ssh_se.F90) ----
+        ! The knobs (env, se_read_env), the Shchepetkin-McWilliams (2005) AB3-AM4 coefficients
+        ! and the state of docs/plans/completed/2026-10-17-split-explicit.md (Technical Details §1). se_init
+        ! sets them and allocates the arrays ONLY when SE is on; the semi-implicit path never
+        ! touches them. Not in write/read_t_dyn: the carried arrays (se_eta, se_ubt, se_sbar_old)
+        ! belong to the Zarr checkpoint (mod_io_restart). Ring levels are shifted by copying, so
+        ! no ring offset is state.
+        logical       :: use_ssh_se = .false.   ! FESOM3_SSH_SE=1
+        integer       :: se_M       = 50        ! substeps per baroclinic step (FESOM3_SE_M)
+        real(kind=WP) :: se_chi     = 0.1_WP    ! SM dissipation parameter chi (FESOM3_SE_CHI)
+        real(kind=WP) :: se_visc_ah = 0.01_WP   ! BT viscosity A_h = se_visc_ah*l_e [m/s]; 0 = off (FESOM3_SE_VISC_AH)
+        logical       :: se_visc_flow = .false. ! flow-dependent BT viscosity in place of A_h (FESOM3_SE_VISC_FLOW)
+        real(kind=WP) :: se_visc_g0 = 10.0_WP   ! its background gamma0 [m^3/s^2] (FESOM3_SE_VISC_GAMMA0)
+        real(kind=WP) :: se_visc_g1 = 2750.0_WP ! its flow factor gamma1 [m^2] (FESOM3_SE_VISC_GAMMA1)
+        logical       :: se_bottdrag = .true.   ! barotropic bottom drag in the substeps (FESOM3_SE_BOTTDRAG)
+        logical       :: se_check   = .false.   ! per-step invariant suite (FESOM3_SE_CHECK)
+        logical       :: se_m_force = .false.   ! run with M below the CFL-guard minimum (FESOM3_SE_M_FORCE)
+        logical       :: se_ready   = .false.   ! se_init done; step_oce refuses FESOM3_SSH_SE=1 otherwise
+        real(kind=WP) :: se_beta  = 0.0_WP      ! AB3 weight beta
+        real(kind=WP) :: se_zeta  = 0.0_WP      ! AM4 weights zeta, gamma, delta (functions of se_chi)
+        real(kind=WP) :: se_gamma = 0.0_WP
+        real(kind=WP) :: se_delta = 0.0_WP
+        real(kind=WP), allocatable, dimension(:,:)   :: se_eta        ! (nNodL,2): eta^{-1/M}, eta^{-2/M}
+        real(kind=WP), allocatable, dimension(:,:,:) :: se_ubt        ! (2,nElemL,0:2): U^n, U^{-1/M}, U^{-2/M}
+        real(kind=WP), allocatable, dimension(:,:)   :: se_sbar_old   ! (2,nElemL): s^{n-1} = sum_k helem*uv
+        real(kind=WP), allocatable, dimension(:,:)   :: se_ubtn       ! (2,nElemL): copy of U^n for V, D(U^m - U^n)
+        real(kind=WP), allocatable, dimension(:)     :: se_kdrag      ! (nElemL): BT drag rate C_d*|u_bottom|/H^n [1/s]
+        real(kind=WP), allocatable, dimension(:)     :: se_etam       ! (nNodL): eta^m
+        real(kind=WP), allocatable, dimension(:)     :: se_etanew     ! (nNodL): eta^{m+1}
+        real(kind=WP), allocatable, dimension(:,:)   :: se_umean      ! (2,nElemL): <<U>>, the mean transport
+        real(kind=WP), allocatable, dimension(:,:)   :: se_force      ! (2,nElemL): barotropic forcing F
+        real(kind=WP), allocatable, dimension(:)     :: se_H          ! (nElemL): H^n_e = sum_k helem^n
+        real(kind=WP), allocatable, dimension(:,:)   :: se_c          ! (MAX_NV,nElemO): zstar depth-law weights c_{e,v}
+        real(kind=WP), allocatable, dimension(:,:)   :: se_kappa      ! (MAX_NV,nElemO): BT viscosity A_h*l/(d*A_e)
+        real(kind=WP), allocatable, dimension(:,:)   :: se_zlen       ! (MAX_NV,nElemO): flow viscosity sqrt(A_e + A_nb)
+        real(kind=WP), allocatable, dimension(:,:)   :: se_vn         ! (2,nElemO): flow viscosity W(U^n), frozen over a step
+        ! FESOM3_SE_CHECK: the area-mean elevation at the start of the run (set by the first
+        ! se_check_core of this process), the reference of the mean-sea-level change, and the
+        ! part of that change the freshwater explains (non-linfs; accumulated per check)
+        real(kind=WP) :: se_msl0     = 0.0_WP
+        logical       :: se_msl0_set = .false.
+        real(kind=WP) :: se_fwmsl    = 0.0_WP
 
         ! ---- sub-objects ----
         type(t_solverinfo) :: solverinfo
