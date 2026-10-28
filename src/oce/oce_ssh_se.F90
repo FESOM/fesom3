@@ -100,6 +100,17 @@ module oce_ssh_se
     ! omega_max*res/c is mesh-dependent (3.29 at the CORE2 trenches), and its M_min = 35 blew up
     ! at step 5 at chi = 0.1 (plan Task 5.1 note).
     !
+    ! RK3 (FESOM3_RK3=1 with FESOM3_SSH_SE=1, docs/plans/2026-10-28-rk3.md, Technical Details §4): the
+    ! "first stage" strategy of rk3.tex. se_bt_forcing_rk3 forms F in RK3 stage 1 from the stage-1
+    ! increment R1 (over tau/3) of the momentum on u^n, the viscosity of u^n over tau and the
+    ! depth-integrated wind and bottom drag of the TDMA's boundary rows, with the pressure and the
+    ! Coriolis of s^n = sum_k helem*u^n removed exactly (no AB2 weights, se_sbar_old is not used);
+    ! se_subcycle then runs unchanged (eta^M, U^M, <<U>>, not committed). In stage 3,
+    ! se_rk3_finish replaces se_trim_finish: u^{n+1} = u^n + the stage-3 increment trimmed to U^M,
+    ! the tracer transport velocity u** (dyn%rk3_us) trimmed to <<U>>, then the commit of eta^M as
+    ! se_trim_finish. se_init accepts RK3 as it is (AB_order stays 2; se_sbar_old stays in the
+    ! checkpoint, unused under RK3).
+    !
     ! The parsers (se_parse_knob) and the guard decision (se_cfl_decision) return their verdict
     ! instead of stopping, so test/test_ssh_se.F90 checks every rejection; the driver-facing
     ! wrappers (se_env_requested, se_read_env, se_init, se_step_guard) stop through se_die
@@ -108,7 +119,7 @@ module oce_ssh_se
     use, intrinsic :: iso_fortran_env, only: output_unit, int64
     use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
     use mod_precision,   only: WP, MPI_WP, WP_full
-    use mod_constants,   only: g, r_earth
+    use mod_constants,   only: g, r_earth, density_0
     use mod_param_phys,  only: C_d
     use mod_config,      only: ab_epsilon, which_ALE
     use mod_mesh,        only: t_mesh, MAX_NV
@@ -124,6 +135,7 @@ module oce_ssh_se
     private
     public :: se_env_requested, se_read_env, se_parse_knob, se_init, se_step_guard
     public :: se_elem_depth, se_bt_forcing, se_subcycle, se_trim_finish
+    public :: se_bt_forcing_rk3
     public :: se_check_core, se_check_values, se_check_line, se_check_tail
     public :: se_inflow, se_visc, se_visc_flow, se_visc_on, se_tendency, se_depth_at, se_kappa_build
     public :: se_knob_conflict
@@ -854,6 +866,76 @@ contains
             end if
         end if
     end subroutine se_bt_forcing
+
+    !===========================================================================
+    subroutine se_bt_forcing_rk3(dyn, mesh, partit, dt, stress_surf)
+        ! RK3 stage 1 (module header; plan Technical Details §4), when uv = u^n, uv_rhs = R1 (the
+        ! stage-1 increment over tau/3 of Coriolis, advection, PGF and -g grad(eta^n) on u^n, owned
+        ! elements), rk3_visc = the viscosity increment of u^n over tau, helem = helem^n and eta_n =
+        ! eta^n. H^n (se_elem_depth: se_H, and se_c under zstar, which kdrag and the substeps
+        ! read), then on the OWNED elements
+        !     G   = sum_k helem*(3*R1 + rk3_visc) + tau*(tau_s/rho_0 - C_d*|u_b|*u_b)
+        !     s^n = sum_k helem*u^n
+        !     F   = G/tau + g H^n grad(eta^n) + f e_z x s^n
+        ! u_b = u^n at nlevels(e)-1: the wind and drag rows of impl_vert_visc_ale integrated over
+        ! the column (the interior viscous fluxes of the TDMA telescope). The pressure term
+        ! cancels what compute_vel_rhs put into R1 (the same gradient_sca expression), the
+        ! Coriolis term the f*(v, -u) of R1 exactly (the 3-D Coriolis is kept out of F, D4-like,
+        ! L76). kdrag, se_ubtn and the shared-element sync of F and kdrag as se_bt_forcing.
+        type(t_dyn),    intent(inout) :: dyn
+        type(t_mesh),   intent(in)    :: mesh
+        type(t_partit), intent(in)    :: partit
+        real(kind=WP),  intent(in)    :: dt                  ! tau, the baroclinic step
+        real(kind=WP),  intent(in)    :: stress_surf(:,:)    ! (2, >= nElemO) the surface stress
+        integer       :: e, nz, nb, elnodes(MAX_NV)
+        integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
+        real(kind=WP) :: f, Fx, Fy, fr, pre(MAX_NV), gb(2), sn(2)
+
+        call se_elem_depth(dyn, mesh, partit)
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+
+        do e = 1, nElemO
+            gb = 0.0_WP
+            sn = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                gb(1) = gb(1) + mesh%helem(nz, e)*(3.0_WP*dyn%uv_rhs(1, nz, e) + dyn%rk3_visc(1, nz, e))
+                gb(2) = gb(2) + mesh%helem(nz, e)*(3.0_WP*dyn%uv_rhs(2, nz, e) + dyn%rk3_visc(2, nz, e))
+                sn(1) = sn(1) + mesh%helem(nz, e)*dyn%uv(1, nz, e)
+                sn(2) = sn(2) + mesh%helem(nz, e)*dyn%uv(2, nz, e)
+            end do
+            ! the depth integral of the TDMA's wind (first row) and quadratic drag (last row)
+            nb = mesh%nlevels(e) - 1
+            fr = -C_d*sqrt(dyn%uv(1, nb, e)**2 + dyn%uv(2, nb, e)**2)
+            gb(1) = gb(1) + dt*(stress_surf(1, e)/density_0 + fr*dyn%uv(1, nb, e))
+            gb(2) = gb(2) + dt*(stress_surf(2, e)/density_0 + fr*dyn%uv(2, nb, e))
+            ! grad(eta^n) exactly as compute_vel_rhs: Fx = -g d(eta)/dx
+            elnodes = mesh%elem2D_nodes(:, e)
+            pre = -(g*dyn%eta_n(elnodes))
+            Fx  = sum(mesh%gradient_sca(1:4, e)*pre)
+            Fy  = sum(mesh%gradient_sca(5:8, e)*pre)
+            f = mesh%coriolis(e)
+            dyn%se_force(1, e) = gb(1)/dt - dyn%se_H(e)*Fx - f*sn(2)
+            dyn%se_force(2, e) = gb(2)/dt - dyn%se_H(e)*Fy + f*sn(1)
+            if (dyn%se_bottdrag) then
+                dyn%se_kdrag(e) = C_d*sqrt(dyn%uv(1, nb, e)**2 + dyn%uv(2, nb, e)**2)/dyn%se_H(e)
+            else
+                dyn%se_kdrag(e) = 0.0_WP
+            end if
+        end do
+
+        do e = 1, nElemL
+            dyn%se_ubtn(:, e) = dyn%se_ubt(:, e, 0)
+        end do
+
+        if (is_multirank(partit)) then
+            if (partit%sync_shared_elem) then
+                call timer_start(TMR_OCE_SHSYNC)
+                call exchange_elem_shared(dyn%se_force, partit)
+                if (dyn%se_bottdrag) call exchange_elem_shared(dyn%se_kdrag, partit)
+                call timer_stop(TMR_OCE_SHSYNC)
+            end if
+        end if
+    end subroutine se_bt_forcing_rk3
 
     !===========================================================================
     subroutine se_kappa_build(dyn, mesh, partit)

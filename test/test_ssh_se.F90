@@ -134,6 +134,15 @@ program test_ssh_se
     !   Z1-Z6 zstar (Task 3.1): the depth law, the freshwater term and the zstar checks through the
     !       real ALE tail; their own block at the end of this file (run last).
     ! FESOM3_MESH_DIR (default pi), FESOM3_TEST_ROTATE=1 reads it rotated (setup_test_mesh).
+    !   S1  RK3 (docs/plans/2026-10-28-rk3.md, Task 13): se_bt_forcing_rk3 with momentum advection
+    !       off, pgf = 0, no viscosity, no wind and no bottom velocity (so no drag): R1 from the real
+    !       compute_vel_rhs over tau/3 (no_history) on a hashed uv and eta_n; F = 0 to 1e-12 of
+    !       max(H|grad p|, |f s|): the pressure and the Coriolis of s^n = sum_k helem*u^n are
+    !       removed exactly, without AB2 weights
+    !   S2  the same with eta = 0, a hashed bottom velocity, viscosity increment and wind stress:
+    !       F = sum_k helem*visc/tau + tau_s/rho_0 - C_d|u_b|u_b to 1e-12 relative, kdrag =
+    !       C_d|u_b|/H (1e-14), se_ubtn == ring level 0
+    !   S3  np 2: the copies of F and kdrag on the shared elements agree bitwise
     use mpi
     use mod_precision,    only: WP, MP, MPI_WP
     use mod_constants,    only: g
@@ -152,6 +161,8 @@ program test_ssh_se
     use mod_mesh_areas,   only: elem_center
     use mod_mesh_rotate,  only: trim_cyclic
     use oce_dyn_velrhs,   only: compute_vel_rhs
+    use mod_constants,    only: density_0
+    use oce_ssh_se,       only: se_bt_forcing_rk3
     use oce_dyn_visc,     only: viscosity_filter
     use oce_ssh_se,       only: se_env_requested, se_parse_knob, se_init, se_sm_coeffs, &
                                 se_cfl_m_min, se_cfl_decision, se_cfl_stable, se_cfl_rho, &
@@ -189,6 +200,7 @@ program test_ssh_se
     call c3_cfl_guard()           ! after C4: the operator reads helem
     call c5_forcing_pressure()
     call c6_forcing_coriolis()
+    call s_rk3_forcing()
     call c7_consistency()
     call c12_bottdrag()
     call c8_visc()
@@ -686,6 +698,89 @@ contains
             'test_ssh_se: C5 pressure part: max|F| = ', res, ' m2/s2, max|g H grad eta| = ', scale, &
             ', ratio ', res/scale
     end subroutine c5_forcing_pressure
+
+    subroutine s_rk3_forcing()
+        ! S1-S3 (header)
+        type(t_dyn) :: dyn
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, n, e, nz, nb, nl, c, elnodes(MAX_NV)
+        real(kind=WP) :: res, scale, pre(MAX_NV), Fx, Fy, sn(2), ex(2), ub(2), fr, kd, rk
+        real(kind=WP), allocatable :: stress(:,:)
+        nl = mesh%nl
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        allocate(stress(2, nElemF))
+        ! ---- S1: pressure and Coriolis removed exactly ----
+        call new_dyn(dyn)
+        call set_uv(dyn, 401)
+        do e = 1, nElemF
+            dyn%uv(:, mesh%nlevels(e) - 1, e) = 0.0_WP          ! no bottom velocity: no drag
+        end do
+        do n = 1, nNodL
+            dyn%eta_n(n) = 0.5_WP*hval(partit%myList_nod2D(n), 41)
+        end do
+        call se_init(dyn, mesh, partit, dt)
+        allocate(dyn%rk3_visc(2, nl-1, nElemF)); dyn%rk3_visc = 0.0_WP
+        stress = 0.0_WP
+        call compute_vel_rhs(dyn, mesh, dt/3.0_WP, .true., partit, no_history=.true.)
+        call se_bt_forcing_rk3(dyn, mesh, partit, dt, stress)
+        res = 0.0_WP; scale = 0.0_WP
+        do e = 1, nElemO
+            elnodes = mesh%elem2D_nodes(:, e)
+            pre = -(g*dyn%eta_n(elnodes))
+            Fx  = sum(mesh%gradient_sca(1:4, e)*pre)
+            Fy  = sum(mesh%gradient_sca(5:8, e)*pre)
+            sn  = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                sn = sn + mesh%helem(nz, e)*dyn%uv(:, nz, e)
+            end do
+            scale = max(scale, dyn%se_H(e)*max(abs(Fx), abs(Fy)), abs(mesh%coriolis(e))*maxval(abs(sn)))
+            res   = max(res, maxval(abs(dyn%se_force(:, e))))
+        end do
+        call max_all(res, partit); call max_all(scale, partit)
+        call check(scale > 0.0_WP, 'S1 pressure and Coriolis are non-trivial', partit%mype)
+        call check(res <= 1.0e-12_WP*scale, 'S1 RK3 forcing: F = 0 (pressure and Coriolis removed)', partit%mype)
+        if (partit%mype == 0) write(*,'(a,es10.3,a,es10.3)') 'test_ssh_se: S1 max|F| = ', res, ', scale ', scale
+        ! ---- S2: viscosity, wind and drag alone ----
+        call set_uv(dyn, 403)
+        dyn%eta_n = 0.0_WP
+        do e = 1, nElemF
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                do c = 1, 2
+                    dyn%rk3_visc(c, nz, e) = 1.0e-4_WP*hval(partit%myList_elem2D(e), 20*nz + c)
+                end do
+            end do
+            stress(1, e) = 0.1_WP*hval(partit%myList_elem2D(e), 5)
+            stress(2, e) = 0.1_WP*hval(partit%myList_elem2D(e), 6)
+        end do
+        call compute_vel_rhs(dyn, mesh, dt/3.0_WP, .true., partit, no_history=.true.)
+        call se_bt_forcing_rk3(dyn, mesh, partit, dt, stress)
+        res = 0.0_WP; scale = 0.0_WP; kd = 0.0_WP
+        do e = 1, nElemO
+            ex = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                ex = ex + mesh%helem(nz, e)*dyn%rk3_visc(:, nz, e)
+            end do
+            nb = mesh%nlevels(e) - 1
+            ub = dyn%uv(:, nb, e)
+            fr = C_d*sqrt(ub(1)**2 + ub(2)**2)
+            ex = ex/dt + stress(:, e)/density_0 - fr*ub
+            scale = max(scale, maxval(abs(ex)))
+            res   = max(res, maxval(abs(dyn%se_force(:, e) - ex)))
+            rk    = fr/dyn%se_H(e)
+            kd    = max(kd, abs(dyn%se_kdrag(e) - rk)/max(rk, tiny(1.0_WP)))
+        end do
+        call max_all(res, partit); call max_all(scale, partit); call max_all(kd, partit)
+        call check(scale > 0.0_WP, 'S2 viscosity, wind and drag are non-trivial', partit%mype)
+        call check(res <= 1.0e-12_WP*scale, 'S2 RK3 forcing: F = visc/tau + wind - drag', partit%mype)
+        call check(kd <= 1.0e-14_WP, 'S2 kdrag = C_d|u_b|/H', partit%mype)
+        call check(all(dyn%se_ubtn(:, 1:nElemL) == dyn%se_ubt(:, 1:nElemL, 0)), 'S2 se_ubtn == ring level 0', &
+                   partit%mype)
+        if (partit%mype == 0) write(*,'(a,es10.3,a,es10.3)') 'test_ssh_se: S2 max|F - expected| = ', res, &
+            ', scale ', scale
+        ! ---- S3: shared copies ----
+        call check(shared_copy_max_elem(dyn%se_force, partit) == 0.0_WP, 'S3 F copies agree on shared elements', &
+                   partit%mype)
+        call check(shared_copy_max_elem(dyn%se_kdrag, partit) == 0.0_WP, 'S3 kdrag copies agree', partit%mype)
+    end subroutine s_rk3_forcing
 
     subroutine c6_forcing_coriolis()
         type(t_dyn) :: dyn, dwrong, doff
