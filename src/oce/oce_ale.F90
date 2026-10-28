@@ -301,7 +301,7 @@ contains
     end subroutine update_eta_n
 
     !===========================================================================
-    subroutine vert_vel_ale(dynamics, mesh, dt, partit, water_flux)
+    subroutine vert_vel_ale(dynamics, mesh, dt, partit, water_flux, uv_in, split, bolus)
         ! FESOM2 oce_ale.F90:2323-2884, the which_ale='linfs' path. Vertical velocity from
         ! the layer-thickness divergence:
         !   Wvel(:,n)  = 0
@@ -317,11 +317,19 @@ contains
         ! owned+halo) read a complete halo. The owned Wvel the ALE dump emits is computed
         ! directly (no halo dependence). hnode_new stays = hnode (linfs); its exchange is
         ! value-neutral but kept for faithfulness.
+        ! RK3 (docs/plans/2026-10-28-rk3.md, D5/D7): three optional arguments, absent = the code
+        ! above. uv_in: the velocity whose divergence gives w (the stage velocity in dyn%rk3_us;
+        ! dyn%uv holds u^n during the step). split=.false.: no CFL_z and no split, w_e = w and
+        ! w_i = 0 over the faces of compute_Wvel_split (its off path, owned + halo) -- RK3
+        ! stages 1-2 advect with the full w. bolus=.false.: fer_w is not touched (RK3 stages
+        ! 1-2 and the first stage-3 call; the last stage-3 call makes it, as AB2).
         type(t_dyn),  intent(inout), target :: dynamics
         type(t_mesh), intent(inout), target :: mesh
         real(kind=WP), intent(in) :: dt
         type(t_partit), intent(in), optional :: partit
         real(kind=WP),  intent(in), optional :: water_flux(:)   ! M6a-3: non-linfs freshwater (zstar)
+        real(kind=WP),  intent(in), optional, target :: uv_in(:,:,:)
+        logical,        intent(in), optional :: split, bolus
         !______________________________________________________________________
         integer       :: ed, el(2), enodes(2), n, nz, nzmin, nzmax
         integer       :: nNodO, nNodL, nEdgeO, nElemO
@@ -330,15 +338,24 @@ contains
         ! c1 is an array over levels (FESOM2 keeps it an array — a deadlock-avoidance note
         ! under OpenMP; here it just carries the per-level edge flux for the slice scatter).
         real(kind=WP) :: c1(mesh%nl-1), c2(mesh%nl-1)
+        logical       :: do_fer, do_split
         real(kind=WP), dimension(:,:,:), pointer :: UV, fer_UV
         real(kind=WP), dimension(:,:),   pointer :: Wvel, fer_Wvel
 
-        UV   => dynamics%uv
+        if (present(uv_in)) then
+            UV => uv_in
+        else
+            UV => dynamics%uv
+        end if
         Wvel => dynamics%w
+        do_split = .true.
+        if (present(split)) do_split = split
+        do_fer = Fer_GM
+        if (present(bolus)) do_fer = Fer_GM .and. bolus
         ! M4b GM bolus vertical velocity: fer_w = vertical divergence of fer_uv, mirrors
         ! Wvel exactly under if(Fer_GM) (FESOM2 oce_ale.F90:2366-2524). Byte-neutral when
         ! Fer_GM=.false. (the M2/M3 config) — fer_uv/fer_w are then unallocated + untouched.
-        if (Fer_GM) then
+        if (do_fer) then
             fer_UV   => dynamics%fer_uv
             fer_Wvel => dynamics%fer_w
         end if
@@ -348,7 +365,7 @@ contains
         ! zero the vertical velocity over the whole column (below-bottom stays 0)
         do n = 1, nNodL
             Wvel(:, n) = 0.0_WP
-            if (Fer_GM) fer_Wvel(:, n) = 0.0_WP
+            if (do_fer) fer_Wvel(:, n) = 0.0_WP
         end do
 
         !______________________________________________________________________
@@ -363,17 +380,17 @@ contains
             nzmax   = mesh%nlevels(el(1)) - 1
             do nz = nzmax, nzmin, -1
                 c1(nz) = (UV(2,nz,el(1))*deltaX1 - UV(1,nz,el(1))*deltaY1)*mesh%helem(nz,el(1))
-                if (Fer_GM) c2(nz) = (fer_UV(2,nz,el(1))*deltaX1 - fer_UV(1,nz,el(1))*deltaY1)*mesh%helem(nz,el(1))
+                if (do_fer) c2(nz) = (fer_UV(2,nz,el(1))*deltaX1 - fer_UV(1,nz,el(1))*deltaY1)*mesh%helem(nz,el(1))
             end do
             Wvel(nzmin:nzmax, enodes(1)) = Wvel(nzmin:nzmax, enodes(1)) + c1(nzmin:nzmax)
             Wvel(nzmin:nzmax, enodes(2)) = Wvel(nzmin:nzmax, enodes(2)) - c1(nzmin:nzmax)
-            if (Fer_GM) then
+            if (do_fer) then
                 fer_Wvel(nzmin:nzmax, enodes(1)) = fer_Wvel(nzmin:nzmax, enodes(1)) + c2(nzmin:nzmax)
                 fer_Wvel(nzmin:nzmax, enodes(2)) = fer_Wvel(nzmin:nzmax, enodes(2)) - c2(nzmin:nzmax)
             end if
 
             c1 = 0.0_WP
-            if (Fer_GM) c2 = 0.0_WP
+            if (do_fer) c2 = 0.0_WP
             if (el(2) /= el(1)) then
                 deltaX2 = mesh%edge_cross_dxdy(3, ed)
                 deltaY2 = mesh%edge_cross_dxdy(4, ed)
@@ -381,11 +398,11 @@ contains
                 nzmax   = mesh%nlevels(el(2)) - 1
                 do nz = nzmax, nzmin, -1
                     c1(nz) = -(UV(2,nz,el(2))*deltaX2 - UV(1,nz,el(2))*deltaY2)*mesh%helem(nz,el(2))
-                    if (Fer_GM) c2(nz) = -(fer_UV(2,nz,el(2))*deltaX2 - fer_UV(1,nz,el(2))*deltaY2)*mesh%helem(nz,el(2))
+                    if (do_fer) c2(nz) = -(fer_UV(2,nz,el(2))*deltaX2 - fer_UV(1,nz,el(2))*deltaY2)*mesh%helem(nz,el(2))
                 end do
                 Wvel(nzmin:nzmax, enodes(1)) = Wvel(nzmin:nzmax, enodes(1)) + c1(nzmin:nzmax)
                 Wvel(nzmin:nzmax, enodes(2)) = Wvel(nzmin:nzmax, enodes(2)) - c1(nzmin:nzmax)
-                if (Fer_GM) then
+                if (do_fer) then
                     fer_Wvel(nzmin:nzmax, enodes(1)) = fer_Wvel(nzmin:nzmax, enodes(1)) + c2(nzmin:nzmax)
                     fer_Wvel(nzmin:nzmax, enodes(2)) = fer_Wvel(nzmin:nzmax, enodes(2)) - c2(nzmin:nzmax)
                 end if
@@ -399,7 +416,7 @@ contains
             nzmax = mesh%nlevels_nod2D(n) - 1
             do nz = nzmax, nzmin, -1
                 Wvel(nz, n) = Wvel(nz, n) + Wvel(nz+1, n)
-                if (Fer_GM) fer_Wvel(nz, n) = fer_Wvel(nz, n) + fer_Wvel(nz+1, n)
+                if (do_fer) fer_Wvel(nz, n) = fer_Wvel(nz, n) + fer_Wvel(nz+1, n)
             end do
         end do
 
@@ -410,7 +427,7 @@ contains
             nzmax = mesh%nlevels_nod2D(n) - 1
             do nz = nzmin, nzmax
                 Wvel(nz, n) = Wvel(nz, n)/mesh%area(n)
-                if (Fer_GM) fer_Wvel(nz, n) = fer_Wvel(nz, n)/mesh%area(n)
+                if (do_fer) fer_Wvel(nz, n) = fer_Wvel(nz, n)/mesh%area(n)
             end do
         end do
 
@@ -455,11 +472,15 @@ contains
         if (is_multirank(partit)) then
             call exchange_nod(Wvel, partit)             ! FESOM2 :2870
             call exchange_nod_h(mesh%hnode_new, partit) ! FESOM2 :2871 (WP_full: hi/lo split in SP, #1207)
-            if (Fer_GM) call exchange_nod(fer_Wvel, partit)
+            if (do_fer) call exchange_nod(fer_Wvel, partit)
         end if
 
-        call compute_CFLz(dynamics, mesh, dt, partit)
-        call compute_Wvel_split(dynamics, mesh, partit)
+        if (do_split) then
+            call compute_CFLz(dynamics, mesh, dt, partit)
+            call compute_Wvel_split(dynamics, mesh, partit)
+        else
+            call wvel_split_off(dynamics, mesh, partit)
+        end if
     end subroutine vert_vel_ale
 
     !===========================================================================
@@ -556,14 +577,7 @@ contains
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
 
         if (.not. dynamics%use_wsplit) then
-            do node = 1, nNodL
-                nzmin = mesh%ulevels_nod2D(node)
-                nzmax = mesh%nlevels_nod2D(node)
-                do nz = nzmin, nzmax
-                    Wvel_e(nz, node) = Wvel(nz, node)
-                    Wvel_i(nz, node) = 0.0_WP
-                end do
-            end do
+            call wvel_split_off(dynamics, mesh, partit)
             return
         end if
 
@@ -577,6 +591,28 @@ contains
             end do
         end do
     end subroutine compute_Wvel_split
+
+    !===========================================================================
+    subroutine wvel_split_off(dynamics, mesh, partit)
+        ! The off path of compute_Wvel_split: w_e = w, w_i = +0 over every face of the owned +
+        ! halo columns (ulevels_nod2D..nlevels_nod2D). Also RK3 stages 1-2 (vert_vel_ale with
+        ! split=.false.), which advect with the full w whatever use_wsplit says (plan D7).
+        type(t_dyn),  intent(inout), target :: dynamics
+        type(t_mesh), intent(in),    target :: mesh
+        type(t_partit), intent(in), optional :: partit
+        integer :: node, nz, nzmin, nzmax
+        integer :: nNodO, nNodL, nEdgeO, nElemO
+
+        call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
+        do node = 1, nNodL
+            nzmin = mesh%ulevels_nod2D(node)
+            nzmax = mesh%nlevels_nod2D(node)
+            do nz = nzmin, nzmax
+                dynamics%w_e(nz, node) = dynamics%w(nz, node)
+                dynamics%w_i(nz, node) = 0.0_WP
+            end do
+        end do
+    end subroutine wvel_split_off
 
     !===========================================================================
     subroutine update_thickness_ale(mesh, partit)

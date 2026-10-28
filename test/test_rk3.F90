@@ -16,6 +16,14 @@ program test_rk3
     !          bitwise (no kernel of the rhs still reads dyn%uv);
     !       b) no_history with a nonzero AB history equals lfirst with a zero history, bitwise
     !          (uv_rhs and uv_rhsAB), also with uv_in
+    !   R1c vert_vel_ale's hooks (Task 4): uv_in = a copy equals the default bitwise (w, w_e, w_i,
+    !       cfl_z on owned + halo nodes), GM off and on (fer_w too); uv_in = u2 with dyn%uv = u1
+    !       equals the default with dyn%uv = u2; bolus=.false. leaves fer_w untouched and w,
+    !       w_e, w_i as the default
+    !   R2  split=.false. (RK3 stages 1-2, plan D7): use_wsplit on with a cap so low that split
+    !       faces exist in the default call (precondition asserted: owned faces with w_i /= 0);
+    !       the default call keeps w_e + w_i = w to one spacing; split=.false. gives w bitwise
+    !       the default's, w_e == w bitwise and w_i == 0 on every owned + halo face
     use mpi
     use mod_precision,    only: WP, MP
     use mod_constants,    only: density_0
@@ -47,6 +55,8 @@ program test_rk3
 
     call k_knobs()
     call r1_momentum_hooks()
+    call r1c_vert_vel_hooks()
+    call r2_split_off()
     call finish(partit, 'test_rk3')
 
 contains
@@ -283,6 +293,88 @@ contains
         type(t_dyn) :: fresh
         d = fresh
     end subroutine free_dyn
+
+    !===========================================================================
+    subroutine r1c_vert_vel_hooks()
+        type(t_dyn) :: d
+        real(kind=WP), allocatable :: u1(:,:,:), u2(:,:,:), w0(:,:), we0(:,:), wi0(:,:), c0(:,:), f0(:,:)
+        integer :: igm, mype
+        character(len=16) :: tag
+        mype = partit%mype
+        allocate(u1(2, nl-1, nElemF), u2(2, nl-1, nElemF))
+        call hashed_uv(u2, 91)
+        do igm = 0, 1
+            write(tag, '(a,i0)') 'GM=', igm
+            call new_dyn(d, 2)
+            d%use_wsplit = .true.; d%wsplit_maxcfl = 1.0e-3_WP; d%wsplit_mincfl = 0.5e-3_WP
+            Fer_GM = (igm == 1)
+            if (Fer_GM) then
+                allocate(d%fer_uv(2, nl-1, nElemF), d%fer_w(nl, nNodL))
+                call hashed_uv(d%fer_uv, 300)
+                d%fer_uv = 0.1_WP*d%fer_uv
+                d%fer_w = 0.0_WP
+            end if
+            call hashed_state(d, 21)
+            u1 = d%uv
+            call vert_vel_ale(d, mesh, dt, partit)
+            w0 = d%w; we0 = d%w_e; wi0 = d%w_i; c0 = d%cfl_z
+            if (Fer_GM) f0 = d%fer_w
+            call vert_vel_ale(d, mesh, dt, partit, uv_in=u1)
+            call check(same_nod(d%w, w0) .and. same_nod(d%w_e, we0) .and. same_nod(d%w_i, wi0) .and. &
+                       same_nod(d%cfl_z, c0), 'R1c uv_in = uv is transparent, '//trim(tag), mype)
+            if (Fer_GM) call check(same_nod(d%fer_w, f0), 'R1c uv_in = uv: fer_w transparent', mype)
+            ! bolus off: fer_w untouched, w / w_e / w_i as the default
+            if (Fer_GM) d%fer_w = -7.0_WP
+            call vert_vel_ale(d, mesh, dt, partit, bolus=.false.)
+            call check(same_nod(d%w, w0) .and. same_nod(d%w_e, we0) .and. same_nod(d%w_i, wi0), &
+                       'R1c bolus=.false.: w, w_e, w_i as the default, '//trim(tag), mype)
+            if (Fer_GM) call check(all(d%fer_w(:, 1:nNodL) == -7.0_WP), 'R1c bolus=.false. leaves fer_w', mype)
+            ! completeness: uv_in = u2 with uv = u1 == the default with uv = u2
+            call vert_vel_ale(d, mesh, dt, partit, uv_in=u2)
+            w0 = d%w; we0 = d%w_e; wi0 = d%w_i; c0 = d%cfl_z
+            d%uv = u2
+            call vert_vel_ale(d, mesh, dt, partit)
+            call check(same_nod(d%w, w0) .and. same_nod(d%w_e, we0) .and. same_nod(d%w_i, wi0) .and. &
+                       same_nod(d%cfl_z, c0), 'R1c uv_in = u2 replaces uv, '//trim(tag), mype)
+            call free_dyn(d)
+        end do
+        Fer_GM = .false.
+    end subroutine r1c_vert_vel_hooks
+
+    !===========================================================================
+    subroutine r2_split_off()
+        type(t_dyn) :: d
+        real(kind=WP), allocatable :: w0(:,:)
+        integer :: n, nz, nsplit, nbad, mype
+        mype = partit%mype
+        call new_dyn(d, 2)
+        d%use_wsplit = .true.; d%wsplit_maxcfl = 1.0e-3_WP; d%wsplit_mincfl = 0.5e-3_WP
+        call hashed_state(d, 31)
+        call vert_vel_ale(d, mesh, dt, partit)
+        w0 = d%w
+        nsplit = 0; nbad = 0
+        do n = 1, nNodO
+            do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n)
+                if (d%w_i(nz, n) /= 0.0_WP) nsplit = nsplit + 1
+                if (abs(d%w_e(nz, n) + d%w_i(nz, n) - d%w(nz, n)) > spacing(abs(d%w(nz, n)))) nbad = nbad + 1
+            end do
+        end do
+        call sum_all(nsplit, partit); call sum_all(nbad, partit)
+        call check(nsplit > 100, 'R2 precondition: split faces in the default call', mype)
+        call check(nbad == 0, 'R2 default call: w_e + w_i == w to one spacing', mype)
+        d%w_i = 3.0_WP; d%w_e = 3.0_WP
+        call vert_vel_ale(d, mesh, dt, partit, split=.false.)
+        call check(same_nod(d%w, w0), 'R2 split=.false.: w bitwise the default', mype)
+        nbad = 0
+        do n = 1, nNodL
+            do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n)
+                if (d%w_e(nz, n) /= d%w(nz, n) .or. d%w_i(nz, n) /= 0.0_WP) nbad = nbad + 1
+            end do
+        end do
+        call sum_all(nbad, partit)
+        call check(nbad == 0, 'R2 split=.false.: w_e == w, w_i == 0 on every owned + halo face', mype)
+        if (mype == 0) write(*,'(a,i0)') 'test_rk3: R2 split faces in the default call: ', nsplit
+    end subroutine r2_split_off
 
     subroutine good(name, str)
         character(len=*), intent(in) :: name, str
