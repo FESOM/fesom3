@@ -135,7 +135,7 @@ module oce_ssh_se
     private
     public :: se_env_requested, se_read_env, se_parse_knob, se_init, se_step_guard
     public :: se_elem_depth, se_bt_forcing, se_subcycle, se_trim_finish
-    public :: se_bt_forcing_rk3
+    public :: se_bt_forcing_rk3, se_rk3_finish
     public :: se_check_core, se_check_values, se_check_line, se_check_tail
     public :: se_inflow, se_visc, se_visc_flow, se_visc_on, se_tendency, se_depth_at, se_kappa_build
     public :: se_knob_conflict
@@ -1470,7 +1470,98 @@ contains
     end subroutine se_trim_finish
 
     !===========================================================================
-    subroutine se_check_values(dyn, mesh, partit, dt, eta_old, vals, water_flux)
+    subroutine se_rk3_finish(dyn, mesh, partit, dt, step, water_flux)
+        ! RK3 stage 3 (module header; plan Technical Details §4), after impl_vert_visc_ale, in
+        ! place of se_trim_finish; uv = u^n, uv_rhs = the stage-3 increment, rk3_us = u**:
+        !  1. u^{n+1} = u^n + uv_rhs, trimmed on the OWNED elements to U^M (ring level 0, the
+        !     barotropic velocity at n+1): uv_k -= (sum_j helem_j uv_j - U^M)/H^n; synced and
+        !     exchanged as update_vel;
+        !  2. u** trimmed to <<U>> (se_umean), the transport that moved eta: the tracers' transport
+        !     velocity; synced and exchanged;
+        !  3.-4. ssh_rhs_old = I(<<U>>) (- W*areasvol off linfs), the commit of eta^M and
+        !     FESOM3_SE_CHECK as se_trim_finish (the trim check on the transport velocity u**).
+        type(t_dyn),    intent(inout) :: dyn
+        type(t_mesh),   intent(inout) :: mesh
+        type(t_partit), intent(in)    :: partit
+        real(kind=WP),  intent(in)    :: dt
+        integer,        intent(in)    :: step
+        real(kind=WP),  intent(in)    :: water_flux(:)
+        integer       :: e, n, nz
+        integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
+        real(kind=WP) :: s(2), c(2)
+        real(kind=WP), allocatable :: eta_old(:)
+
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+
+        ! ---- 1. u^{n+1} and its trim to U^M ----
+        do e = 1, nElemO
+            s = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                dyn%uv(1, nz, e) = dyn%uv(1, nz, e) + dyn%uv_rhs(1, nz, e)
+                dyn%uv(2, nz, e) = dyn%uv(2, nz, e) + dyn%uv_rhs(2, nz, e)
+                s(1) = s(1) + mesh%helem(nz, e)*dyn%uv(1, nz, e)
+                s(2) = s(2) + mesh%helem(nz, e)*dyn%uv(2, nz, e)
+            end do
+            c(1) = (s(1) - dyn%se_ubt(1, e, 0))/dyn%se_H(e)
+            c(2) = (s(2) - dyn%se_ubt(2, e, 0))/dyn%se_H(e)
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                dyn%uv(1, nz, e) = dyn%uv(1, nz, e) - c(1)
+                dyn%uv(2, nz, e) = dyn%uv(2, nz, e) - c(2)
+            end do
+        end do
+        ! ---- 2. the transport velocity u** and its trim to <<U>> ----
+        do e = 1, nElemO
+            s = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                s(1) = s(1) + mesh%helem(nz, e)*dyn%rk3_us(1, nz, e)
+                s(2) = s(2) + mesh%helem(nz, e)*dyn%rk3_us(2, nz, e)
+            end do
+            c(1) = (s(1) - dyn%se_umean(1, e))/dyn%se_H(e)
+            c(2) = (s(2) - dyn%se_umean(2, e))/dyn%se_H(e)
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                dyn%rk3_us(1, nz, e) = dyn%rk3_us(1, nz, e) - c(1)
+                dyn%rk3_us(2, nz, e) = dyn%rk3_us(2, nz, e) - c(2)
+            end do
+        end do
+        if (is_multirank(partit)) then
+            if (partit%sync_shared_elem) then
+                call timer_start(TMR_OCE_SHSYNC)
+                call exchange_elem_shared(dyn%uv, partit)
+                call exchange_elem_shared(dyn%rk3_us, partit)
+                call timer_stop(TMR_OCE_SHSYNC)
+            end if
+            call exchange_elem(dyn%uv, partit)
+            call exchange_elem(dyn%rk3_us, partit)
+        end if
+
+        ! ---- 3. the divergence the tail and the diagnostics read ----
+        call se_inflow(mesh, partit, dyn%se_umean, dyn%ssh_rhs_old)
+        if (trim(which_ALE) /= 'linfs') then
+            do n = 1, nNodO
+                if (mesh%ulevels_nod2D(n) > 1) cycle
+                dyn%ssh_rhs_old(n) = dyn%ssh_rhs_old(n) - water_flux(n)*mesh%areasvol(n)
+            end do
+            if (is_multirank(partit)) call exchange_nod(dyn%ssh_rhs_old, partit)
+        end if
+
+        ! ---- 4. commit the elevation, the invariants ----
+        if (dyn%se_check) then
+            allocate(eta_old(nNodL))
+            eta_old = dyn%eta_n(1:nNodL)
+        end if
+        do n = 1, nNodL
+            mesh%hbar_old(n) = mesh%hbar(n)
+            mesh%hbar(n)     = dyn%se_etam(n)
+            dyn%eta_n(n)     = dyn%se_etam(n)
+        end do
+        if (dyn%se_check) then
+            call se_check_core(dyn, mesh, partit, dt, step, eta_old, water_flux, vel_tr=dyn%rk3_us)
+            deallocate(eta_old)
+        end if
+    end subroutine se_rk3_finish
+
+    !===========================================================================
+    subroutine se_check_values(dyn, mesh, partit, dt, eta_old, vals, water_flux, vel_tr)
         ! The FESOM3_SE_CHECK invariants after se_trim_finish's commit, while helem is still at
         ! n; reduced over the ranks (collective). eta^{n+1} = eta_n, eta^n = eta_old (the copy
         ! taken before the commit). vals(SE_CHK_*):
@@ -1494,6 +1585,8 @@ contains
         !             water_flux is present, so call this ONCE per step with water_flux
         !             (se_check_core does); 0 under linfs (virtual salt, no volume flux)
         ! Exposed (not only through se_check_core) so that test_ssh_se can check the values.
+        ! vel_tr (RK3): the transport velocity of TRIM and of its finiteness, the trimmed u**
+        ! (dyn%rk3_us); absent = uv, which AB2 trims to <<U>> (RK3 trims uv to U^M instead).
         type(t_dyn),    intent(inout) :: dyn          ! se_msl0 / se_fwmsl: set / accumulated
         type(t_mesh),   intent(in)    :: mesh
         type(t_partit), intent(in)    :: partit
@@ -1501,6 +1594,7 @@ contains
         real(kind=WP),  intent(in)    :: eta_old(:)   ! (>= nNodO) eta^n
         real(kind=WP),  intent(out)   :: vals(SE_NCHK)
         real(kind=WP),  intent(in), optional :: water_flux(:)   ! (>= nNodO) + out of the ocean
+        real(kind=WP),  intent(in), optional :: vel_tr(:,:,:)
         integer       :: n, e, nz, nbad
         integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
         real(kind=WP) :: mx(6), s(2)
@@ -1522,15 +1616,12 @@ contains
             if (fw .and. mesh%ulevels_nod2D(n) == 1) sm(5) = sm(5) + real(water_flux(n), WP_full)*mesh%areasvol(n)
             if (.not. (ieee_is_finite(dyn%eta_n(n)) .and. ieee_is_finite(dyn%ssh_rhs_old(n)))) nbad = nbad + 1
         end do
+        if (present(vel_tr)) then
+            call trim_scan(vel_tr)
+        else
+            call trim_scan(dyn%uv)
+        end if
         do e = 1, nElemO
-            s = 0.0_WP
-            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
-                s(1) = s(1) + mesh%helem(nz, e)*dyn%uv(1, nz, e)
-                s(2) = s(2) + mesh%helem(nz, e)*dyn%uv(2, nz, e)
-                if (.not. (ieee_is_finite(dyn%uv(1, nz, e)) .and. ieee_is_finite(dyn%uv(2, nz, e)))) &
-                    nbad = nbad + 1
-            end do
-            mx(2) = max(mx(2), abs(s(1) - dyn%se_umean(1, e)), abs(s(2) - dyn%se_umean(2, e)))
             mx(6) = max(mx(6), abs(dyn%se_ubt(1, e, 0)), abs(dyn%se_ubt(2, e, 0)))
             if (.not. (all(ieee_is_finite(dyn%se_umean(:, e))) .and. all(ieee_is_finite(dyn%se_ubt(:, e, 0))))) &
                 nbad = nbad + 1
@@ -1558,6 +1649,24 @@ contains
         vals(SE_CHK_MAXU)     = mx(6)
         vals(SE_CHK_NBAD)     = real(sm(4), WP)
         vals(SE_CHK_FW)       = real(dyn%se_fwmsl, WP)
+
+    contains
+
+        subroutine trim_scan(ut)
+            ! TRIM and the finiteness of the transport velocity ut (uv, or RK3's vel_tr)
+            real(kind=WP), intent(in) :: ut(:,:,:)
+            do e = 1, nElemO
+                s = 0.0_WP
+                do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                    s(1) = s(1) + mesh%helem(nz, e)*ut(1, nz, e)
+                    s(2) = s(2) + mesh%helem(nz, e)*ut(2, nz, e)
+                    if (.not. (ieee_is_finite(ut(1, nz, e)) .and. ieee_is_finite(ut(2, nz, e)))) &
+                        nbad = nbad + 1
+                end do
+                mx(2) = max(mx(2), abs(s(1) - dyn%se_umean(1, e)), abs(s(2) - dyn%se_umean(2, e)))
+            end do
+        end subroutine trim_scan
+
     end subroutine se_check_values
 
     !===========================================================================
@@ -1592,7 +1701,7 @@ contains
     end function se_kv
 
     !===========================================================================
-    subroutine se_check_core(dyn, mesh, partit, dt, step, eta_old, water_flux)
+    subroutine se_check_core(dyn, mesh, partit, dt, step, eta_old, water_flux, vel_tr)
         ! FESOM3_SE_CHECK, called by se_trim_finish after the commit (helem still at n):
         ! se_check_values, one SE_CHECK line on rank 0 (se_check_line), and a stop with the
         ! step number on any non-finite value. Collective.
@@ -1603,10 +1712,11 @@ contains
         integer,        intent(in)    :: step
         real(kind=WP),  intent(in)    :: eta_old(:)
         real(kind=WP),  intent(in), optional :: water_flux(:)
+        real(kind=WP),  intent(in), optional :: vel_tr(:,:,:)   ! RK3: the transport velocity (se_check_values)
         real(kind=WP)      :: vals(SE_NCHK)
         character(len=160) :: msg
 
-        call se_check_values(dyn, mesh, partit, dt, eta_old, vals, water_flux)
+        call se_check_values(dyn, mesh, partit, dt, eta_old, vals, water_flux, vel_tr)
         if (partit%mype == 0) then
             write(*,'(a)') trim(se_check_line(step, vals))
             flush(output_unit)

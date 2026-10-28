@@ -660,6 +660,18 @@ foreach(_np 1 2)
         FAIL_REGULAR_EXPRESSION "VIOLATED;non-finite"
         SKIP_REGULAR_EXPRESSION "cannot open;No such file")
 endforeach()
+# RK3 + split-explicit (Task 14): the same with FESOM3_SSH_SE=1 and the per-step SE_CHECK line (its
+# non-finite stop; the levels are gated by tools/run_conserve_pi.sh), RK3_CHECK adding trimM (u^{n+1} to
+# U^M); np 2 with the shared-element gate (divsum, the copy spreads of uv and uv_rhsAB exactly 0).
+foreach(_np 1 2)
+    add_test(NAME fesom_conserve_rk3_se_linfs_ts_np${_np}
+             COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np ${_np} $<TARGET_FILE:fesom_conserve>)
+    set_tests_properties(fesom_conserve_rk3_se_linfs_ts_np${_np} PROPERTIES
+        ENVIRONMENT "${_rk3_env};FESOM3_SSH_SE=1;FESOM3_SE_CHECK=1;FESOM3_DIVSUM_TOL=1e-12"
+        PASS_REGULAR_EXPRESSION "SE_CHECK step=20 etacomp=.*RK3_CHECK step=20 trim1=.*trimM=.*fesom_conserve: CONSERVATION OK within tol"
+        FAIL_REGULAR_EXPRESSION "VIOLATED;non-finite"
+        SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+endforeach()
 # the RK3 stops: a bad switch, a bad knob, zlevel (fesom_conserve's rk3_init), and a driver without
 # rk3_init (fesom_stepfull_mr: step_oce's rk3_step_guard)
 foreach(_case badswitch badnsub zlevel)
