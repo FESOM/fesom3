@@ -3116,3 +3116,27 @@ Atlantic.
   run survives the window. On CORE2 with the drag that is χ = 0.1.
 - Test a suspected feedback with on/off switches before naming it; the obvious suspect here (the ice, after L74) was
   wrong.
+
+## L78 — "The restart set" is everything a step reads before it writes: under zstar that includes the SSH matrix values, the lagged dhe, the geometry derived from hnode, and the frozen preconditioner
+
+**Context.** Exact zstar restart, `FESOM3_RESTART_ZSTAR_EXACT` (2026-10-24). L73 found the geometry part
+and the gap in the stiffness matrix; this closes the gap.
+
+**What happened.**
+- The M10 restart set was gated byte-exact on linfs only. Under zstar four more things carry over:
+  `update_stiff_mat_ale` ADDS `-dhe` to the stiffness values every step (the matrix is state, not
+  setup); `dhe` is lagged (computed in `compute_hbar_ale`, read by the next step's matrix update);
+  `zbar_3d_n`, `Z_3d_n`, `helem`, `hnode_new` are derived from `hnode` at the end of each step and read
+  before they are rebuilt (pressure gradient, GM, the SSH rhs); and the Jacobi preconditioner is built
+  ONCE at the first solve and then frozen, so a straight run keeps the COLD matrix's diagonal.
+- A resume restored `hnode` but restarted all four cold. After 2 resumed steps on pi `eta_n` differed
+  by 7.2e-4 relative. Skipping one piece at a time: geometry 7.2e-4, `dhe` 3.2e-5, matrix values
+  1.8e-5, preconditioner 3.6e-6 -- each alone breaks bit-identity.
+- The preconditioner is the trap: restoring the matrix values without care builds it from the
+  RESTORED matrix at the first resumed solve, which a straight run never does.
+- The matrix is stored partition-independently (row = node, diagonal first, then off-diagonals by
+  ascending global column) because the CSR order depends on the local edge order.
+
+**How to apply.** For each new physics option, list the arrays a step READS before it WRITES them
+(including "setup" objects that a step modifies, and lazily-built caches) and gate a straight-vs-split
+run with that option ON. Check that each restored piece is needed by skipping it once.
