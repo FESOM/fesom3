@@ -1470,7 +1470,7 @@ contains
     end subroutine se_trim_finish
 
     !===========================================================================
-    subroutine se_rk3_finish(dyn, mesh, partit, dt, step, water_flux)
+    subroutine se_rk3_finish(dyn, mesh, partit, dt, step, water_flux, Htr, defer)
         ! RK3 stage 3 (module header; plan Technical Details §4), after impl_vert_visc_ale, in
         ! place of se_trim_finish; uv = u^n, uv_rhs = the stage-3 increment, rk3_us = u**:
         !  1. u^{n+1} = u^n + uv_rhs, trimmed on the OWNED elements to U^M (ring level 0, the
@@ -1480,18 +1480,27 @@ contains
         !     velocity; synced and exchanged;
         !  3.-4. ssh_rhs_old = I(<<U>>) (- W*areasvol off linfs), the commit of eta^M and
         !     FESOM3_SE_CHECK as se_trim_finish (the trim check on the transport velocity u**).
+        ! Htr (optional, default se_H): the depth of the u** trim, sum_k helem of the geometry in
+        ! place (zstar: h_2; under linfs equal to se_H bitwise). defer = .true. (zstar): u^{n+1} =
+        ! u^n + uv_rhs without the trim, which the caller makes with the h^{n+1} weights after the
+        ! thickness commit.
         type(t_dyn),    intent(inout) :: dyn
         type(t_mesh),   intent(inout) :: mesh
         type(t_partit), intent(in)    :: partit
         real(kind=WP),  intent(in)    :: dt
         integer,        intent(in)    :: step
         real(kind=WP),  intent(in)    :: water_flux(:)
+        real(kind=WP),  intent(in), optional :: Htr(:)
+        logical,        intent(in), optional :: defer
         integer       :: e, n, nz
         integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
-        real(kind=WP) :: s(2), c(2)
+        real(kind=WP) :: s(2), c(2), ht
         real(kind=WP), allocatable :: eta_old(:)
+        logical       :: later
 
         call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        later = .false.
+        if (present(defer)) later = defer
 
         ! ---- 1. u^{n+1} and its trim to U^M ----
         do e = 1, nElemO
@@ -1502,6 +1511,7 @@ contains
                 s(1) = s(1) + mesh%helem(nz, e)*dyn%uv(1, nz, e)
                 s(2) = s(2) + mesh%helem(nz, e)*dyn%uv(2, nz, e)
             end do
+            if (later) cycle
             c(1) = (s(1) - dyn%se_ubt(1, e, 0))/dyn%se_H(e)
             c(2) = (s(2) - dyn%se_ubt(2, e, 0))/dyn%se_H(e)
             do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
@@ -1516,8 +1526,10 @@ contains
                 s(1) = s(1) + mesh%helem(nz, e)*dyn%rk3_us(1, nz, e)
                 s(2) = s(2) + mesh%helem(nz, e)*dyn%rk3_us(2, nz, e)
             end do
-            c(1) = (s(1) - dyn%se_umean(1, e))/dyn%se_H(e)
-            c(2) = (s(2) - dyn%se_umean(2, e))/dyn%se_H(e)
+            ht = dyn%se_H(e)
+            if (present(Htr)) ht = Htr(e)
+            c(1) = (s(1) - dyn%se_umean(1, e))/ht
+            c(2) = (s(2) - dyn%se_umean(2, e))/ht
             do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
                 dyn%rk3_us(1, nz, e) = dyn%rk3_us(1, nz, e) - c(1)
                 dyn%rk3_us(2, nz, e) = dyn%rk3_us(2, nz, e) - c(2)

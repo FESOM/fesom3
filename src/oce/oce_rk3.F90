@@ -28,8 +28,7 @@ module oce_rk3
     ! SILENT when off (no header, no check line, quiet timers, no checkpoint key):
     ! run_conserve_pi.sh and the G0 gate compare fixed output.
     !
-    ! GUARDS (rk3_init): linfs only until zstar lands (plan Stage 6), no zlevel; double precision
-    ! only; no cavities; alpha = theta = 1 (the CG corrector of stage 3 is update_vel /
+    ! GUARDS (rk3_init): linfs or zstar, no zlevel; double precision only; no cavities; alpha = theta = 1 (the CG corrector of stage 3 is update_vel /
     ! compute_ssh_rhs_ale with theta = 1, alpha = 1). step_oce stops if FESOM3_RK3=1 reaches it
     ! from a driver that did not run rk3_init (rk3_step_guard).
     !
@@ -55,14 +54,30 @@ module oce_rk3
     ! update is on the owned elements, then the shared copies are synced (FESOM3_SHARED_SYNC, as
     ! update_vel) and the eDim halo exchanged.
     !
+    ! ZSTAR STAGE GEOMETRY (Task 18, plan Technical Details §6). Stage s = 1, 2 runs on the geometry
+    ! h_{s-1} (h_0 = h^n) and ends on h_s: rk3_implied_eta sets hbar = eta~_s = eta^n + tau_s*
+    ! I(sum_k helem*u_{s-1})/areasvol (hbar_old = eta^n since the step's start); vert_vel_ale over
+    ! tau_s without water_flux then gives the diasurface w (w(top) = 0) and hnode_new = h_s by the
+    ! zstar law; the tracers go T^n h^n -> T_s h_s with the flux thickness h_{s-1};
+    ! rk3_stage_geometry(h_s) rebuilds helem, zbar_3d_n, Z_3d_n (update_thickness_ale without
+    ! committing hnode, which stays h^n) and rk3_H; the momentum update then keeps sum_k h_s*u_s =
+    ! sum_k h_s*u^n. Stage 3 runs on h_2 (PGF, momentum, the CG rhs, the tracer fluxes) and restores
+    ! hbar = eta^n before the barotropic block, so compute_hbar_ale / se_rk3_finish see what AB2's
+    ! do; its last vert_vel_ale (with W) gives h^{n+1}, which update_thickness_ale commits. Under
+    ! linfs none of this changes anything (helem, hnode and hbar stay).
+    !
     ! FESOM3_RK3_CHECK (Task 9): one rank-0 line per step,
-    !     RK3_CHECK step=<n> trim1= trim2= trim3= etacomp= maxu= nbad=        (SE: + trimM=)
+    !     RK3_CHECK step=<n> trim1= trim2= trim3= etacomp= maxu= nbad= cflh= cflz=   (SE: + trimM=)
     ! trim1, trim2 = max|sum_k helem*u_s - sum_k helem*u^n| after stages 1 and 2 [m^2/s];
     ! trim3 = max|sum_k helem*u_tr - target| of the stage-3 transport velocity (CG: the
     ! transport of u^{n+1}; SE: <<U>>); etacomp = max|eta^{n+1} - eta^n - tau*(I(sum_k helem*u_tr)
     ! - W*areasvol)/areasvol| [m] (W only under zstar), the elevation is the one the tracers'
     ! transport implies; trimM (SE) = max|sum_k helem*u^{n+1} - U^M|; maxu = max|u^{n+1}|; nbad =
-    ! the non-finite u^{n+1}, eta^{n+1}, T, S. Owned elements / nodes, reduced over the ranks. With
+    ! the non-finite u^{n+1}, eta^{n+1}, T, S; cflh = max tau*(horizontal outflow)/(areasvol*hnode) of the
+    ! stage-3 transport velocity, the horizontal Courant number of the FCT low order (the choice of
+    ! FESOM3_RK3_LO_NSUB), and cflz = max CFL_z of its w (the split's Courant number; D7's stability limit
+    ! for momentum and non-FCT tracers is a per-cell number of about 9 at maxcfl 1, plan §5).
+    ! Owned elements / nodes, reduced over the ranks. With
     ! FESOM3_RK3_CHECK_TOL > 0 a trim or etacomp above it, or nbad > 0, stops the run (the ctest
     ! and run_conserve_pi.sh hard gates); nbad > 0 stops in any case.
     !
@@ -84,6 +99,7 @@ module oce_rk3
     use oce_adv_tra_driver, only: do_oce_adv_tra_rk3
     use oce_dyn_velrhs,  only: compute_vel_rhs
     use oce_dyn_visc,    only: viscosity_filter
+    use oce_adv_tra_hor, only: adv_tra_hor_upw1
     use mod_param_phys,  only: alpha, theta
     use mod_config,      only: which_ALE
     use oce_ssh_se,      only: se_env_requested
@@ -92,16 +108,18 @@ module oce_rk3
     public :: rk3_env_requested, rk3_read_env, rk3_parse_knob, rk3_init, rk3_step_guard, rk3_die
     public :: rk3_tracer_prep, rk3_tracer_stage
     public :: rk3_depth, rk3_transport, rk3_momentum_stage, rk3_viscosity, rk3_trim, rk3_elem_sync
+    public :: rk3_momentum_rhs, rk3_momentum_update, rk3_implied_eta, rk3_stage_geometry, rk3_check_eta
     public :: rk3_check_begin, rk3_check_trim, rk3_check_finish, rk3_check_line, rk3_inflow
     public :: rk3_cold_ab_start
     public :: RK3_NCHK, RK3_CHK_TRIM1, RK3_CHK_TRIM2, RK3_CHK_TRIM3, RK3_CHK_ETACOMP, RK3_CHK_TRIMM, &
-              RK3_CHK_MAXU, RK3_CHK_NBAD
+              RK3_CHK_MAXU, RK3_CHK_NBAD, RK3_CHK_CFLH, RK3_CHK_CFLZ
 
     ! FESOM3_RK3_CHECK: the entries of the check values (meaning in the module header); the
     ! running values of the current step
-    integer, parameter :: RK3_NCHK = 7
+    integer, parameter :: RK3_NCHK = 9
     integer, parameter :: RK3_CHK_TRIM1 = 1, RK3_CHK_TRIM2 = 2, RK3_CHK_TRIM3 = 3, RK3_CHK_ETACOMP = 4, &
-                          RK3_CHK_TRIMM = 5, RK3_CHK_MAXU = 6, RK3_CHK_NBAD = 7
+                          RK3_CHK_TRIMM = 5, RK3_CHK_MAXU = 6, RK3_CHK_NBAD = 7, RK3_CHK_CFLH = 8, &
+                          RK3_CHK_CFLZ = 9
     real(kind=WP), save :: chk(RK3_NCHK) = 0.0_WP
 
     ! the knobs rk3_read_env reads (FESOM3_RK3 itself: rk3_env_requested)
@@ -218,8 +236,8 @@ contains
 #if defined(USE_SINGLE_PRECISION)
         call rk3_die('RK3 needs a double-precision build (this one is USE_SINGLE_PRECISION)', partit)
 #endif
-        if (trim(which_ALE) /= 'linfs') &
-            call rk3_die('RK3 supports which_ALE = linfs, not '//trim(which_ALE), partit)
+        if (trim(which_ALE) /= 'linfs' .and. trim(which_ALE) /= 'zstar') &
+            call rk3_die('RK3 supports which_ALE = linfs and zstar, not '//trim(which_ALE), partit)
         if (any(mesh%ulevels_nod2D(1:nNodL) > 1)) &
             call rk3_die('RK3 does not support cavities (ulevels_nod2D > 1)', partit)
         if (alpha /= 1.0_WP .or. theta /= 1.0_WP) &
@@ -389,12 +407,42 @@ contains
 
     !===========================================================================
     subroutine rk3_momentum_stage(stage, tau_s, dynamics, mesh, partit)
-        ! Stage s = 1, 2 of the momentum (module header): R_s from compute_vel_rhs on u^n (s = 1)
-        ! or u* (s = 2, dyn%rk3_us) into uv_rhs, then rk3_us = u^n + R_s - <R_s> on the owned
-        ! elements, synced and exchanged. Needs rk3_H (rk3_depth) and w_e (vert_vel_ale of the
-        ! stage, split off: w_e = w).
+        ! Stage s = 1, 2 of the momentum (module header): rk3_momentum_rhs, then
+        ! rk3_momentum_update on the same geometry (linfs; under zstar the step puts the tracers
+        ! and the stage geometry between the two)
         integer,        intent(in)            :: stage
         real(kind=WP),  intent(in)            :: tau_s
+        type(t_dyn),    intent(inout), target :: dynamics
+        type(t_mesh),   intent(in),    target :: mesh
+        type(t_partit), intent(in), optional  :: partit
+        call rk3_momentum_rhs(stage, tau_s, dynamics, mesh, partit)
+        call rk3_momentum_update(dynamics, mesh, partit)
+    end subroutine rk3_momentum_stage
+
+    !===========================================================================
+    subroutine rk3_momentum_rhs(stage, tau_s, dynamics, mesh, partit)
+        ! R_s from compute_vel_rhs on u^n (s = 1) or u* (s = 2, dyn%rk3_us) into uv_rhs (owned
+        ! elements), on the current geometry. Needs w_e (vert_vel_ale of the stage, split off:
+        ! w_e = w).
+        integer,        intent(in)            :: stage
+        real(kind=WP),  intent(in)            :: tau_s
+        type(t_dyn),    intent(inout), target :: dynamics
+        type(t_mesh),   intent(in),    target :: mesh
+        type(t_partit), intent(in), optional  :: partit
+        select case (stage)
+        case (1)
+            call compute_vel_rhs(dynamics, mesh, tau_s, .true., partit, no_history=.true.)
+        case (2)
+            call compute_vel_rhs(dynamics, mesh, tau_s, .true., partit, uv_in=dynamics%rk3_us, no_history=.true.)
+        case default
+            call rk3_die('rk3_momentum_rhs: stage must be 1 or 2', partit)
+        end select
+    end subroutine rk3_momentum_rhs
+
+    !===========================================================================
+    subroutine rk3_momentum_update(dynamics, mesh, partit)
+        ! rk3_us = u^n + R_s - <R_s> on the owned elements, <.> with the CURRENT helem and rk3_H
+        ! (zstar: h_s, so that sum_k h_s*u_s = sum_k h_s*u^n), synced and exchanged
         type(t_dyn),    intent(inout), target :: dynamics
         type(t_mesh),   intent(in),    target :: mesh
         type(t_partit), intent(in), optional  :: partit
@@ -403,14 +451,6 @@ contains
         real(kind=WP) :: s(2)
 
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
-        select case (stage)
-        case (1)
-            call compute_vel_rhs(dynamics, mesh, tau_s, .true., partit, no_history=.true.)
-        case (2)
-            call compute_vel_rhs(dynamics, mesh, tau_s, .true., partit, uv_in=dynamics%rk3_us, no_history=.true.)
-        case default
-            call rk3_die('rk3_momentum_stage: stage must be 1 or 2', partit)
-        end select
         do e = 1, nElemO
             s = 0.0_WP
             do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
@@ -424,7 +464,64 @@ contains
             end do
         end do
         call rk3_elem_sync(dynamics%rk3_us, partit)
-    end subroutine rk3_momentum_stage
+    end subroutine rk3_momentum_update
+
+    !===========================================================================
+    subroutine rk3_implied_eta(tau_s, vel, dyn, mesh, partit)
+        ! zstar: hbar = eta~_s = eta^n + tau_s*I(sum_k helem*vel)/areasvol on the owned open-surface
+        ! nodes (eta^n = dyn%eta_n, the elevation at the step's start), then exchange_nod: the
+        ! elevation the stage's transport implies, without the freshwater (W enters in stage 3)
+        real(kind=WP),  intent(in)           :: tau_s
+        real(kind=WP),  intent(in)           :: vel(:,:,:)
+        type(t_dyn),    intent(in)           :: dyn
+        type(t_mesh),   intent(inout)        :: mesh
+        type(t_partit), intent(in), optional :: partit
+        integer :: n, nNodO, nNodL, nEdgeO, nElemO
+        real(kind=WP), allocatable :: inflow(:)
+        call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
+        allocate(inflow(nNodL))
+        call rk3_inflow(vel, mesh, partit, inflow)
+        do n = 1, nNodO
+            if (mesh%ulevels_nod2D(n) > 1) cycle
+            mesh%hbar(n) = dyn%eta_n(n) + tau_s*inflow(n)/mesh%areasvol(n)
+        end do
+        if (is_multirank(partit)) call exchange_nod(mesh%hbar, partit)
+    end subroutine rk3_implied_eta
+
+    !===========================================================================
+    subroutine rk3_stage_geometry(dyn, mesh, partit)
+        ! zstar: the geometry of the stage thickness h_s = hnode_new (module header):
+        ! update_thickness_ale's rebuild without committing hnode -- zbar_3d_n and Z_3d_n bottom-up
+        ! from the fixed anchor over the owned + halo nodes (hnode_new is halo-valid from
+        ! vert_vel_ale), helem = sum_v elem_w*hnode_new over the owned elements' full range and
+        ! exchange_elem, then rk3_H. A no-op under linfs.
+        type(t_dyn),    intent(inout)        :: dyn
+        type(t_mesh),   intent(inout)        :: mesh
+        type(t_partit), intent(in), optional :: partit
+        integer :: n, nz, elem, nzmin, nzmax
+        integer :: nNodO, nNodL, nEdgeO, nElemO
+        if (trim(which_ALE) /= 'zstar') return
+        call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
+        do n = 1, nNodL
+            nzmin = mesh%ulevels_nod2D(n)
+            nzmax = mesh%nlevels_nod2D(n) - 2
+            if (nzmin > 1) cycle
+            do nz = nzmax, nzmin, -1
+                mesh%zbar_3d_n(nz,n) = mesh%zbar_3d_n(nz+1,n) + mesh%hnode_new(nz,n)
+                mesh%Z_3d_n(nz,n)    = mesh%zbar_3d_n(nz+1,n) + mesh%hnode_new(nz,n)/2.0_WP
+            end do
+        end do
+        do elem = 1, nElemO
+            nzmin = mesh%ulevels(elem)
+            nzmax = mesh%nlevels(elem) - 1
+            if (nzmin > 1) cycle
+            do nz = nzmin, nzmax
+                mesh%helem(nz,elem) = sum(mesh%elem_w(:,elem)*mesh%hnode_new(nz,mesh%elem2D_nodes(:,elem)))
+            end do
+        end do
+        if (is_multirank(partit)) call exchange_elem(mesh%helem, partit)
+        call rk3_depth(dyn, mesh, partit)
+    end subroutine rk3_stage_geometry
 
     !===========================================================================
     subroutine rk3_viscosity(dynamics, mesh, tau, partit)
@@ -537,24 +634,21 @@ contains
     end subroutine rk3_inflow
 
     !===========================================================================
-    subroutine rk3_check_finish(step, dt, eta_old, vel_tr, dyn, tracers, mesh, partit, water_flux)
-        ! FESOM3_RK3_CHECK, end of a step: etacomp, maxu and nbad, the reductions, the rank-0 line
-        ! and the stops (module header). eta_old = eta^n (owned + halo), vel_tr = the stage-3
-        ! transport velocity, water_flux = W (non-linfs only).
-        integer,        intent(in)           :: step
+    subroutine rk3_check_eta(dt, eta_old, vel_tr, dyn, mesh, partit, water_flux)
+        ! FESOM3_RK3_CHECK, stage 3 after the last vert_vel_ale (the geometry of the transport,
+        ! h_2 under zstar, is still in place): etacomp of eta^{n+1} = eta_n against eta_old = eta^n
+        ! (owned + halo) and the transport velocity vel_tr, cflh of vel_tr and cflz of its w (module
+        ! header); water_flux = W (non-linfs only). Local values, reduced in rk3_check_finish.
         real(kind=WP),  intent(in)           :: dt
         real(kind=WP),  intent(in)           :: eta_old(:)
         real(kind=WP),  intent(in)           :: vel_tr(:,:,:)
         type(t_dyn),    intent(in)           :: dyn
-        type(t_tracer), intent(in)           :: tracers
         type(t_mesh),   intent(in)           :: mesh
         type(t_partit), intent(in)           :: partit
         real(kind=WP),  intent(in), optional :: water_flux(:)
-        integer :: n, e, nz, t, ierr, nNodO, nNodL, nEdgeO, nElemO
+        integer :: n, e, nz, en(2), nNodO, nNodL, nEdgeO, nElemO
         real(kind=WP) :: res, fw
-        real(kind=WP), allocatable :: inflow(:)
-        logical :: bad
-        character(len=320) :: line
+        real(kind=WP), allocatable :: inflow(:), one(:,:), fl(:,:), out(:,:)
 
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
         allocate(inflow(nNodL))
@@ -564,6 +658,43 @@ contains
             if (trim(which_ALE) /= 'linfs' .and. present(water_flux)) fw = water_flux(n)*mesh%areasvol(n)
             res = dyn%eta_n(n) - eta_old(n) - dt*(inflow(n) - fw)/mesh%areasvol(n)
             chk(RK3_CHK_ETACOMP) = max(chk(RK3_CHK_ETACOMP), abs(res))
+        end do
+        ! the Courant numbers: the horizontal outflow of the stage-3 transport (the upwind flux of T = 1
+        ! is the transport into an edge's first node) and the CFL_z of its w
+        allocate(one(mesh%nl-1, nNodL), fl(mesh%nl-1, max(nEdgeO, 1)), out(mesh%nl-1, nNodL))
+        one = 1.0_WP; out = 0.0_WP
+        call adv_tra_hor_upw1(vel_tr, one, mesh, fl, o_init_zero=.true., partit=partit)
+        do e = 1, nEdgeO
+            en = mesh%edges(:, e)
+            out(:, en(1)) = out(:, en(1)) + max(0.0_WP, -fl(:, e))
+            out(:, en(2)) = out(:, en(2)) + max(0.0_WP,  fl(:, e))
+        end do
+        do n = 1, nNodO
+            do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n) - 1
+                chk(RK3_CHK_CFLH) = max(chk(RK3_CHK_CFLH), dt*out(nz, n)/(mesh%areasvol(n)*mesh%hnode(nz, n)))
+            end do
+            do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n)
+                chk(RK3_CHK_CFLZ) = max(chk(RK3_CHK_CFLZ), dyn%cfl_z(nz, n))
+            end do
+        end do
+    end subroutine rk3_check_eta
+
+    !===========================================================================
+    subroutine rk3_check_finish(step, dyn, tracers, mesh, partit)
+        ! FESOM3_RK3_CHECK, end of a step: maxu and nbad, the reductions, the rank-0 line and the
+        ! stops (module header)
+        integer,        intent(in) :: step
+        type(t_dyn),    intent(in) :: dyn
+        type(t_tracer), intent(in) :: tracers
+        type(t_mesh),   intent(in) :: mesh
+        type(t_partit), intent(in) :: partit
+        integer :: n, e, nz, t, ierr, nNodO, nNodL, nEdgeO, nElemO
+        real(kind=WP) :: res
+        logical :: bad
+        character(len=320) :: line
+
+        call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
+        do n = 1, nNodO
             if (.not. ieee_is_finite(dyn%eta_n(n))) chk(RK3_CHK_NBAD) = chk(RK3_CHK_NBAD) + 1.0_WP
             do t = 1, tracers%num_tracers
                 do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n) - 1
@@ -609,9 +740,10 @@ contains
         do k = 1, RK3_NCHK
             write(v(k), '(es12.4)') vals(k)
         end do
-        write(line, '(a,i0,6(a,a))') 'RK3_CHECK step=', step, ' trim1=', trim(adjustl(v(1))), &
+        write(line, '(a,i0,8(a,a))') 'RK3_CHECK step=', step, ' trim1=', trim(adjustl(v(1))), &
             ' trim2=', trim(adjustl(v(2))), ' trim3=', trim(adjustl(v(3))), ' etacomp=', trim(adjustl(v(4))), &
-            ' maxu=', trim(adjustl(v(6))), ' nbad=', trim(adjustl(v(7)))
+            ' maxu=', trim(adjustl(v(6))), ' nbad=', trim(adjustl(v(7))), ' cflh=', trim(adjustl(v(8))), &
+            ' cflz=', trim(adjustl(v(9)))
         if (se) line = trim(line)//' trimM='//trim(adjustl(v(5)))
     end function rk3_check_line
 

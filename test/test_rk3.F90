@@ -85,6 +85,15 @@ program test_rk3
     !       ends with "time_scheme": "rk3" and reads back 'rk3', without RK3 it has no such key and
     !       reads back 'ab2' (year, day, time_sec round-trip); rk3_cold_ab_start zeroes uv_rhsAB
     !       and se_sbar_old and sets every valuesold level to values
+    !   Z1  zstar stage geometry (Task 18), which_ALE = zstar on the cold thicknesses, hashed
+    !       u^n, u*, u**: in stages 1 and 2 rk3_implied_eta + vert_vel_ale (tau_s, no water_flux)
+    !       give a layer sum sum_k hnode_new = H + eta~_s (1e-10 m) and rk3_stage_geometry gives
+    !       helem = sum elem_w*hnode_new and rk3_H = sum helem (bitwise); stage 3, forced (a hashed
+    !       W), with eta^{n+1} = eta^n + tau*(I - W*areasvol)/areasvol: sum hnode_new = H + eta^{n+1}
+    !   Z2  w(top) = 0 to 1e-12 of max|w| in all three stages: the diasurface w of stages 1-2, and in
+    !       stage 3 the W of the stretch cancels vert_vel_ale's -W (the free surface moves with the
+    !       freshwater; SE_CHECK_TAIL's w1 measures the same; the plan's "-W" was a slip).
+    !       Positive control: stage 3 without water_flux leaves w(top) = W
     !   G   (FESOM3_TEST_RK3_GUARD=alpha|cavity, with FESOM3_RK3=1; separate ctest cases) the
     !       rk3_init guards stop the run: alpha = 0.5, or a node with ulevels_nod2D = 2. The run
     !       prints "test_rk3: GUARD NOT TRIGGERED" and fails if rk3_init returns.
@@ -103,9 +112,10 @@ program test_rk3
     use oce_ale_tracer,   only: solve_tracers_ale, solve_tracers_rk3
     use mod_io_restart,   only: t_restart, restart_register_state, write_checkpoint_json, read_checkpoint_json
     use mod_ice,          only: t_ice
-    use oce_rk3,          only: rk3_cold_ab_start
+    use oce_rk3,          only: rk3_cold_ab_start, rk3_implied_eta, rk3_stage_geometry, rk3_inflow
+    use mod_config,       only: which_ALE
     use, intrinsic :: iso_fortran_env, only: real64
-    use mod_halo,         only: shared_copy_max_elem
+    use mod_halo,         only: shared_copy_max_elem, exchange_nod
     use mod_tracer,       only: t_tracer
     use oce_muscl_adv,    only: muscl_adv_init
     use oce_adv_tra_driver, only: do_oce_adv_tra, do_oce_adv_tra_rk3
@@ -144,6 +154,7 @@ program test_rk3
     call r10t_rest()
     call r11_constancy()
     call r10_restart()
+    call z_zstar()
     call r7_substeps()
     call r8_lo_bounded()
     call r9_fct_stage3()
@@ -156,9 +167,11 @@ contains
 
     subroutine setup_thickness()
         ! the linfs full-cell thicknesses and depths of the drivers (fesom_conserve), cold
-        ! elevation (hbar = hbar_old = 0), hnode_new = hnode
+        ! elevation (hbar = hbar_old = 0), hnode_new = hnode; again after the zstar parts
         integer :: n, e, nz, nzmin, nzmax
         real(kind=MP) :: zbar_srf, zbar_bot
+        if (allocated(mesh%hnode)) deallocate(mesh%hnode, mesh%helem, mesh%zbar_e_bot, mesh%zbar_3d_n, &
+                                              mesh%Z_3d_n, mesh%hbar, mesh%hbar_old, mesh%dhe, mesh%hnode_new)
         allocate(mesh%hnode(nl-1, nNodL)); mesh%hnode = 0.0_MP
         do n = 1, nNodL
             do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n)-1
@@ -1373,6 +1386,109 @@ contains
         end do
         call check(ok, 'R10 cold AB start: uv_rhsAB = 0, se_sbar_old = 0, valuesold = values', partit%mype)
     end subroutine r10_cold_start
+
+    !===========================================================================
+    subroutine z_zstar()
+        ! Z1, Z2 (header) under which_ALE = zstar; the linfs geometry is restored after
+        which_ALE = 'zstar'
+        call z12_geometry()
+        which_ALE = 'linfs'
+        call setup_thickness()
+    end subroutine z_zstar
+
+    real(kind=WP) function laysum_err(eta)
+        ! max over owned nodes of |sum_k hnode_new - (H + eta)|, H = the cold column depth
+        real(kind=WP), intent(in) :: eta(:)
+        integer :: n
+        laysum_err = 0.0_WP
+        do n = 1, nNodO
+            laysum_err = max(laysum_err, abs(sum(mesh%hnode_new(mesh%ulevels_nod2D(n):mesh%nlevels_nod2D(n)-1, n)) &
+                         - (mesh%zbar(mesh%ulevels_nod2D(n)) - mesh%zbar(mesh%nlevels_nod2D(n)) + eta(n))))
+        end do
+        call max_all(laysum_err, partit)
+    end function laysum_err
+
+    subroutine wtop(d, wt, wmax, wf)
+        ! wt = max|w(top) - wf| (wf absent: 0), wmax = max|w| over the owned nodes
+        type(t_dyn),   intent(in)  :: d
+        real(kind=WP), intent(out) :: wt, wmax
+        real(kind=WP), intent(in), optional :: wf(:)
+        integer :: n
+        wt = 0.0_WP; wmax = 0.0_WP
+        do n = 1, nNodO
+            if (present(wf)) then
+                wt = max(wt, abs(d%w(mesh%ulevels_nod2D(n), n) - wf(n)))
+            else
+                wt = max(wt, abs(d%w(mesh%ulevels_nod2D(n), n)))
+            end if
+            wmax = max(wmax, maxval(abs(d%w(:, n))))
+        end do
+        call max_all(wt, partit); call max_all(wmax, partit)
+    end subroutine wtop
+
+    subroutine z12_geometry()
+        type(t_dyn) :: d
+        real(kind=WP), allocatable :: u2(:,:,:), u3(:,:,:), wf(:), inflow(:), eta(:), Hs(:)
+        real(kind=WP) :: err, wt, wmax, hs_err
+        integer :: s, n, e, nz, mype
+        mype = partit%mype
+        call new_dyn(d, 2)
+        call new_rk3(d)
+        call hashed_uv(d%uv, 131)
+        allocate(u2(2, nl-1, nElemF), u3(2, nl-1, nElemF), wf(nNodL), inflow(nNodL), eta(nNodL), Hs(nElemL))
+        call hashed_uv(u2, 132); call hashed_uv(u3, 133)
+        d%eta_n = 0.0_WP; mesh%hbar = 0.0_MP; mesh%hbar_old = 0.0_MP
+        call rk3_depth(d, mesh, partit)
+        do s = 1, 2
+            if (s == 1) then
+                call rk3_implied_eta(dt/3.0_WP, d%uv, d, mesh, partit)
+                call vert_vel_ale(d, mesh, dt/3.0_WP, partit, split=.false., bolus=.false.)
+            else
+                call rk3_implied_eta(0.5_WP*dt, u2, d, mesh, partit)
+                call vert_vel_ale(d, mesh, 0.5_WP*dt, partit, uv_in=u2, split=.false., bolus=.false.)
+            end if
+            eta = mesh%hbar(1:nNodL)
+            err = laysum_err(eta)
+            call wtop(d, wt, wmax)
+            call check(maxval(abs(eta(1:nNodO))) > 1.0e-6_WP, 'Z1 precondition: eta~_s is not 0', mype)
+            call check(err <= 1.0e-10_WP, 'Z1 layer sum = H + eta~_s', mype)
+            call check(wt <= 1.0e-12_WP*wmax, 'Z2 w(top) = 0 in stages 1-2', mype)
+            if (mype == 0) write(*,'(a,i0,a,es9.2,a,es9.2,a,es9.2)') 'test_rk3: Z stage ', s, ' laysum err ', err, &
+                ' m, |w(top)|/max|w| ', wt/wmax, ', max|eta~| ', maxval(abs(eta(1:nNodO)))
+            call rk3_stage_geometry(d, mesh, partit)
+            hs_err = 0.0_WP
+            do e = 1, nElemO
+                Hs(e) = 0.0_WP
+                do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                    hs_err = max(hs_err, abs(mesh%helem(nz, e) - sum(mesh%elem_w(:, e)*mesh%hnode_new(nz, mesh%elem2D_nodes(:, e)))))
+                    Hs(e) = Hs(e) + mesh%helem(nz, e)
+                end do
+                hs_err = max(hs_err, abs(d%rk3_H(e) - Hs(e)))
+            end do
+            call max_all(hs_err, partit)
+            call check(hs_err == 0.0_WP, 'Z1 stage geometry: helem = sum elem_w*hnode_new, rk3_H = sum helem', mype)
+        end do
+        ! stage 3, forced
+        do n = 1, nNodL
+            wf(n) = 1.0e-6_WP*hval(partit%myList_nod2D(n), 77)
+        end do
+        call rk3_inflow(u3, mesh, partit, inflow)
+        mesh%hbar = mesh%hbar_old
+        do n = 1, nNodO
+            mesh%hbar(n) = mesh%hbar_old(n) + dt*(inflow(n) - wf(n)*mesh%areasvol(n))/mesh%areasvol(n)
+        end do
+        if (partit%npes > 1) call exchange_nod(mesh%hbar, partit)
+        call vert_vel_ale(d, mesh, dt, partit, water_flux=wf, uv_in=u3)
+        eta = mesh%hbar(1:nNodL)
+        err = laysum_err(eta)
+        call wtop(d, wt, wmax)
+        call check(err <= 1.0e-10_WP, 'Z1 stage 3 (forced): layer sum = H + eta^{n+1}', mype)
+        call check(wt <= 1.0e-12_WP*wmax, 'Z2 stage 3 (forced): w(top) = 0', mype)
+        if (mype == 0) write(*,'(a,es9.2,a,es9.2)') 'test_rk3: Z stage 3 laysum err ', err, ' m, |w(top)|/max|w| ', wt/wmax
+        call vert_vel_ale(d, mesh, dt, partit, uv_in=u3)
+        call wtop(d, wt, wmax, wf)
+        call check(wt <= 1.0e-12_WP*wmax, 'Z2 positive control: without water_flux w(top) = W', mype)
+    end subroutine z12_geometry
 
     subroutine good(name, str)
         character(len=*), intent(in) :: name, str

@@ -673,6 +673,25 @@ foreach(_np 1 2)
         FAIL_REGULAR_EXPRESSION "VIOLATED;non-finite"
         SKIP_REGULAR_EXPRESSION "cannot open;No such file")
 endforeach()
+# RK3 under zstar (Task 18): CG and split-explicit, np 1 and 2, the hard heat/salt/volume conservation of
+# the zstar cases (FESOM3_CONSERVE_TOL=1e-12), RK3_CHECK with its TOL, and with SE the SE_CHECK and
+# SE_CHECK_TAIL lines (the layer sum, w(1) and the depth law; their levels gated by run_conserve_pi.sh).
+foreach(_np 1 2)
+    add_test(NAME fesom_conserve_rk3_zstar_np${_np}
+             COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np ${_np} $<TARGET_FILE:fesom_conserve>)
+    set_tests_properties(fesom_conserve_rk3_zstar_np${_np} PROPERTIES
+        ENVIRONMENT "FESOM3_MESH_DIR=${_mesh_pi};FESOM3_IC_FILE=${_icf};FESOM3_NSTEPS=20;FESOM3_WHICH_ALE=zstar;FESOM3_CONSERVE_TOL=1e-12;FESOM3_RK3=1;FESOM3_RK3_CHECK=1;FESOM3_RK3_CHECK_TOL=3e-10"
+        PASS_REGULAR_EXPRESSION "RK3_CHECK step=20 trim1=.*fesom_conserve: CONSERVATION OK within tol"
+        FAIL_REGULAR_EXPRESSION "VIOLATED;non-finite"
+        SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+    add_test(NAME fesom_conserve_rk3_se_zstar_np${_np}
+             COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np ${_np} $<TARGET_FILE:fesom_conserve>)
+    set_tests_properties(fesom_conserve_rk3_se_zstar_np${_np} PROPERTIES
+        ENVIRONMENT "FESOM3_MESH_DIR=${_mesh_pi};FESOM3_IC_FILE=${_icf};FESOM3_NSTEPS=20;FESOM3_WHICH_ALE=zstar;FESOM3_CONSERVE_TOL=1e-12;FESOM3_RK3=1;FESOM3_RK3_CHECK=1;FESOM3_RK3_CHECK_TOL=3e-10;FESOM3_SSH_SE=1;FESOM3_SE_CHECK=1"
+        PASS_REGULAR_EXPRESSION "SE_CHECK_TAIL step=20 laysum=.*RK3_CHECK step=20 trim1=.*trimM=.*fesom_conserve: CONSERVATION OK within tol"
+        FAIL_REGULAR_EXPRESSION "VIOLATED;non-finite"
+        SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+endforeach()
 # the RK3 stops: a bad switch, a bad knob, zlevel (fesom_conserve's rk3_init), and a driver without
 # rk3_init (fesom_stepfull_mr: step_oce's rk3_step_guard)
 foreach(_case badswitch badnsub zlevel)
@@ -684,7 +703,7 @@ foreach(_case badswitch badnsub zlevel)
         set(_msg "FESOM3_RK3_LO_NSUB must be 1, 2 or 3: \"4\"")
     else()
         set(_knobs "FESOM3_RK3=1;FESOM3_WHICH_ALE=zlevel")
-        set(_msg "RK3 supports which_ALE = linfs, not zlevel")
+        set(_msg "RK3 supports which_ALE = linfs and zstar, not zlevel")
     endif()
     add_test(NAME fesom_conserve_rk3_${_case}_np1
              COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np 1 $<TARGET_FILE:fesom_conserve>)
