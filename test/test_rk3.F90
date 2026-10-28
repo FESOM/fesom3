@@ -34,6 +34,31 @@ program test_rk3
     !       content change of a hashed tracer is exactly tau_s times the top flux
     !       -sum area*w(top)*T(top) (1e-13 of the content); closed surface (the depth mean
     !       removed from u, so w(top) ~ 0): the content is conserved to 1e-13
+    !   R6  the stage-3 substep driver at N = 1 (do_oce_adv_tra_rk3, Task 7): fct_LO and
+    !       del_ttf_advhoriz/advvert equal do_oce_adv_tra's bitwise on the same valuesAB (T**
+    !       /= T^n) and tr_xy, use_wsplit on with split faces (FCT tracer); a non-FCT tracer is
+    !       delegated to do_oce_adv_tra (bitwise too)
+    !   R7  the low order in N = 1, 2, 3 substeps with the split (cap low enough for split faces):
+    !       a uniform T0 (T^n = T** = T0) gives fct_LO = T0 and T^{n+1} = T0 to 1e-13 relative;
+    !       closed surface (depth mean removed): the content of T^{n+1} is conserved to 1e-13;
+    !       open surface: its change is tau*sum(adv_flux_ver(top) - the substep-mean low-order
+    !       surface transport rk3_lo_top), to 1e-13 of the content
+    !   R8  low-order boundedness at a horizontal Courant number of 1.5 (the velocity scaled to
+    !       it; the cap keeps the explicit vertical part small): N = 2 keeps fct_LO within the
+    !       global [min, max] of T^n (1e-12 of the range); positive control: N = 1 leaves it by
+    !       more than 1e-3 of the range
+    !   R9  stage-3 FCT for N = 2, 3 on a hashed field: T^{n+1} - fct_LO within the admissible
+    !       increments [fct_ttf_min, fct_ttf_max] of the limiter (1e-12 of the range), the
+    !       limiter active somewhere (a factor < 1). On a smooth field at a Courant number of
+    !       0.01 (depth-uniform, linear in the 3-D position: no interior extremum) the limiter
+    !       still clips at the coastal extrema of the global pi, so "no flux is limited" holds
+    !       on the CLEAN cells only: both factors == 1 at the cell, at its edge neighbours on the
+    !       level and at the cells above and below, i.e. every flux into the cell unlimited
+    !       (asserted: >= 90 % of the wet cells). There T^{n+1} equals fct_LO + the scatter of
+    !       the full antidiffusive flux HO(T**) - the substep-mean low-order flux
+    !       (rk3_lo_fh/fv), the HO recomputed here from the kernels, to 1e-13; positive
+    !       control: with the low-order flux of ONE step from T^n in place of the substep mean,
+    !       the clean cells differ by more than 1e-9
     use mpi
     use mod_precision,    only: WP, MP, WP_full
     use mod_constants,    only: density_0
@@ -75,6 +100,10 @@ program test_rk3
     call r2_split_off()
     call p_pressure_only()
     call r5_ho_stage()
+    call r6_substep_n1()
+    call r7_substeps()
+    call r8_lo_bounded()
+    call r9_fct_stage3()
     call finish(partit, 'test_rk3')
 
 contains
@@ -604,6 +633,347 @@ contains
             if (mype == 0) write(*,'(a,i0,a,es9.2)') 'test_rk3: R5 closed tracer ', t, ' |dC|/C = ', rel
         end do
     end subroutine r5_ho_stage
+
+    !===========================================================================
+    subroutine r6_substep_n1()
+        type(t_dyn)    :: d
+        type(t_tracer) :: tr
+        real(kind=WP), allocatable :: lo0(:,:), dh0(:,:), dv0(:,:)
+        integer :: t, nsplit, mype
+        mype = partit%mype
+        call new_dyn(d, 2)
+        d%use_wsplit = .true.; d%wsplit_maxcfl = 1.0e-3_WP; d%wsplit_mincfl = 0.5e-3_WP
+        call new_tracers(tr)
+        call hashed_state(d, 51)
+        call vert_vel_ale(d, mesh, dt, partit)
+        nsplit = count(d%w_i(:, 1:nNodO) /= 0.0_WP)
+        call sum_all(nsplit, partit)
+        call check(nsplit > 100, 'R6 precondition: split faces', mype)
+        do t = 1, 2
+            call set_tracer(tr%data(t)%values,   10.0_WP*t, 3.0_WP, 11*t)
+            call set_tracer(tr%data(t)%valuesAB, 10.0_WP*t, 3.0_WP, 13*t)
+            call rk3_tracer_prep(t, tr, mesh, partit)
+            call do_oce_adv_tra(dt, d%uv, d%w, d%w_i, d%w_e, t, d, tr, mesh, partit)
+            lo0 = tr%work%fct_LO; dh0 = tr%work%del_ttf_advhoriz; dv0 = tr%work%del_ttf_advvert
+            tr%work%fct_LO = -1.0_WP
+            call rk3_tracer_prep(t, tr, mesh, partit)
+            call do_oce_adv_tra_rk3(dt, d%uv, d%w, d%w_i, d%w_e, t, 3, 1, d, tr, mesh, partit)
+            call check(same_nod(tr%work%del_ttf_advhoriz, dh0) .and. same_nod(tr%work%del_ttf_advvert, dv0), &
+                       'R6 N = 1: del_ttf_adv* bitwise do_oce_adv_tra, '//trim(tr%data(t)%tra_adv_lim), mype)
+            if (t == 1) call check(same_nod(tr%work%fct_LO, lo0), 'R6 N = 1: fct_LO bitwise do_oce_adv_tra', mype)
+            call check(any(dv0(:, 1:nNodO) /= 0.0_WP), 'R6 non-vacuous tendency', mype)
+        end do
+    end subroutine r6_substep_n1
+
+    !===========================================================================
+    subroutine stage3_update(tr, t, Tnew)
+        ! T^{n+1} after the stage-3 advection alone: the identity form of diff_tracers_ale's
+        ! reconstruct on the owned nodes (no diffusion)
+        type(t_tracer), intent(in)    :: tr
+        integer,        intent(in)    :: t
+        real(kind=WP),  intent(inout) :: Tnew(:,:)
+        integer :: n, nz
+        real(kind=WP) :: dl
+        Tnew = tr%data(t)%values
+        do n = 1, nNodO
+            do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n) - 1
+                dl = tr%work%del_ttf_advhoriz(nz, n) + tr%work%del_ttf_advvert(nz, n) &
+                   + tr%data(t)%values(nz, n)*(mesh%hnode(nz, n) - mesh%hnode_new(nz, n))
+                Tnew(nz, n) = tr%data(t)%values(nz, n) + dl/mesh%hnode_new(nz, n)
+            end do
+        end do
+    end subroutine stage3_update
+
+    real(kind=WP) function lo_top_sum(tr)
+        integer :: n
+        type(t_tracer), intent(in) :: tr
+        lo_top_sum = 0.0_WP
+        do n = 1, nNodO
+            lo_top_sum = lo_top_sum + tr%work%rk3_lo_top(n) - tr%work%adv_flux_ver(mesh%ulevels_nod2D(n), n)
+        end do
+        call sum_all(lo_top_sum, partit)
+    end function lo_top_sum
+
+    subroutine r7_substeps()
+        type(t_dyn)    :: d
+        type(t_tracer) :: tr
+        real(kind=WP), allocatable :: Tnew(:,:)
+        real(kind=WP) :: dev, devlo, c0, c1, ex, rel
+        integer :: nsub, nsplit, mype
+        character(len=8) :: tag
+        mype = partit%mype
+        call new_dyn(d, 2)
+        d%use_wsplit = .true.; d%wsplit_maxcfl = 1.0e-3_WP; d%wsplit_mincfl = 0.5e-3_WP
+        call new_tracers(tr)
+        call hashed_state(d, 61)
+        call vert_vel_ale(d, mesh, dt, partit)
+        nsplit = count(d%w_i(:, 1:nNodO) /= 0.0_WP)
+        call sum_all(nsplit, partit)
+        call check(nsplit > 100, 'R7 precondition: split faces', mype)
+        allocate(Tnew(nl-1, nNodL))
+        do nsub = 1, 3
+            write(tag, '(a,i0)') 'N=', nsub
+            ! constancy
+            call set_tracer(tr%data(1)%values, 7.3_WP, 0.0_WP, 0)
+            tr%data(1)%valuesAB = tr%data(1)%values
+            call rk3_tracer_prep(1, tr, mesh, partit)
+            call do_oce_adv_tra_rk3(dt, d%uv, d%w, d%w_i, d%w_e, 1, 3, nsub, d, tr, mesh, partit)
+            call stage3_update(tr, 1, Tnew)
+            devlo = maxdev(tr%work%fct_LO, 7.3_WP)
+            dev   = maxdev(Tnew, 7.3_WP)
+            call check(devlo <= 1.0e-13_WP*7.3_WP .and. dev <= 1.0e-13_WP*7.3_WP, &
+                       'R7 constancy of fct_LO and T^{n+1}, '//trim(tag), mype)
+            if (mype == 0) write(*,'(a,a,a,es9.2,a,es9.2)') 'test_rk3: R7 ', trim(tag), &
+                ' max|LO - T0| = ', devlo, ', max|T^{n+1} - T0| = ', dev
+            ! open surface: content change = tau*(adf(top) - mean LO surface transport)
+            call set_tracer(tr%data(1)%values,   10.0_WP, 4.0_WP, 17)
+            call set_tracer(tr%data(1)%valuesAB, 10.0_WP, 4.0_WP, 19)
+            call rk3_tracer_prep(1, tr, mesh, partit)
+            call do_oce_adv_tra_rk3(dt, d%uv, d%w, d%w_i, d%w_e, 1, 3, nsub, d, tr, mesh, partit)
+            call stage3_update(tr, 1, Tnew)
+            c0 = content(tr%data(1)%values); c1 = content(Tnew)
+            ex = -dt*lo_top_sum(tr)
+            rel = abs(c1 - c0 - ex)/abs(c0)
+            call check(rel <= 1.0e-13_WP, 'R7 open surface: content change = tau*substep-mean surface flux, '// &
+                       trim(tag), mype)
+            call check(abs(ex)/abs(c0) > 1.0e-11_WP, 'R7 open surface: the surface flux is not negligible', mype)
+            if (mype == 0) write(*,'(a,a,a,es9.2,a,es9.2)') 'test_rk3: R7 ', trim(tag), &
+                ' open |dC - tau*F|/C = ', rel, ', tau*F/C = ', ex/c0
+        end do
+        ! closed surface: conservation
+        call remove_depth_mean(d%uv)
+        call vert_vel_ale(d, mesh, dt, partit)
+        do nsub = 1, 3
+            write(tag, '(a,i0)') 'N=', nsub
+            call set_tracer(tr%data(1)%values,   10.0_WP, 4.0_WP, 17)
+            call set_tracer(tr%data(1)%valuesAB, 10.0_WP, 4.0_WP, 19)
+            call rk3_tracer_prep(1, tr, mesh, partit)
+            call do_oce_adv_tra_rk3(dt, d%uv, d%w, d%w_i, d%w_e, 1, 3, nsub, d, tr, mesh, partit)
+            call stage3_update(tr, 1, Tnew)
+            c0 = content(tr%data(1)%values); c1 = content(Tnew)
+            rel = abs(c1 - c0)/abs(c0)
+            call check(rel <= 1.0e-13_WP, 'R7 closed surface: content conserved, '//trim(tag), mype)
+            if (mype == 0) write(*,'(a,a,a,es9.2)') 'test_rk3: R7 ', trim(tag), ' closed |dC|/C = ', rel
+        end do
+    end subroutine r7_substeps
+
+    !===========================================================================
+    real(kind=WP) function hor_courant(d)
+        ! max over owned nodes and wet layers of tau*(horizontal outflow)/(areasvol*hnode): the
+        ! upwind flux of T = 1 is the edge transport into the edge's first node
+        type(t_dyn), intent(in) :: d
+        real(kind=WP), allocatable :: one(:,:), fl(:,:), out(:,:)
+        integer :: e, n, nz, en(2)
+        allocate(one(nl-1, nNodL), fl(nl-1, nEdgeO), out(nl-1, nNodL))
+        call set_tracer(one, 1.0_WP, 0.0_WP, 0)
+        call adv_tra_hor_upw1(d%uv, one, mesh, fl, o_init_zero=.true., partit=partit)
+        out = 0.0_WP
+        do e = 1, nEdgeO
+            en = mesh%edges(:, e)
+            out(:, en(1)) = out(:, en(1)) + max(0.0_WP, -fl(:, e))
+            out(:, en(2)) = out(:, en(2)) + max(0.0_WP,  fl(:, e))
+        end do
+        hor_courant = 0.0_WP
+        do n = 1, nNodO
+            do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n) - 1
+                hor_courant = max(hor_courant, dt*out(nz, n)/(mesh%areasvol(n)*mesh%hnode(nz, n)))
+            end do
+        end do
+        call max_all(hor_courant, partit)
+    end function hor_courant
+
+    subroutine minmax(T, tmin, tmax)
+        real(kind=WP), intent(in)  :: T(:,:)
+        real(kind=WP), intent(out) :: tmin, tmax
+        integer :: n, nz
+        tmin = huge(1.0_WP); tmax = -huge(1.0_WP)
+        do n = 1, nNodO
+            do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n) - 1
+                tmin = min(tmin, T(nz, n)); tmax = max(tmax, T(nz, n))
+            end do
+        end do
+        tmin = -tmin
+        call max_all(tmin, partit); call max_all(tmax, partit)
+        tmin = -tmin
+    end subroutine minmax
+
+    subroutine r8_lo_bounded()
+        type(t_dyn)    :: d
+        type(t_tracer) :: tr
+        real(kind=WP) :: c, tmin, tmax, lmin, lmax, over(2)
+        integer :: nsub, mype
+        mype = partit%mype
+        call new_dyn(d, 2)
+        d%use_wsplit = .true.; d%wsplit_maxcfl = 0.05_WP; d%wsplit_mincfl = 0.025_WP
+        call new_tracers(tr)
+        call hashed_state(d, 71)
+        c = hor_courant(d)
+        d%uv = d%uv*(1.5_WP/c)
+        c = hor_courant(d)
+        call vert_vel_ale(d, mesh, dt, partit)
+        call set_tracer(tr%data(1)%values, 10.0_WP, 4.0_WP, 23)
+        tr%data(1)%valuesAB = tr%data(1)%values
+        call minmax(tr%data(1)%values, tmin, tmax)
+        do nsub = 1, 2
+            call rk3_tracer_prep(1, tr, mesh, partit)
+            call do_oce_adv_tra_rk3(dt, d%uv, d%w, d%w_i, d%w_e, 1, 3, nsub, d, tr, mesh, partit)
+            call minmax(tr%work%fct_LO, lmin, lmax)
+            over(nsub) = max(tmin - lmin, lmax - tmax, 0.0_WP)/(tmax - tmin)
+        end do
+        call check(abs(c - 1.5_WP) < 1.0e-9_WP, 'R8 precondition: horizontal Courant number 1.5', mype)
+        call check(over(2) <= 1.0e-12_WP, 'R8 N = 2: the low order stays within [min, max] of T^n', mype)
+        call check(over(1) > 1.0e-3_WP, 'R8 positive control: N = 1 leaves [min, max]', mype)
+        if (mype == 0) write(*,'(a,f6.3,a,es9.2,a,es9.2)') 'test_rk3: R8 Courant ', c, &
+            ', overshoot/range N=1 ', over(1), ', N=2 ', over(2)
+    end subroutine r8_lo_bounded
+
+    !===========================================================================
+    subroutine r9_fct_stage3()
+        type(t_dyn)    :: d
+        type(t_tracer) :: tr
+        real(kind=WP), allocatable :: Tnew(:,:), fh(:,:), fv(:,:), Tfull(:,:), Twrong(:,:)
+        logical, allocatable :: dirty(:,:), clean(:,:)
+        real(kind=WP) :: tmin, tmax, viol, err, errw, fmin, c, lon, lat, xn
+        real(kind=WP), parameter :: lon0 = 1.5707963267948966_WP, lat0 = 0.7853981633974483_WP
+        integer :: nsub, n, nz, e, en(2), nlim, ncl, nwet, mype
+        character(len=8) :: tag
+        mype = partit%mype
+        call new_dyn(d, 2)
+        d%use_wsplit = .true.; d%wsplit_maxcfl = 1.0e-3_WP; d%wsplit_mincfl = 0.5e-3_WP
+        call new_tracers(tr)
+        allocate(Tnew(nl-1, nNodL), Tfull(nl-1, nNodL), Twrong(nl-1, nNodL))
+        allocate(dirty(nl-1, nNodL), clean(nl-1, nNodL))
+        ! (a) a hashed field: the Zalesak bounds hold, the limiter acts
+        call hashed_state(d, 81)
+        call vert_vel_ale(d, mesh, dt, partit)
+        do nsub = 2, 3
+            write(tag, '(a,i0)') 'N=', nsub
+            call set_tracer(tr%data(1)%values,   10.0_WP, 4.0_WP, 27)
+            call set_tracer(tr%data(1)%valuesAB, 10.0_WP, 4.0_WP, 29)
+            call minmax(tr%data(1)%values, tmin, tmax)
+            call rk3_tracer_prep(1, tr, mesh, partit)
+            call do_oce_adv_tra_rk3(dt, d%uv, d%w, d%w_i, d%w_e, 1, 3, nsub, d, tr, mesh, partit)
+            call stage3_update(tr, 1, Tnew)
+            viol = 0.0_WP; nlim = 0
+            do n = 1, nNodO
+                do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n) - 1
+                    viol = max(viol, Tnew(nz,n) - tr%work%fct_LO(nz,n) - tr%work%fct_ttf_max(nz,n), &
+                                     tr%work%fct_ttf_min(nz,n) - (Tnew(nz,n) - tr%work%fct_LO(nz,n)))
+                    if (tr%work%fct_plus(nz,n) < 1.0_WP .or. tr%work%fct_minus(nz,n) < 1.0_WP) nlim = nlim + 1
+                end do
+            end do
+            call max_all(viol, partit); call sum_all(nlim, partit)
+            call check(viol <= 1.0e-12_WP*(tmax - tmin), 'R9 Zalesak bounds hold, '//trim(tag), mype)
+            call check(nlim > 0, 'R9 the limiter acts on the hashed field, '//trim(tag), mype)
+            if (mype == 0) write(*,'(a,a,a,es9.2,a,i0)') 'test_rk3: R9 ', trim(tag), ' bound violation/range = ', &
+                viol/(tmax - tmin), ', limited cells ', nlim
+        end do
+        ! (b) a smooth field at a small Courant number: no limiting, LO + the full antidiffusion
+        call hashed_state(d, 83)
+        c = hor_courant(d)
+        d%uv = d%uv*(0.01_WP/c)
+        call vert_vel_ale(d, mesh, dt, partit)
+        allocate(fh(nl-1, nEdgeO), fv(nl, nNodL))
+        do nsub = 2, 3
+            write(tag, '(a,i0)') 'N=', nsub
+            ! depth-uniform (no vertical antidiffusion) and linear in the 3-D Cartesian position,
+            ! T = 10 + 2*(x.n) with n towards (90E, 45N): its extrema on the sphere are over land
+            do n = 1, nNodL
+                lon = mesh%geo_coord_nod2D(1, n); lat = mesh%geo_coord_nod2D(2, n)
+                xn  = cos(lat)*cos(lon)*cos(lat0)*cos(lon0) + cos(lat)*sin(lon)*cos(lat0)*sin(lon0) &
+                    + sin(lat)*sin(lat0)
+                do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n) - 1
+                    tr%data(1)%values(nz, n) = 10.0_WP + 2.0_WP*xn
+                end do
+            end do
+            tr%data(1)%valuesAB = tr%data(1)%values
+            call rk3_tracer_prep(1, tr, mesh, partit)
+            call do_oce_adv_tra_rk3(dt, d%uv, d%w, d%w_i, d%w_e, 1, 3, nsub, d, tr, mesh, partit)
+            call stage3_update(tr, 1, Tnew)
+            fmin = 1.0_WP
+            do n = 1, nNodO
+                do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n) - 1
+                    fmin = min(fmin, tr%work%fct_plus(nz,n), tr%work%fct_minus(nz,n))
+                end do
+            end do
+            ! the clean cells: every flux into the cell unlimited
+            dirty = .false.
+            do n = 1, nNodL
+                do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n) - 1
+                    if (tr%work%fct_plus(nz,n) < 1.0_WP .or. tr%work%fct_minus(nz,n) < 1.0_WP) dirty(nz, n) = .true.
+                end do
+            end do
+            clean = .not. dirty
+            do e = 1, nEdgeO
+                en = mesh%edges(:, e)
+                do nz = 1, nl-1
+                    if (dirty(nz, en(1)) .or. dirty(nz, en(2))) then
+                        clean(nz, en(1)) = .false.; clean(nz, en(2)) = .false.
+                    end if
+                end do
+            end do
+            do n = 1, nNodO
+                do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n) - 1
+                    if (nz > mesh%ulevels_nod2D(n)) then
+                        if (dirty(nz-1, n)) clean(nz, n) = .false.
+                    end if
+                    if (nz < mesh%nlevels_nod2D(n) - 1) then
+                        if (dirty(nz+1, n)) clean(nz, n) = .false.
+                    end if
+                end do
+            end do
+            ! LO + the scatter of HO(T**) - the substep-mean LO flux; the control with the LO flux
+            ! of one step from T^n
+            call full_adf(d, tr, tr%work%rk3_lo_fh, tr%work%rk3_lo_fv, Tfull)
+            call adv_tra_hor_upw1(d%uv, tr%data(1)%values, mesh, fh, o_init_zero=.true., partit=partit)
+            call adv_tra_ver_upw1(d%w, tr%data(1)%values, mesh, fv, o_init_zero=.true., partit=partit)
+            call full_adf(d, tr, fh, fv, Twrong)
+            err = 0.0_WP; errw = 0.0_WP; ncl = 0; nwet = 0
+            do n = 1, nNodO
+                do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n) - 1
+                    nwet = nwet + 1
+                    if (.not. clean(nz, n)) cycle
+                    ncl  = ncl + 1
+                    err  = max(err,  abs(Tnew(nz, n) - Tfull(nz, n)))
+                    errw = max(errw, abs(Tnew(nz, n) - Twrong(nz, n)))
+                end do
+            end do
+            call max_all(err, partit); call max_all(errw, partit)
+            call sum_all(ncl, partit); call sum_all(nwet, partit)
+            call check(real(ncl, WP) >= 0.9_WP*real(nwet, WP), 'R9 smooth field: >= 90 % clean cells, '//trim(tag), mype)
+            call check(err <= 1.0e-13_WP*10.0_WP, 'R9 smooth field: T^{n+1} = LO + full antidiffusion, '//trim(tag), mype)
+            call check(errw > 1.0e-9_WP, 'R9 positive control: the one-step LO flux differs, '//trim(tag), mype)
+            if (mype == 0) write(*,'(a,a,a,f8.5,a,i0,a,i0,a,es9.2,a,es9.2)') 'test_rk3: R9 ', trim(tag), &
+                ' smooth: min factor ', fmin, ', clean ', ncl, ' of ', nwet, ', max|T - (LO + adf)| = ', err, &
+                ', control ', errw
+        end do
+
+    end subroutine r9_fct_stage3
+
+    subroutine full_adf(d, tr, lofh, lofv, Tout)
+        ! R9: fct_LO + the scatter of HO(T**) - (lofh, lofv) on the owned nodes
+        type(t_dyn),    intent(in)    :: d
+        type(t_tracer), intent(in)    :: tr
+        real(kind=WP),  intent(in)    :: lofh(:,:), lofv(:,:)
+        real(kind=WP),  intent(inout) :: Tout(:,:)
+        real(kind=WP), allocatable :: fh(:,:), fv(:,:)
+        real(kind=WP_full), allocatable :: dh(:,:), dv(:,:)
+        integer :: n, nz
+        fh = lofh; fv = lofv
+        allocate(dh(nl-1, nNodL), dv(nl-1, nNodL))
+        call adv_tra_hor_muscl(d%uv, tr%data(1)%valuesAB, mesh, tr%data(1)%tra_adv_ph, fh, tr%work%tr_xy, &
+                               tr%work%edge_up_dn_tri, o_init_zero=.false., partit=partit)
+        call adv_tra_ver_qr4c(d%w, tr%data(1)%valuesAB, mesh, tr%data(1)%tra_adv_pv, fv, &
+                              o_init_zero=.false., partit=partit)
+        dh = 0.0_WP; dv = 0.0_WP
+        call oce_tra_adv_flux2dtracer(dt, dh, dv, fh, fv, mesh, partit=partit)
+        Tout = tr%work%fct_LO
+        do n = 1, nNodO
+            do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n) - 1
+                Tout(nz, n) = tr%work%fct_LO(nz, n) + (dh(nz, n) + dv(nz, n))/mesh%hnode_new(nz, n)
+            end do
+        end do
+    end subroutine full_adf
 
     subroutine good(name, str)
         character(len=*), intent(in) :: name, str
