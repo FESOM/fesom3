@@ -46,6 +46,11 @@ module mod_ice
     type t_ice_thermo
         real(kind=WP), allocatable, dimension(:) :: t_skin, thdgr, thdgrsn, thdgra, thdgr_old, ustar
         real(kind=WP), allocatable, dimension(:) :: dyngr, dyngrsn, dyngra
+        ! Conserving cut_off (FESOM3_ICE_CUTOFF_CONSERVE=1; not in FESOM2): cut_off records the
+        ! ice and snow it deletes per node [m] and the thermodynamics of the same step hands them
+        ! to the ocean as melt (mod_ice_thermo). The two arrays are allocated (nNodL) only when on.
+        logical :: cutoff_conserve = .false.
+        real(kind=WP), allocatable, dimension(:) :: dm_ice_cut, dm_snow_cut
         !_______________________________________________________________________
         real(kind=WP) :: rhoair=1.3  , inv_rhoair=1./1.3    ! Air density & inverse,  LY2004
         real(kind=WP) :: rhowat=1025., inv_rhowat=1./1025.  ! Water density & inverse
