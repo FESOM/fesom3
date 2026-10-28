@@ -34,6 +34,7 @@ program fesom_lifecycle_native_mr
     !   FESOM3_RUNOFF_FILE  runoff climatology                  default: pool CORE2_runoff.nc
     !   FESOM3_SSS_FILE     SSS restoring climatology           default: pool PHC2_salx.nc
     !   FESOM3_WHICHEVP     0=EVP / 1=mEVP                       (default 0)
+    !   FESOM3_ICE_CUTOFF_CONSERVE  1 = conserving sea-ice cut_off (mod_ice_thermo); 0/unset = FESOM2's
     !   FESOM_DUMP_FILE     per-rank node dump prefix (mod_dump; <prefix>.<mype5>)
     !   FESOM_DUMP_MAXSTEPS dump step cap
     !   FESOM3_NSTEPS       number of steps                     (default: 3)
@@ -101,6 +102,7 @@ program fesom_lifecycle_native_mr
     use oce_initial_state,  only: t_ic3d_config, do_ic3d, ic3d_extrap_from_env
     use oce_muscl_adv,      only: muscl_adv_init
     use oce_ssh_rhs,        only: init_stiff_mat_ale
+    use oce_ssh_solve,      only: ssh_solve_preconditioner   ! zstar exact resume (cold-matrix preconditioner)
     use mod_step_oce,       only: step_oce
     use oce_ssh_se,         only: se_init
     use mod_io_meshdiag,    only: meshdiag_write
@@ -146,6 +148,9 @@ program fesom_lifecycle_native_mr
     integer            :: clk_d0, clk_y0, clk_unit, idx, ierr
     real(kind=WP)      :: clk_t0, dstat(10)  ! dstat: M8c Step-3 global per-step physical diagnostics
     real(kind=WP_full) :: dsum(2)            ! [sum ssh_rhs_old, sum|ssh_rhs_old|] over owned nodes
+    real(kind=WP)      :: sbud(3)            ! FESOM3_STEP_DIAG zstar ocean + ice salt budget (salt_budget)
+    real(kind=WP), allocatable :: salt_col(:)   ! its per-node ocean + ice salt of the previous step
+    logical            :: cutoff_conserve    ! FESOM3_ICE_CUTOFF_CONSERVE (conserving sea-ice cut_off)
     logical            :: ftz_supported   ! M8c Step-3: flush-to-zero (denormal) underflow control (match FESOM2)
     logical            :: step_diag        ! perf: per-step global MPI_MAX stability diagnostic (env FESOM3_STEP_DIAG; default OFF — FESOM2 has no per-step collective)
     integer            :: mon_every        ! perf monitoring: emit a per-component timing report every mon_every steps (env FESOM3_TIMING_EVERY; 0 = only the final report)
@@ -200,6 +205,21 @@ program fesom_lifecycle_native_mr
     whichevp = 0
     call get_environment_variable('FESOM3_WHICHEVP', whichevp_str)
     if (len_trim(whichevp_str) > 0) read(whichevp_str, *, iostat=ios) whichevp
+    ! Conserving sea-ice cut_off (not in FESOM2; mod_ice_thermo cut_off + thermodynamics): 1 = the
+    ! ice and snow cut_off deletes melt into the ocean in the same step (freshwater, ice salt,
+    ! negative growth in thdgr/thdgrsn); 0 or unset = FESOM2's cut_off, which deletes them
+    ! without a flux. VALUE-based; any other value stops.
+    cutoff_conserve = .false.
+    call get_environment_variable('FESOM3_ICE_CUTOFF_CONSERVE', env, length=env_len, status=ios)
+    if (ios == 0 .and. env_len > 0) then
+        select case (trim(env))
+        case ('1')
+            cutoff_conserve = .true.
+        case ('0')
+        case default
+            error stop 'FESOM3_ICE_CUTOFF_CONSERVE must be 0 or 1'
+        end select
+    end if
     call get_environment_variable('FESOM3_FER_GM', env, length=env_len, status=ios)
     use_fer_gm = (ios == 0 .and. env_len > 0)
     call get_environment_variable('FESOM3_REDI', env, length=env_len, status=ios)
@@ -659,6 +679,15 @@ program fesom_lifecycle_native_mr
     ice%thermo%consn             = 0.31_WP
     ice%thermo%snowdist          = .true.
     ice%thermo%c_melt            = 0.5_WP
+    ! conserving cut_off: the per-node deleted ice/snow work arrays exist only when it is on
+    if (cutoff_conserve) then
+        ice%thermo%cutoff_conserve = .true.
+        allocate(ice%thermo%dm_ice_cut(nNodL), ice%thermo%dm_snow_cut(nNodL))
+        ice%thermo%dm_ice_cut  = 0.0_WP
+        ice%thermo%dm_snow_cut = 0.0_WP
+        if (partit%mype == 0) write(*,'(a)') &
+            'fesom_lifecycle_native_mr: conserving sea-ice cut_off ON (FESOM3_ICE_CUTOFF_CONSERVE=1)'
+    end if
 
     !===========================================================================
     ! atmflux: allocate (local nNodL) + scalar config (the CORE2 namelist scalars).
@@ -953,15 +982,21 @@ program fesom_lifecycle_native_mr
     ! (the forcing build reads only the clock + atmosphere). restart_read resolves the folder via
     ! restart.latest under RestartInPath; clock_year/day/time_sec drive the time-vs-clock safety warning
     ! (time_sec is the sec-of-day == timenew, matching the folder tag + checkpoint.json convention).
+    ! FESOM3_RESTART_ZSTAR_EXACT=1 (read by restart_init; zstar only, rst%zstar_exact): the checkpoint
+    ! adds ssh_stiff + dhe, and the resume (1) builds the SSH Jacobi preconditioner from the COLD
+    ! matrix before restart_read replaces its values (a straight run builds it at its first solve,
+    ! where step 1 adds -dhe = 0, and keeps it), (2) rebuilds zbar_3d_n/Z_3d_n/helem/hnode_new from
+    ! the restored hnode after it. Then the resumed run is bitwise the straight one.
     if (do_restart) then
         call restart_init(rst, mesh, partit)
-        call restart_register_state(rst, dyn, tracers, ice, mesh, mix_scheme=mix_scheme_nmb)
+        call restart_register_state(rst, dyn, tracers, ice, mesh, mix_scheme=mix_scheme_nmb, partit=partit)
         if (partit%mype == 0) write(*,'(a,i0,a)') &
             'restart: registered ', rst%nf, ' prognostic fields -> '//trim(RestartOutPath)
         if (r_restart) then
+            if (rst%zstar_exact) call ssh_solve_preconditioner(dyn, mesh, partit)
             call restart_read(rst, trim(RestartInPath), mesh, partit, &
                               clock_year=yearnew, clock_day=daynew, clock_time_sec=real(timenew, real64))
-            ! zstar: the checkpoint holds hnode only. At the top of a straight-run step hnode_new == hnode
+            ! zstar: the checkpoint holds hnode, not the geometry derived from it. At the top of a straight-run step hnode_new == hnode
             ! and zbar_3d_n / Z_3d_n / helem are what update_thickness_ale built from them (bottom-up from
             ! the fixed anchor; helem over owned elements + exchange_elem), so rerun it with
             ! hnode_new = hnode: the same loops give the same bits (hnode is rewritten with itself).
@@ -1000,6 +1035,10 @@ program fesom_lifecycle_native_mr
     ! step_oce (the FESOM2 runloop order; update_atm_forcing replaced by apply_native_forcing).
     call timer_init()
     wrote_final = .false.
+    if (step_diag .and. .not. atm%use_virt_salt) then   ! zstar salt budget: the starting content
+        allocate(salt_col(nNodO))
+        call salt_budget(sbud, .true.)
+    end if
     do n = 1, nsteps
         call clock                                   ! M8a: advance the model clock (top of step)
         if (ftz_supported) call ieee_set_underflow_mode(gradual=.false.)   ! M8c: keep FTZ on each step (match FESOM2; survive library MXCSR resets)
@@ -1133,6 +1172,17 @@ program fesom_lifecycle_native_mr
                 '  dUV=', dstat(7), '  dAB=', dstat(8), '  dsig=', dstat(9)
         if (partit%mype == 0) &
             write(*,'(a,i0,a,es12.4)') 'fesom_lifecycle_native_mr: CFL_z step ', n, '  max CFL_z=', dstat(10)
+        ! zstar (.not. use_virt_salt): the ocean + sea-ice salt budget of the step (salt_budget).
+        ! resid = change of ocean + ice salt - dt*sum(areasvol*relax_salt): roundoff when the step
+        ! conserves; with FESOM2's cut_off it is minus the ice salt cut_off deleted. cut = the ice
+        ! salt the conserving cut_off returned (0 when off). Own line ("salt step"), so the greps
+        ! on "native_mr: step" are unchanged.
+        if (.not. atm%use_virt_salt) then
+            call salt_budget(sbud, .false.)
+            if (partit%mype == 0) write(*,'(a,i0,a,es24.16,2(a,es12.4))') &
+                'fesom_lifecycle_native_mr: salt step ', n, '  ocean+ice=', sbud(1), &
+                '  resid=', sbud(2), '  cut=', sbud(3)
+        end if
     end do
     ! Restart Stage 5 (Task 5.3): end-of-run final checkpoint — a safety net for the case the last
     ! in-loop step was NOT cadence-due. restart_due already treats the last step as due, so this is
@@ -1161,6 +1211,42 @@ program fesom_lifecycle_native_mr
     call par_ex(partit%MPI_COMM_FESOM, partit%mype)
 
 contains
+
+    ! FESOM3_STEP_DIAG under zstar: the ocean + sea-ice salt budget of the last step, over owned
+    ! nodes, allreduced [psu m^3]. With k = Sice*rhoice*inv_rhowat (the ice salt per metre of
+    ! m_ice, therm_ice's rsf) and the node column c(j) = areasvol*(sum(hnode*S) over the wet
+    ! layers + k*m_ice):
+    !   sb(1) = sum(c)                                            the content
+    !   sb(2) = sum(c - c_previous - dt*areasvol*relax_salt)      the residual
+    !   sb(3) = k*sum(areasvol*dm_ice_cut)                        conserving cut_off on; else 0
+    ! The residual is summed per node (c - c_previous), so its roundoff is that of the columns
+    ! (~1e2 psu m^3 on pi), not of the content (~1e5). Under zstar the ocean's salt changes only by
+    ! real_salt_flux and relax_salt (no virtual salt; relax_salt balanced to zero), and
+    ! real_salt_flux is the ice's own salt change, so the residual is roundoff unless salt is lost
+    ! (lane G of the fesom3_jax zstar port: FESOM2's cut_off is the only such term). first: only
+    ! store the columns (before the first step).
+    subroutine salt_budget(sb, first)
+        real(kind=WP), intent(out) :: sb(3)
+        logical,       intent(in)  :: first
+        integer       :: j, k
+        real(kind=WP) :: kice, acc, col
+        kice = ice%thermo%Sice*ice%thermo%rhoice*ice%thermo%inv_rhowat
+        sb = 0.0_WP
+        do j = 1, nNodO
+            acc = 0.0_WP
+            do k = mesh%ulevels_nod2D(j), mesh%nlevels_nod2D(j)-1
+                acc = acc + tracers%data(2)%values(k,j)*real(mesh%hnode(k,j), WP)
+            end do
+            col = (acc + kice*ice%data(2)%values(j))*real(mesh%areasvol(j), WP)
+            sb(1) = sb(1) + col
+            if (.not. first) &
+                sb(2) = sb(2) + ((col - salt_col(j)) - dt*atm%relax_salt(j)*real(mesh%areasvol(j), WP))
+            if (ice%thermo%cutoff_conserve) &
+                sb(3) = sb(3) + kice*ice%thermo%dm_ice_cut(j)*real(mesh%areasvol(j), WP)
+            salt_col(j) = col
+        end do
+        call MPI_Allreduce(MPI_IN_PLACE, sb, 3, MPI_WP, MPI_SUM, partit%MPI_COMM_FESOM, ierr)
+    end subroutine salt_budget
 
     ! Restart Stage 5 (Task 5.3): the GLOBAL restart cadence predicate. FESOM2 io_restart.F90:937 is_due
     ! + gen_events.F90 annual/monthly/daily/hourly/step_event ported FRESH (the M9 mod_io_means event_due

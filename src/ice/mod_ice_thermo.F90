@@ -98,17 +98,38 @@ contains
     !___________________________________________________________________________
     ! cut_off (FESOM2 ice_thermo_oce.F90:70). Clamp a_ice into [0,1] and zero a/m_ice/m_snow
     ! together when concentration or ice mass falls below 1e-9. Loops owned+halo (nNodL).
+    !
+    ! FESOM2 deletes that ice and snow without any flux. Behind the ice FCT, which limits a_ice
+    ! and m_ice separately, this hits open-water nodes ahead of a moving ice edge (a_ice ~ 0,
+    ! m_ice 1e-5..2e-4 m): on CORE2 ~65 km^3 of ice a year, -2.3e11 psu m^3 of ocean + ice salt
+    ! under zstar. CONSERVING CUT_OFF (ice%thermo%cutoff_conserve, FESOM3_ICE_CUTOFF_CONSERVE=1,
+    ! not in FESOM2): record what is deleted, dm_ice_cut = m_ice(before) - m_ice(after) and
+    ! dm_snow_cut the same for m_snow [m], 0 exactly at a node that is not cut; thermodynamics
+    ! returns them to the ocean in this step. A negative FCT undershoot (m ~ -1e-17) that the
+    ! m_ice test zeroes is recorded with its sign, so the budget closes exactly. Off: the arrays
+    ! are not allocated and only FESOM2's loop runs.
     subroutine cut_off(ice, mesh, partit)
         type(t_ice),    intent(inout), target :: ice
         type(t_mesh),   intent(in)            :: mesh
         type(t_partit), intent(in), optional  :: partit
         integer :: n, nNodO, nNodL, nEdgeO, nElemO
         real(kind=WP), dimension(:), pointer  :: a_ice, m_ice, m_snow
+        real(kind=WP), dimension(:), pointer  :: dm_ice_cut, dm_snow_cut
 
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
         a_ice  => ice%data(1)%values(:)
         m_ice  => ice%data(2)%values(:)
         m_snow => ice%data(3)%values(:)
+
+        ! conserving cut_off: the ice and snow before the cut
+        if (ice%thermo%cutoff_conserve) then
+            dm_ice_cut  => ice%thermo%dm_ice_cut(:)
+            dm_snow_cut => ice%thermo%dm_snow_cut(:)
+            do n = 1, nNodL
+                dm_ice_cut(n)  = m_ice(n)
+                dm_snow_cut(n) = m_snow(n)
+            end do
+        end if
 
         do n = 1, nNodL
             ! upper cutoff: a_ice
@@ -126,11 +147,34 @@ contains
                 a_ice(n)  = 0.0_WP
             end if
         end do
+
+        ! conserving cut_off: the deleted ice and snow (before - after)
+        if (ice%thermo%cutoff_conserve) then
+            do n = 1, nNodL
+                dm_ice_cut(n)  = dm_ice_cut(n)  - m_ice(n)
+                dm_snow_cut(n) = dm_snow_cut(n) - m_snow(n)
+            end do
+        end if
     end subroutine cut_off
 
     !___________________________________________________________________________
     ! thermodynamics (FESOM2 ice_thermo_oce.F90:148). For every surface node extract the
     ! inputs, call therm_ice, and write the prognostic ice state + air-sea fluxes back.
+    !
+    ! CONSERVING CUT_OFF (ice%thermo%cutoff_conserve, FESOM3_ICE_CUTOFF_CONSERVE=1; not in
+    ! FESOM2). The ice and snow that cut_off deleted at a node in this step (dm_ice_cut,
+    ! dm_snow_cut) melt at that node in this step, as if therm_ice had melted them. After
+    ! therm_ice, with the melt rates dhcut = dm_ice_cut/ice_dt and dhsncut = dm_snow_cut/ice_dt:
+    !   fwice_c = dhcut*rhoice*inv_rhowat          (use_virt_salt: *(rsss-Sice)/rsss, therm_ice's form)
+    !   fwsnw_c = dhsncut*rhosno*inv_rhowat
+    !   fw = fw + fwice_c + fwsnw_c;  fwice = fwice + fwice_c;  fwsnw = fwsnw + fwsnw_c
+    !   rsf = rsf + fwice_c*Sice                   (.not. use_virt_salt only, as therm_ice)
+    !   thdgr = thdgr - dhcut;  thdgrsn = thdgrsn - dhsncut   (negative growth)
+    ! So the ocean's salt gains Sice*rhoice*inv_rhowat*dm_ice_cut per unit area, what the ice
+    ! lost, and oce_fluxes' zstar freshwater balance (-thdgr*rhoice*inv_rhowat - thdgrsn*rhosno*
+    ! inv_rhowat) sees the cut ice and snow exactly as it sees thermodynamic melt: ocean + ice
+    ! salt closes to roundoff under zstar. The latent heat is NOT taken from the ocean (FESOM2's
+    ! cut_off never accounted heat): on CORE2 ~3.5e-6 K a year of ocean warming equivalent.
     subroutine thermodynamics(ice, mesh, atm, partit)
         type(t_ice),     intent(inout), target :: ice
         type(t_mesh),    intent(in),    target :: mesh
@@ -142,6 +186,7 @@ contains
         real(kind=WP) :: ug,ustar,T_oc,S_oc,h_ml,t,ch,ce,ch_i,ce_i,fw,fwice,fwsnw,ehf,evap
         real(kind=WP) :: ithdgr, ithdgrsn, ithdgra, iflice, hflatow, hfsenow, hflwrdout
         real(kind=WP) :: subli, hfswrow, hflwrow, hfradow, lid_clo, geolon, geolat
+        real(kind=WP) :: dhcut, dhsncut, fwice_c, fwsnw_c   ! conserving cut_off
         !_______________________________________________________________________
         real(kind=WP), dimension(:), pointer :: u_ice, v_ice, a_ice, m_ice, m_snow
         real(kind=WP), dimension(:), pointer :: a_ice_old, m_ice_old, m_snow_old
@@ -245,6 +290,26 @@ contains
                            evap_in, fw, fwice, fwsnw, ehf, evap, rsf, ithdgr, ithdgrsn, ithdgra, iflice, &
                            hflatow, hfsenow, hflwrdout, hfswrow, hflwrow, hfradow, lid_clo, geolon, geolat, subli, &
                            atm%use_virt_salt)
+
+            ! conserving cut_off: the ice and snow cut_off deleted here melt in this step
+            ! (the rule in the header above; latent heat not returned)
+            if (ice%thermo%cutoff_conserve) then
+                dhcut   = ice%thermo%dm_ice_cut(i)/ice%ice_dt
+                dhsncut = ice%thermo%dm_snow_cut(i)/ice%ice_dt
+                if (.not. atm%use_virt_salt) then
+                    fwice_c = dhcut*ice%thermo%rhoice*ice%thermo%inv_rhowat
+                    fwsnw_c = dhsncut*ice%thermo%rhosno*ice%thermo%inv_rhowat
+                    rsf     = rsf + fwice_c*ice%thermo%Sice
+                else
+                    fwice_c = dhcut*ice%thermo%rhoice*ice%thermo%inv_rhowat*(rsss-ice%thermo%Sice)/rsss
+                    fwsnw_c = dhsncut*ice%thermo%rhosno*ice%thermo%inv_rhowat
+                end if
+                fw       = fw + fwice_c + fwsnw_c
+                fwice    = fwice + fwice_c
+                fwsnw    = fwsnw + fwsnw_c
+                ithdgr   = ithdgr - dhcut
+                ithdgrsn = ithdgrsn - dhsncut
+            end if
 
             ! write ice thermodyn. results into arrays. backup of old values
             m_ice_old(i)  = m_ice(i)

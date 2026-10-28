@@ -347,6 +347,23 @@ halo is reconstructed with the exchange variant its in-step consumer expects. PO
 on one rank count can be read on another. (The exact reproducibility guarantees — and their one
 FESOM2-inherited limit — are in [TESTING.md](TESTING.md).)
 
+**Exact `zstar` restart (`FESOM3_RESTART_ZSTAR_EXACT=1`).** Under `zstar` three more things carry
+over between steps: the SSH stiffness values (`update_stiff_mat_ale` adds `-dhe` every step), the
+lagged `dhe`, and the geometry derived from `hnode` (`zbar_3d_n`, `Z_3d_n`, `helem`, `hnode_new`).
+With the switch the checkpoint adds two stores and the resume rebuilds the rest:
+
+- `ssh_stiff`: node-indexed, `W` values per node row, `W` = the longest row of the global matrix;
+  per row the diagonal first, then the off-diagonal entries by ascending **global** node index of
+  their column, zeros after the row's last entry; float64, stored like a 3-D node field with the
+  `W` slots as levels (dimension `nstiff`). The in-memory CSR order depends on the partition, so
+  `restart_register_stiff` maps slot to CSR position once. fesom3_jax reads and writes the same
+  layout.
+- `dhe`: element 2-D, float64, through the element decomposition.
+- On resume the driver builds the Jacobi preconditioner from the cold matrix *before*
+  `restart_read` restores the values (a straight run builds it at its first solve and keeps it,
+  and there `-dhe` is still 0). After the read every zstar resume, exact or not, derives the
+  geometry from the restored `hnode` (`hnode_new = hnode`, then `update_thickness_ale`; LESSONS L73).
+
 ### 11. Correctness decisions that make byte-identity possible
 
 Bit-for-bit agreement between two independently compiled programs is fragile; a handful of specific

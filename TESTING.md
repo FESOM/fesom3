@@ -110,7 +110,7 @@ assembled step — data flow and dispatch — is byte-faithful, not just the ker
 
 ### 5. The `ctest` self-test suite
 
-`test/CMakeLists.txt` registers **176 ctest cases**, run on the Intel and GNU builds. The core
+`test/CMakeLists.txt` registers **177 ctest cases**, run on the Intel and GNU builds. The core
 infrastructure cases:
 
 | Test | Ranks | Checks |
@@ -132,6 +132,7 @@ infrastructure cases:
 | `test_shared_elem` (+ `_corrupt`, `_badknob`, `_off`) | pi 1/2/8, pi_w 2/4, cut-outs 2, core2_w 8 | shared elements: the list `com_elem2D_shared` vs an allgather oracle (S1), its exchange and the copy-spread probe (S2), the mechanism through `update_vel` + `compute_hbar_ale` with the sync on and off (S3: divergence-sum ratio ~1e-17 vs 1e-5..4e-4); the error stops and `FESOM3_SHARED_SYNC=0` |
 | `fesom_conserve_linfs_ts` (+ `_wsplit`, `_badvalue`, `_zstar`) | 1, 2 | `linfs` with `FESOM3_LINFS_CONSERVE=TS`: heat and salt conserve to `1e-12` (§6a); an unknown value and `zstar` stop the run |
 | `fesom_conserve_linfs_vinv_shsync` | 2 | linfs, vector invariant with `rvo_upwind` 1, sea ice: divergence-sum ratio < 1e-12 and zero shared-copy spreads in every step (`FESOM3_DIVSUM_TOL`) |
+| `fesom_cutoff_conserve_pi_w` | 1, 2 | conserving sea-ice cut_off (`FESOM3_ICE_CUTOFF_CONSERVE`, §6d): `tools/run_cutoff_conserve_pi.sh` with 48 steps of a June cold start on pi_w (JRA55, production driver): zstar ocean + ice salt closes per step with the switch, loses the cut ice's salt without it; linfs with it runs; a bad value stops |
 | `fesom_icgather_det_{piw,mixcut}`, `fesom_icgather_hist_piw` | pi_w 1/2/8, nemo025mix_cut 1/2/4 | the cold-start T/S gathered by global id (`fesom_icgather`): with `FESOM3_IC_EXTRAP_DET` the np 2/4/8 IC is the np 1 one bit for bit (triangles; triangles + quads); with the historical fill the pi_w np 2 IC differs (the test's teeth) |
 
 Kernel tests from the bottom-at-vertices and momentum work (`test_vert_spline`, `test_vinv`,
@@ -158,7 +159,7 @@ The mesh-dependent hybrid cases read meshes from the hard-coded root `/work/ab09
 (`test/CMakeLists.txt`). Whether a mesh exists is decided at configure time
 (`if(EXISTS <meshes>/<mesh>/nod2d.out)`): a case whose mesh is absent is registered as DISABLED
 (ctest prints "Not Run (Disabled)"); a missing `dist_N`/`com_info` file in an existing mesh
-directory FAILS. "176/176 passed" therefore holds on a filesystem that has these meshes. The
+directory FAILS. "177/177 passed" therefore holds on a filesystem that has these meshes. The
 shared-element guards live in existing tests: `test_vinv` V13 (`uv_rhsAB` copies bitwise equal with
 the upwind blend on) and `test_ice_dyn_mixed` D6 (EVP/mEVP sigma copies bitwise equal), at np>1.
 
@@ -191,9 +192,9 @@ cd build_intel_dp && ctest --output-on-failure
 > `run_ice*_gate*`.
 >
 > The **self-consistency** gates are not oracle-dependent and remain the live net:
-> `run_conserve_pi.sh` (§6a), `run_restartroundtrip.sh`, `run_output_gate.sh` (partition
-> independence), the restart straight-vs-resume gates, `run_bottom_audit.sh` (§6a), and the
-> split-explicit gates of §6c.
+> `run_conserve_pi.sh` (§6a), `run_cutoff_conserve_pi.sh` (§6d), `run_restartroundtrip.sh`,
+> `run_output_gate.sh` (partition independence), the restart straight-vs-resume gates,
+> `run_bottom_audit.sh` (§6a), and the split-explicit gates of §6c.
 > The table below documents the gates as they were built; treat the oracle rows as history.
 
 Beyond the self-tests, byte-gates cover each subsystem as it was built. They live in `tools/` as
@@ -207,6 +208,7 @@ Beyond the self-tests, byte-gates cover each subsystem as it was built. They liv
 | Multi-rank | `run_step_gate_multirank.sh`, `run_lifecycle_fullynative_gate_multirank.sh`, `run_lifecycle_jra55_gate_multirank.sh` | pi/CORE2, 2–864 | the same fields match per gid across rank counts |
 | Output | `run_output_gate.sh`, `run_meshdiag_gate.sh` | pi, 1/2/8 | Zarr stores round-trip; mesh diagnostics match FESOM2 |
 | Restart | `run_restart_gate_core2.sh`, `run_restart_gate_multirank.sh`, `run_restartroundtrip.sh` | CORE2, 1/2/8 | resume reproduces the straight-through trajectory |
+| Restart, zstar | `run_restart_gate_zstar.sh` | pi and CORE2, 1/2/8 | with `FESOM3_RESTART_ZSTAR_EXACT=1` a `zstar` resume is bitwise the straight run, the restore round trip np 2 → 1/8 too; without the switch it is not; the error stops (§8) |
 
 Each gate is `max|Δ| = 0` at its stated anchor. As built, the np>1 restart gate admitted the
 multi-rank element floor of §1/§7; since the shared-element sync it is strict at every np (the floor
@@ -358,6 +360,36 @@ and SI linfs/zstar baselines) all run stably; after the cold-start transient SE'
 m²/s, |msl| ≤ 2.6e-16 m, laysum ≤ 2.6e-11 m, spreads 0. The 1-year SE-vs-SI twins and the SSH-phase
 timing (plan Tasks 5.2, 5.3, 5.5–5.8) are in [IMPLEMENTATION.md](IMPLEMENTATION.md) §14.
 
+### 6d. The conserving sea-ice cut_off gate
+
+**`tools/run_cutoff_conserve_pi.sh`.** FESOM2's `cut_off` deletes the ice and snow where `a_ice`
+or `m_ice` falls below 1e-9 without a flux; `FESOM3_ICE_CUTOFF_CONSERVE=1` melts them into the
+ocean in the same step (`src/ice/mod_ice_thermo.F90`: `cut_off` records the
+deleted amounts, `thermodynamics` returns their fresh water and ice salt and counts them as negative
+growth in `thdgr`/`thdgrsn`; latent heat not returned). The tool runs the production driver
+(`fesom_lifecycle_native_mr`, the physics of `tools/prod_env.sh`, SSH at the production defaults) on
+pi_w from a cold start on 1 June 1958, when the Antarctic ice edge advances and `cut_off` fires every
+step. Under zstar `FESOM3_STEP_DIAG` prints a `salt step` line per step: the ocean + ice salt
+`sum(areasvol*hnode*S) + Sice*rhoice/rhowat*sum(areasvol*m_ice)`, the residual (summed per node:
+change minus `dt*sum(areasvol*relax_salt)`) and the ice salt the conserving cut_off returned. With
+the switch the residual must stay below `1e-15` of the content per step and `1e-14` over the run;
+without it the run must lose more than `1e-14`. With `REF_BIN` (a build of the base commit) the
+switch-off runs (zstar and linfs) write checkpoints and must match it byte for byte.
+
+Measured 2026-10-24, Intel dp, 192 steps (content `4.74e19` psu m³):
+
+| run | np | max \|residual\| per step | residual over 192 steps | ice salt returned by cut_off |
+|---|---|---|---|---|
+| zstar, switch on | 1 | `8.3e2` | `-5.2e2` | `3.49e8` |
+| zstar, switch on | 2 | `1.0e3` | `+8.6e2` | `3.68e8` |
+| zstar, switch off | 1 | `1.75e7` | `-3.71e8` (days 1-4: `-1.78e7`, `-6.20e7`, `-1.89e8`, `-3.71e8`) | — |
+| zstar / linfs, switch off vs base commit | 1 | — | checkpoints: 1418 / 1418 files, none differ | — |
+
+The switch-off loss agrees with the fesom3_jax port's budget of the same start (`-3.72e8`, from
+FESOM_F's GNU oracle build, which that port reproduces bit for bit; there the whole loss is `cut_off`). The residual of a conserving step is the roundoff of the column sums (~1e3 psu m³, 2e-17
+of the content). The ctest `fesom_cutoff_conserve_pi_w` runs the same cases for 48 steps
+(np 1: max residual `6.2e2`, returned `1.78e7`; off: `-1.78e7`).
+
 ### 7. Multi-rank and partition independence
 
 Correctness across ranks is tested in two complementary ways:
@@ -401,6 +433,30 @@ steps, checkpoints, starts a *fresh process*, reads the checkpoint, and runs the
 - **Different rank count:** the state is *restored* exactly (partition-independent storage,
   `C2 ≡ C8`), after which the run continues on a physically valid — but, because element ownership
   differs, not bit-identical — trajectory.
+- **`zstar`:** the default restart set resumes a `zstar` run inexactly: the SSH stiffness values
+  (accumulating `-dhe` each step), the lagged `dhe` and the geometry derived from `hnode` start cold.
+  With `FESOM3_RESTART_ZSTAR_EXACT=1` the checkpoint adds `ssh_stiff` and `dhe` and the resume
+  rebuilds the rest (README run-variable table, IMPLEMENTATION.md §10).
+  `tools/run_restart_gate_zstar.sh` (`MESH=pi|core2`) runs N = 4 steps straight against 2 + 2 split
+  (CORE2 NCAR forcing from 1948-01-01, EVP sea ice):
+  - with the switch: checkpoint (all stores, `ssh_stiff` and `dhe` included) and live node dumps
+    `max|Δ| = 0` at np 1, 2, 8, on pi and CORE2, each with the default physics and with the
+    production ocean physics (TKE, GM + Redi, splines, vector-invariant momentum, w split, SW
+    penetration);
+  - restore round trip: the np 2 checkpoint read at np 1 and np 8 with zero steps and re-written is
+    `max|Δ| = 0`, `ssh_stiff` included (the store layout is partition-independent);
+  - without the switch (np 1) the resumed run differs after 2 resumed steps, relative
+    (`max|Δ| / max|field|`): on pi `eta_n` 7.2e-4, `temp` 1.3e-5, the EVP stresses up to 5 %; on
+    CORE2 `eta_n` 9.6e-4, `temp` 9.6e-4, `u` 8.9e-4, the EVP stresses up to 8.5 %;
+  - each restored piece is needed (pi np 1, a temporary build that skips one of them; `eta_n` relative
+    difference after 2 resumed steps): the geometry rebuild 7.2e-4, `dhe` 3.2e-5, the stiffness values
+    1.8e-5, the cold-matrix preconditioner 3.6e-6;
+  - `FESOM3_RESTART_ZSTAR_EXACT=1` on a checkpoint without the two stores stops with a message, under
+    `linfs` it is ignored with one log line, a value other than `1`/`0` stops; with the switch unset
+    the checkpoints of a `zstar` and a `linfs` run equal those of the base commit (same 27 stores,
+    `max|Δ| = 0`; pi np 1 and CORE2 np 1).
+  Cross-rank *evolution* is not bitwise for any setting (the CG reductions depend on the rank count),
+  so the cross-rank case is the restore round trip, as for `linfs`.
 
 ### 9. Results
 

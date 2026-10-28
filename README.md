@@ -80,6 +80,21 @@ conservation, mesh-delta, regression and self-consistency gates take its place
     Without the drag χ = 0.1 blows up a cold-started CORE2 run after about 7 days (a shelf mode fed
     through the sea ice).
   - See [IMPLEMENTATION.md](IMPLEMENTATION.md) §14.
+- **Conserving sea-ice cut_off (`FESOM3_ICE_CUTOFF_CONSERVE=1`, opt-in).** FESOM2's `cut_off` deletes
+  the ice and snow where `a_ice` or `m_ice` falls below 1e-9 without any flux. The ice FCT limits
+  `a_ice` and `m_ice` separately and leaves `a_ice` ~ 0 with `m_ice` 1e-5 to 2e-4 m at open-water nodes
+  ahead of a moving ice edge. On CORE2 this deletes about 65 km³ of ice a year, which under zstar is
+  -2.3e11 psu m³ of ocean + ice salt a year (-4.8e-9 of the content). With the switch, `cut_off`
+  records the deleted ice and snow per node and the thermodynamics of the same step hands them to the
+  ocean as melt: their fresh water, the ice salt (zstar: `real_salt_flux`; linfs: the virtual-salt
+  form of `therm_ice`) and negative growth in `thdgr`/`thdgrsn`, which the zstar freshwater balance
+  uses. Ocean + ice salt then closes to roundoff under zstar. The latent heat is not taken from the
+  ocean (FESOM2's `cut_off` never accounted heat): about 3.5e-6 K a year of ocean warming on CORE2.
+  Off (the default) the model is bit-identical to before. Gate: `tools/run_cutoff_conserve_pi.sh`
+  ([TESTING.md](TESTING.md) §6d).
+- **Exact `zstar` restart (opt-in):** with `FESOM3_RESTART_ZSTAR_EXACT=1` a `zstar` checkpoint also
+  holds the SSH stiffness values and `dhe`, and a resumed run matches the straight run bit for bit.
+  Without it a `zstar` resume continues from the cold stiffness matrix and geometry (not bitwise).
 
 Production runs on Levante with these changes conserve volume to roundoff: CORE2 on 512 ranks (about
 95 model years per day) and the NEMO ORCA025 quad mesh on 1280 ranks (about 29 model years per day).
@@ -218,8 +233,9 @@ export FESOM3_STEP_PER_DAY=48                        # 1800 s on CORE2; 72 (1200
 
 **Where the knobs are defined.** The authoritative, always-current list of run variables is the
 environment block at the top of **`src/drivers/fesom_lifecycle_native_mr.F90`** (each is read with
-`get_environment_variable`); the SSH solver knobs, `FESOM3_SHARED_SYNC` and `FESOM3_LINFS_CONSERVE` in the table
-below are read where they act (the solver, `src/infra/mod_shared_elem.F90`, `src/oce/oce_ale_tracer.F90`). The `tools/*.sbatch` and `tools/run_lifecycle_*.sh` scripts are working
+`get_environment_variable`); the SSH solver knobs, `FESOM3_SHARED_SYNC`, `FESOM3_LINFS_CONSERVE` and
+`FESOM3_RESTART_ZSTAR_EXACT` in the table below are read where they act (the solver,
+`src/infra/mod_shared_elem.F90`, `src/oce/oce_ale_tracer.F90`, `src/io/mod_io_restart.F90`). The `tools/*.sbatch` and `tools/run_lifecycle_*.sh` scripts are working
 examples. The most common variables:
 
 | Variable | Meaning |
@@ -233,6 +249,7 @@ examples. The most common variables:
 | `FESOM3_NSTEPS` | number of time steps (or use `FESOM3_RUN_LENGTH` + `FESOM3_RUN_UNIT`) |
 | `FESOM3_STEP_PER_DAY` | time steps per day (default `48` = 1800 s; CORE2 uses 48, finer meshes need more) |
 | `FESOM3_WHICHEVP` | sea-ice solver: `0` = EVP, `1` = mEVP |
+| `FESOM3_ICE_CUTOFF_CONSERVE` | sea-ice `cut_off`: `1` = conserving (the ice and snow it deletes melt into the ocean in the same step, with their fresh water and ice salt), `0` or unset = FESOM2's (deleted without a flux); any other value stops. See *Changes since v1* above |
 | `FESOM3_WHICH_ALE` | vertical coordinate: `linfs` (default) or `zstar`. `zlevel` is not ported, and the driver does not reject it: do not use it |
 | `FESOM3_LINFS_CONSERVE` | `S`, `T` or `TS` (unset = FESOM2): with `linfs` the layers are fixed while `w` at the surface is not zero, so the vertical advection moves tracer through the surface and the ocean's salt and heat content drift (CORE2 JRA55-do, Dmitry's setup: whole-ocean S -5.5e-5 in the cold-start year, ~-2e-6 a year later). This returns that flux, summed over the ocean, as a uniform surface flux of S and/or T every step (MITgcm's `linFSConserveTr`). `linfs` and the FCT limiter only. Read in `src/oce/oce_ale_tracer.F90` |
 | `FESOM3_FER_GM`, `FESOM3_REDI` | Gent–McWilliams bolus advection, Redi isopycnal diffusion |
@@ -243,8 +260,9 @@ examples. The most common variables:
 | `FESOM3_WSPLIT`, `FESOM3_WSPLIT_MAXCFL`, `FESOM3_WSPLIT_MINCFL` | Courant-dependent explicit/implicit w split; explicit CFL cap (default `1.0`) and onset (default half the cap) |
 | `FESOM3_OUTPUT`, `FESOM3_OUTPUT_EVERY` | output directory (enables output) and step cadence |
 | `FESOM3_RESTART`, `FESOM3_RESTART_LENGTH`, `FESOM3_RESTART_UNIT` | checkpoint directory and cadence |
+| `FESOM3_RESTART_ZSTAR_EXACT` | `1` = exact `zstar` resume: the checkpoint adds the stores `ssh_stiff` (SSH stiffness values) and `dhe`, and the resume rebuilds the `zstar` geometry from `hnode`; set it for the run that writes and the run that reads. `0` or unset = off (default; a `zstar` resume then differs from the straight run). Ignored with one log line under `linfs`, whose resume is exact anyway; resuming a checkpoint without the two stores with it on stops. Read in `src/io/mod_io_restart.F90` |
 | `FESOM3_SHARED_SYNC` | shared border elements: `1` (default) = every step the other owners take the designated owner's `uv` (no volume leak, exact np>1 restarts); `0` = off, the old unsynced copies (A/B comparisons only). Read in `src/infra/mod_shared_elem.F90` |
-| `FESOM3_STEP_DIAG` | per-step global diagnostic line (max\|eta\|, max\|uv\|, ice, Tmax, Smax, and the shared-element numbers `divsum=`, `dUV=`, `dAB=`, `dsig=`); two extra collectives per step, off by default |
+| `FESOM3_STEP_DIAG` | per-step global diagnostic line (max\|eta\|, max\|uv\|, ice, Tmax, Smax, and the shared-element numbers `divsum=`, `dUV=`, `dAB=`, `dsig=`); two extra collectives per step, off by default. Under zstar a second line per step, `salt step`: the ocean + sea-ice salt content, the step's residual (change minus the balanced SSS restoring; roundoff when salt is conserved) and the ice salt the conserving cut_off returned (one more collective) |
 | `FESOM3_SSH_SOLTOL`, `FESOM3_SSH_MAXITER` | SSH solver tolerance and iteration cap — test/diagnostic only, read in `src/oce/oce_ssh_solve.F90` (defaults `1e-5`, `2000`) |
 | `FESOM3_SSH_SE` | free surface: `0` (default) = semi-implicit CG solve, `1` = split-explicit barotropic subcycling (production driver and `fesom_conserve` only; AB2, no cavities). Read in `src/oce/oce_ssh_se.F90`, like the knobs below |
 | `FESOM3_SE_M`, `FESOM3_SE_M_FORCE` | substeps per baroclinic step (default `50`); the run stops if M is below the CFL-guard minimum printed at startup (CORE2 at 1800 s: 40 at the default χ 0.1, 38 at χ 0.05, 48 at χ 0.25) unless `FESOM3_SE_M_FORCE=1` |
@@ -262,7 +280,8 @@ examples. The most common variables:
 **Restart.** Set `FESOM3_RESTART=<dir>` to write checkpoints (cadence via `FESOM3_RESTART_LENGTH` /
 `FESOM3_RESTART_UNIT`). On the next launch, if a complete checkpoint is found under that directory
 (a `restart.latest` pointer to a folder containing `checkpoint.json`), the run resumes from it
-byte-exactly; otherwise it cold-starts. See [IMPLEMENTATION.md](IMPLEMENTATION.md) §I/O.
+byte-exactly; otherwise it cold-starts. Under `FESOM3_WHICH_ALE=zstar` the resume is byte-exact only
+with `FESOM3_RESTART_ZSTAR_EXACT=1` (table above). See [IMPLEMENTATION.md](IMPLEMENTATION.md) §I/O.
 
 ---
 

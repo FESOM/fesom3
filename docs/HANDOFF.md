@@ -5,6 +5,15 @@ Full pre-M2.12 milestone detail + the per-gate recipes live in [`HANDOFF-archive
 
 ## Where we are
 
+- **Exact zstar restart ✅ (2026-10-24, branch `zstar-exact-restart`, opt-in `FESOM3_RESTART_ZSTAR_EXACT=1`):**
+  under zstar the checkpoint adds `ssh_stiff` (stiffness values in a partition-independent node-row
+  layout, the format fesom3_jax shares) and `dhe`; the resume builds the SSH preconditioner from the
+  cold matrix before `restart_read`; the geometry rebuild from `hnode` after it is main's (L73), for
+  every zstar resume. Gate `tools/run_restart_gate_zstar.sh`: straight == split
+  `max|Δ|=0` at np 1/2/8 on pi and CORE2, restore round trip np 2 → 1/8 exact; without the switch not
+  bitwise (TESTING.md §8, LESSONS L78). Unset: checkpoints and runs bit-identical to `main`. Follow-ups:
+  the SP branch stores `ssh_stiff%values_full` (comment in `restart_register_stiff`); split-explicit +
+  zstar does not use the matrix and needs only the geometry rebuild.
 - **Split-explicit barotropic solver — Stages 0–6 DONE (2026-10-19, branch `split-explicit`, worktree
   `/work/ab0995/a270088/fesom3_se`, unpushed):** SE subcycling after Sergey's notes (SESM, `FESOM3_SSH_SE=1`), linfs
   and zstar, any np, exact restarts; SE off byte-identical to main. Task 5.4 added the barotropic bottom drag (kept);

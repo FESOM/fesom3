@@ -65,12 +65,16 @@ module oce_ssh_solve
     implicit none
     private
     public :: solve_ssh_ale
+    ! The zstar exact resume (FESOM3_RESTART_ZSTAR_EXACT, fesom_lifecycle_native_mr) builds the
+    ! preconditioner itself, from the cold matrix, before restart_read restores the stiffness values.
+    public :: ssh_solve_preconditioner
 
 contains
 
     !===========================================================================
     subroutine solve_ssh_ale(dynamics, mesh, n_iter, partit)
-        ! Build the preconditioner on the first call, then CG-solve for d_eta.
+        ! Build the preconditioner on the first call (unless the caller already built it),
+        ! then CG-solve for d_eta.
         ! n_iter (optional, NOT part of FESOM2's signature) returns the CG iteration
         ! count for the driver's non-vacuity diagnostic only.
         type(t_dyn),  intent(inout), target  :: dynamics
@@ -79,7 +83,7 @@ contains
         type(t_partit), intent(in), optional :: partit
         logical, save :: lfirst = .true.
 
-        if (lfirst) call ssh_solve_preconditioner(dynamics, mesh, partit)
+        if (.not. allocated(mesh%ssh_stiff%pr_values)) call ssh_solve_preconditioner(dynamics, mesh, partit)
         if (lfirst) call ssh_solve_env_overrides(dynamics, partit)
         call ssh_solve_cg(dynamics%d_eta, dynamics%ssh_rhs, dynamics, mesh, n_iter, partit)
         if (is_multirank(partit)) call exchange_nod(dynamics%d_eta, partit)  ! FESOM2 :3308
@@ -129,7 +133,9 @@ contains
     subroutine ssh_solve_preconditioner(dynamics, mesh, partit)
         ! Diagonal (Jacobi) preconditioner: pr_values(row) = 1/a_rr over the OWNED rows.
         ! M^-1 r is then purely local (no halo columns), so neither the diagonal nor r
-        ! needs a halo exchange.
+        ! needs a halo exchange. Built ONCE and then frozen: under zstar the matrix moves
+        ! (update_stiff_mat_ale) but pr_values keeps the diagonal of the first solve, which
+        ! is the cold matrix (step 1 adds -dhe = 0).
         type(t_dyn),  intent(inout), target :: dynamics
         type(t_mesh), intent(inout), target :: mesh
         type(t_partit), intent(in), optional :: partit
