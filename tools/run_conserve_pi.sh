@@ -98,6 +98,12 @@
 #       (FESOM3_DIVSUM_TOL). Measured 2026-10-28 (pi, 1000 steps, np 1, CG: plain / w split / production
 #       set): trim <= 2.73e-12 m^2/s, etacomp <= 3.34e-14 m, heat/salt drift <= 2.4e-14, divsum <= 1.0e-15;
 #       two identical runs print identical logs.
+#   zstar + RK3 (Task 20), np 1 and 8 -> the RK3 stage geometry under zstar with the HARD conservation gate of
+#       the zstar cases (heat, salt, volume) and the RK3_CHECK gate; with SE also the SE_CHECK gate and the run
+#       maxima of SE_CHECK_TAIL (laysum, w1, hlaw) below the SE_Z_TOL_* of the zstar SE block. Configs: CG and
+#       SE, default and the production ocean set with the w split, two LO substeps (the interpolated
+#       thicknesses of Task 19).
+#
 # Measured zstar baseline on pi, 20 steps, before any bottom change:
 #   np=1  heat -4.87e-15  salt -1.66e-14
 #   np=2  heat  0.00e+00  salt -7.80e-15
@@ -383,6 +389,56 @@ SE 8 $RK3_SE FESOM3_DIVSUM_TOL=$TOL
 SE-qq 1 $RK3_SE FESOM3_SE_VISC_AH=0 FESOM3_SE_BOTTDRAG=0
 SE-qq 8 $RK3_SE FESOM3_SE_VISC_AH=0 FESOM3_SE_BOTTDRAG=0 FESOM3_DIVSUM_TOL=$TOL
 SE-prod 8 $RK3_SE $PROD_OCEAN $WSPLIT_CFG FESOM3_DIVSUM_TOL=$TOL
+CFG
+
+# RK3 ZSTAR: zstar + FESOM3_RK3=1 with the hard conservation gate, RK3_CHECK and the SE checks (header).
+RK3_Z_ENV="FESOM3_WHICH_ALE=zstar FESOM3_RK3=1 FESOM3_RK3_CHECK=1"
+while read -r -u 3 label np vars; do
+    [ -z "$label" ] && continue
+    echo "=== zstar + RK3 + $label, np=$np, $NSTEPS steps (conservation gate, tol=$TOL; RK3_CHECK gate) ==="
+    se=0; case " $vars " in *" FESOM3_SSH_SE=1 "*) se=1 ;; esac
+    rc=0
+    out=$(env $RK3_Z_ENV $vars FESOM3_CONSERVE_TOL="$TOL" mpirun $MPIFLAGS -n "$np" "$BIN" < /dev/null 2>&1) || rc=$?
+    { echo "$out" | grep -vE '^(RK3_CHECK|SE_CHECK|SE_CHECK_TAIL) ' || true; } | tail -9
+    echo "$out" | awk -v ns="$NSTEPS" -v se="$se" -v tt="$RK3_TOL_TRIM" -v te="$RK3_TOL_ETACOMP" \
+                      -v ste="$SE_Z_TOL_ETACOMP" -v stt="$SE_Z_TOL_TRIM" -v stm="$SE_Z_TOL_MSL" \
+                      -v tl="$SE_Z_TOL_LAYSUM" -v tw="$SE_Z_TOL_W1" -v th="$SE_Z_TOL_HLAW" '
+        /^RK3_CHECK / { n++
+                        for (i = 3; i <= NF; i++) { split($i, kv, "="); v = kv[2] + 0; if (v < 0) v = -v
+                                                    if (v > mx[kv[1]]) mx[kv[1]] = v } }
+        /^SE_CHECK / || /^SE_CHECK_TAIL / {
+                        if ($1 == "SE_CHECK") m++; else mt++
+                        for (i = 3; i <= NF; i++) { split($i, kv, "="); v = kv[2] + 0; if (v < 0) v = -v
+                                                    if (v > sx[kv[1]]) sx[kv[1]] = v } }
+        END { printf "run_conserve_pi: RK3_CHECK max over %d steps: trim1=%.3e trim2=%.3e trim3=%.3e trimM=%.3e " \
+                     "etacomp=%.3e maxu=%.3e nbad=%d cflh=%.3e cflz=%.3e (tol %s %s)\n", n, mx["trim1"], mx["trim2"], \
+                     mx["trim3"], mx["trimM"], mx["etacomp"], mx["maxu"], mx["nbad"], mx["cflh"], mx["cflz"], tt, te
+              ok = (n == ns && mx["trim1"] <= tt + 0 && mx["trim2"] <= tt + 0 && mx["trim3"] <= tt + 0 &&
+                    mx["trimM"] <= tt + 0 && mx["etacomp"] <= te + 0 && mx["nbad"] == 0)
+              if (se == 1) {
+                  printf "run_conserve_pi: SE_CHECK max over %d steps: etacomp=%.3e trim=%.3e |msl|=%.3e " \
+                         "spreadU=%.3e spreadUm=%.3e; SE_CHECK_TAIL over %d: laysum=%.3e w1=%.3e hlaw=%.3e\n", m, \
+                         sx["etacomp"], sx["trim"], sx["msl"], sx["spreadU"], sx["spreadUm"], mt, sx["laysum"], \
+                         sx["w1"], sx["hlaw"]
+                  ok = ok && m == ns && mt == ns && sx["etacomp"] <= ste + 0 && sx["trim"] <= stt + 0 &&
+                       sx["msl"] <= stm + 0 && sx["spreadU"] == 0 && sx["spreadUm"] == 0 &&
+                       sx["laysum"] <= tl + 0 && sx["w1"] <= tw + 0 && sx["hlaw"] <= th + 0
+              }
+              exit !ok }' || rc=1
+    if [ "$rc" -ne 0 ]; then
+        echo "run_conserve_pi: FAILED (zstar+RK3+$label np=$np)"; fail=1
+    fi
+done 3<<CFG
+CG 1
+CG 8 FESOM3_DIVSUM_TOL=$TOL
+CG-prod 1 $PROD_OCEAN $WSPLIT_CFG
+CG-prod 8 $PROD_OCEAN $WSPLIT_CFG
+lonsub2 1 FESOM3_RK3_LO_NSUB=2 $WSPLIT_CFG
+lonsub3 8 FESOM3_RK3_LO_NSUB=3 $WSPLIT_CFG
+SE 1 $RK3_SE
+SE 8 $RK3_SE
+SE-prod 1 $RK3_SE $PROD_OCEAN $WSPLIT_CFG
+SE-prod 8 $RK3_SE $PROD_OCEAN $WSPLIT_CFG
 CFG
 
 if [ "$fail" -ne 0 ]; then
