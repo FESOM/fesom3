@@ -101,7 +101,8 @@ program fesom_lifecycle_native_mr
     use mod_forcing_other,  only: read_other_NetCDF   ! runoff + SSS climatology read
     use oce_initial_state,  only: t_ic3d_config, do_ic3d, ic3d_extrap_from_env
     use oce_muscl_adv,      only: muscl_adv_init
-    use oce_ssh_rhs,        only: init_stiff_mat_ale
+    use oce_ssh_rhs,        only: init_stiff_mat_ale, stiff_full_seed   ! seed: single-precision checkpoint
+    use oce_ale_tracer,     only: tracer_carry_alloc                    ! single-precision checkpoint
     use oce_ssh_solve,      only: ssh_solve_preconditioner   ! zstar exact resume (cold-matrix preconditioner)
     use mod_step_oce,       only: step_oce
     use oce_ssh_se,         only: se_init
@@ -987,8 +988,14 @@ program fesom_lifecycle_native_mr
     ! matrix before restart_read replaces its values (a straight run builds it at its first solve,
     ! where step 1 adds -dhe = 0, and keeps it), (2) rebuilds zbar_3d_n/Z_3d_n/helem/hnode_new from
     ! the restored hnode after it. Then the resumed run is bitwise the straight one.
+    ! Single precision: the checkpoint also holds the tracer carry and (zstar exact restart) the real64
+    ! stiffness accumulator, which the first step would allocate; allocate them here (a zero carry,
+    ! values_full seeded from the cold matrix: the bits the first step would give) so the registry can
+    ! point at them. Both calls are no-ops in double precision.
     if (do_restart) then
         call restart_init(rst, mesh, partit)
+        call tracer_carry_alloc(tracers)
+        if (rst%zstar_exact .and. trim(which_ALE) == 'zstar') call stiff_full_seed(mesh)
         call restart_register_state(rst, dyn, tracers, ice, mesh, mix_scheme=mix_scheme_nmb, partit=partit)
         if (partit%mype == 0) write(*,'(a,i0,a)') &
             'restart: registered ', rst%nf, ' prognostic fields -> '//trim(RestartOutPath)

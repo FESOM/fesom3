@@ -231,7 +231,8 @@ scalars, the SSH stiffness accumulator, the TKE column solve, the tracer tendenc
 layer thickness `hnode`/`hnode_new` — plus the single-precision-only algorithms (point-slope forcing
 interpolation, FCT low-order tendency in flux form, tracer carry). In double precision every `WP_full`
 cast is the identity and the single-precision algorithms are preprocessor-guarded, so the DP build stays
-bit-identical. The full policy, the PR mapping and the validation are in
+bit-identical. A single-precision checkpoint holds that state exactly (`hnode` and the stiffness
+accumulator in real64, the tracer carry), so a single-precision resume is bitwise the straight run (§10). The full policy, the PR mapping and the validation are in
 `docs/plans/2026-10-19-single-precision.md`.
 
 ### 7. Mesh-arity generalization
@@ -363,6 +364,17 @@ With the switch the checkpoint adds two stores and the resume rebuilds the rest:
   `restart_read` restores the values (a straight run builds it at its first solve and keeps it,
   and there `-dhe` is still 0). After the read every zstar resume, exact or not, derives the
   geometry from the restored `hnode` (`hnode_new = hnode`, then `update_thickness_ale`; LESSONS L73).
+
+**Single-precision checkpoints.** Besides the WP prognostic fields, a single-precision step carries
+`hnode` (real64), under the exact zstar restart the real64 stiffness accumulator
+`ssh_stiff%values_full`, and the tracer carry (the float32 rounding residual of each tracer write,
+upstream #1206). The checkpoint holds all three: `hnode` and `ssh_stiff` go through real64
+redistribution and read paths (`mod_io_decomp`, `mod_io_zarr`, compiled in single precision only), and
+the carry is written as `carry_t` and `carry_s` (float32, owned nodes; the names fesom3_jax uses). The
+lifecycle driver allocates the carry and seeds `values_full` before the restart registry, as the first
+step would. A checkpoint without the carry stores (an older or upstream one) resumes with a zero carry
+and a log line saying the resume is not exact. Upstream FESOM2's restart rounds `hnode` and omits the
+other two. In double precision the stores and their bits are unchanged (LESSONS L79).
 
 ### 11. Correctness decisions that make byte-identity possible
 

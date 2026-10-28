@@ -5,14 +5,22 @@ Full pre-M2.12 milestone detail + the per-gate recipes live in [`HANDOFF-archive
 
 ## Where we are
 
+- **Exact single-precision restart (2026-10-28, branch `sp-restart-exact` from `single-precision-main`,
+  worktree `/work/ab0995/a270088/fesom3_sp_restart`):** the SP checkpoint keeps `hnode` and (zstar exact)
+  `ssh_stiff%values_full` in real64 (real64 `decomp_redistribute`/`decomp_gather`/`zarr_read_chunk`,
+  SP only) and adds the tracer carry as `carry_t`/`carry_s` (fesom3_jax's stores); the driver allocates
+  the carry and seeds `values_full` before the registry. SP restart gates `max|Δ| = 0` (core2 linfs CG +
+  SE np 1/2, zstar pi np 1/2/8 + CORE2 np 2/8, multirank 2 → 8); DP bit-identical to the base (ctest
+  191/191, checkpoint pairs, restart gates). TESTING.md §8, LESSONS L79. A checkpoint without the carry
+  stores resumes with a zero carry (log line).
 - **Exact zstar restart ✅ (2026-10-24, branch `zstar-exact-restart`, opt-in `FESOM3_RESTART_ZSTAR_EXACT=1`):**
   under zstar the checkpoint adds `ssh_stiff` (stiffness values in a partition-independent node-row
   layout, the format fesom3_jax shares) and `dhe`; the resume builds the SSH preconditioner from the
   cold matrix before `restart_read`; the geometry rebuild from `hnode` after it is main's (L73), for
   every zstar resume. Gate `tools/run_restart_gate_zstar.sh`: straight == split
   `max|Δ|=0` at np 1/2/8 on pi and CORE2, restore round trip np 2 → 1/8 exact; without the switch not
-  bitwise (TESTING.md §8, LESSONS L78). Unset: checkpoints and runs bit-identical to `main`. Follow-ups:
-  the SP branch stores `ssh_stiff%values_full` (comment in `restart_register_stiff`); split-explicit +
+  bitwise (TESTING.md §8, LESSONS L78). Unset: checkpoints and runs bit-identical to `main`. In single
+  precision the store holds `ssh_stiff%values_full` (branch `sp-restart-exact`, L79); split-explicit +
   zstar does not use the matrix and needs only the geometry rebuild.
 - **Split-explicit barotropic solver — Stages 0–6 DONE (2026-10-19, branch `split-explicit`, worktree
   `/work/ab0995/a270088/fesom3_se`, unpushed):** SE subcycling after Sergey's notes (SESM, `FESOM3_SSH_SE=1`), linfs
