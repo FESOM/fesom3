@@ -33,6 +33,17 @@ module oce_rk3
     ! compute_ssh_rhs_ale with theta = 1, alpha = 1). step_oce stops if FESOM3_RK3=1 reaches it
     ! from a driver that did not run rk3_init (rk3_step_guard).
     !
+    ! TRACER STAGES (Task 6). The stage tracer lives in valuesAB (T*, T**), values keeps T^n until
+    ! the stage-3 solve. rk3_tracer_prep is the scratch part of init_tracers_AB on the STAGE
+    ! tracer: del_ttf* zeroed (oce_tra_adv_flux2dtracer only adds) and the elemental gradient
+    ! tr_xy of valuesAB (MUSCL and, in stage 3, the horizontal diffusion read it); no AB
+    ! interpolation, no history roll (valuesold is not RK3 state). Every stage and every tracer
+    ! calls it, stage 3 too. rk3_tracer_stage advances one stage s = 1, 2 of every tracer:
+    !     T_s h_s = T^n h^n + tau_s*D_HO(T_{s-1}; u_{s-1}, w_{s-1})
+    ! in the identity form of diff_tracers_ale's reconstruct, T_s = T^n + (D + T^n(h^n - h_s))/h_s,
+    ! which returns T^n bitwise at zero transport. Advection only: no GM, no diffusion, no
+    ! surface flux (plan D8). With the full w of the stage, a uniform tracer stays uniform.
+    !
     ! The parser (rk3_parse_knob) returns its verdict instead of stopping, so test/test_rk3.F90
     ! checks every rejection; the driver-facing wrappers stop through rk3_die (MPI_Abort, so no
     ! rank is left waiting in a collective).
@@ -42,14 +53,19 @@ module oce_rk3
     use mod_precision,   only: WP
     use mod_mesh,        only: t_mesh
     use mod_dyn,         only: t_dyn
+    use mod_tracer,      only: t_tracer
     use mod_partit,      only: t_partit
-    use mod_part_bounds, only: local_dims
+    use mod_part_bounds, only: local_dims, owned_bounds, is_multirank
+    use mod_halo,        only: exchange_nod, exchange_elem_full
+    use oce_tracer_grad, only: tracer_gradient_elements
+    use oce_adv_tra_driver, only: do_oce_adv_tra_rk3
     use mod_param_phys,  only: alpha, theta
     use mod_config,      only: which_ALE
     use oce_ssh_se,      only: se_env_requested
     implicit none
     private
     public :: rk3_env_requested, rk3_read_env, rk3_parse_knob, rk3_init, rk3_step_guard, rk3_die
+    public :: rk3_tracer_prep, rk3_tracer_stage
 
     ! the knobs rk3_read_env reads (FESOM3_RK3 itself: rk3_env_requested)
     character(len=20), parameter :: RK3_KNOBS(3) = [character(len=20) :: &
@@ -205,6 +221,84 @@ contains
         if (.not. present(partit)) &
             call rk3_die('FESOM3_RK3=1 but step_oce got no partit (RK3 needs it)', partit)
     end subroutine rk3_step_guard
+
+    !===========================================================================
+    subroutine rk3_tracer_prep(tr_num, tracers, mesh, partit)
+        ! The per-tracer scratch of a stage (module header): del_ttf, del_ttf_advhoriz and
+        ! del_ttf_advvert zeroed over owned + halo nodes, tr_xy (allocated on first use, as in
+        ! init_tracers_AB) = the elemental gradient of valuesAB on the owned elements, exchanged
+        ! over the full element halo.
+        integer,        intent(in)           :: tr_num
+        type(t_tracer), intent(inout)        :: tracers
+        type(t_mesh),   intent(in)           :: mesh
+        type(t_partit), intent(in), optional :: partit
+        integer :: n, nz, nElemA
+        integer :: nNodO, nNodL, nEdgeO, nElemO
+
+        call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
+        do n = 1, nNodL
+            do nz = 1, mesh%nl-1
+                tracers%work%del_ttf         (nz, n) = 0.0_WP
+                tracers%work%del_ttf_advhoriz(nz, n) = 0.0_WP
+                tracers%work%del_ttf_advvert (nz, n) = 0.0_WP
+            end do
+        end do
+        nElemA = mesh%elem2D
+        if (is_multirank(partit)) &
+            nElemA = partit%myDim_elem2D + partit%eDim_elem2D + partit%eXDim_elem2D
+        if (.not. allocated(tracers%work%tr_xy)) then
+            allocate(tracers%work%tr_xy(2, mesh%nl-1, nElemA))
+            tracers%work%tr_xy = 0.0_WP
+        end if
+        call tracer_gradient_elements(tracers%data(tr_num)%valuesAB, tracers%work%tr_xy, mesh, partit)
+        if (is_multirank(partit)) call exchange_elem_full(tracers%work%tr_xy, partit)
+    end subroutine rk3_tracer_prep
+
+    !===========================================================================
+    subroutine rk3_tracer_stage(stage, tau_s, vel, w, dynamics, tracers, mesh, partit)
+        ! Stage s = 1, 2 of every tracer (module header): valuesAB := T^n first (stage 1), then
+        ! per tracer rk3_tracer_prep, the high order of valuesAB (do_oce_adv_tra_rk3) with the
+        ! stage velocity vel and the vertical velocity w (the step passes the full w of the
+        ! stage; test_rk3 R11 also w_e, the dropped rule), the stage update on the owned nodes
+        ! and exchange_nod(valuesAB).
+        integer,        intent(in)            :: stage
+        real(kind=WP),  intent(in)            :: tau_s
+        real(kind=WP),  intent(in)            :: vel(:,:,:)
+        real(kind=WP),  intent(in)            :: w(:,:)
+        type(t_dyn),    intent(inout), target :: dynamics
+        type(t_tracer), intent(inout), target :: tracers
+        type(t_mesh),   intent(in)            :: mesh
+        type(t_partit), intent(in), optional  :: partit
+        integer :: tr_num, n, nzmin, nzmax
+        integer :: nNodO, nNodL, nEdgeO, nElemO
+        real(kind=WP), pointer :: T0(:,:), Ts(:,:)
+
+        if (stage /= 1 .and. stage /= 2) call rk3_die('rk3_tracer_stage: stage must be 1 or 2', partit)
+        call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
+        do tr_num = 1, tracers%num_tracers
+            T0 => tracers%data(tr_num)%values
+            Ts => tracers%data(tr_num)%valuesAB
+            if (stage == 1) then
+                do n = 1, nNodL
+                    Ts(:, n) = T0(:, n)
+                end do
+            end if
+            call rk3_tracer_prep(tr_num, tracers, mesh, partit)
+            call do_oce_adv_tra_rk3(tau_s, vel, w, dynamics%w_i, w, tr_num, stage, 1, &
+                                    dynamics, tracers, mesh, partit)
+            do n = 1, nNodO
+                nzmax = mesh%nlevels_nod2D(n) - 1
+                nzmin = mesh%ulevels_nod2D(n)
+                tracers%work%del_ttf(nzmin:nzmax,n) = tracers%work%del_ttf_advhoriz(nzmin:nzmax,n) &
+                                                    + tracers%work%del_ttf_advvert(nzmin:nzmax,n)
+                tracers%work%del_ttf(nzmin:nzmax,n) = tracers%work%del_ttf(nzmin:nzmax,n) + T0(nzmin:nzmax,n)* &
+                                                      (mesh%hnode(nzmin:nzmax,n)-mesh%hnode_new(nzmin:nzmax,n))
+                Ts(nzmin:nzmax,n) = T0(nzmin:nzmax,n) + &
+                                    tracers%work%del_ttf(nzmin:nzmax,n)/mesh%hnode_new(nzmin:nzmax,n)
+            end do
+            if (is_multirank(partit)) call exchange_nod(Ts, partit)
+        end do
+    end subroutine rk3_tracer_stage
 
     !===========================================================================
     ! ---- helpers (the knob helpers of oce_ssh_se are private there) ----

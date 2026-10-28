@@ -33,6 +33,20 @@ module oce_adv_tra_driver
     !  * the DVD (downgradient-variance-decomposition) diagnostic blocks are dropped (not v1).
     !  * work arrays live in tracers%work (MP); kernels take WP. At the DP/SP anchor
     !    MP==WP so the pointers/args bind by kind value; revisit for FP16 (D3).
+    !
+    ! do_oce_adv_tra_rk3 (docs/plans/2026-10-28-rk3.md, D6/D7, Technical Details §5) is the RK3
+    ! counterpart for what do_oce_adv_tra cannot do; do_oce_adv_tra itself stays untouched:
+    !  * stages 1-2: the HIGH ORDER only (no low order, no limiter) on the stage tracer in
+    !    valuesAB, horizontal MUSCL/UPW1 and vertical QR4C/UPW1 with the FULL w for every
+    !    tracer, FCT or not (no w split before stage 3), fluxes from zero, then the scatter;
+    !  * stage 3, FCT tracers: the low order in N substeps of dt/N (FESOM3_RK3_LO_NSUB), each
+    !    explicit with w_e from T^(k) and implicit with w_i (the stage-3 split), the low-order
+    !    fluxes (horizontal; vertical with the full w) averaged over the substeps; then the
+    !    high order on valuesAB (T**) minus that mean as the antidiffusive flux, the limiter
+    !    against T^n and the low-order solution T^(N), and the scatter. At N = 1 this is
+    !    do_oce_adv_tra's FCT path bitwise (test_rk3 R6); the RK3 step itself calls
+    !    do_oce_adv_tra there and for every non-FCT tracer (stage 3 with N = 1 is today's
+    !    operator on T**).
     use mod_precision,    only: WP, WP_full
     use mod_mesh,         only: t_mesh
     use mod_dyn,          only: t_dyn
@@ -46,7 +60,7 @@ module oce_adv_tra_driver
     use oce_adv_tra_flux, only: oce_tra_adv_flux2dtracer
     implicit none
     private
-    public :: do_oce_adv_tra
+    public :: do_oce_adv_tra, do_oce_adv_tra_rk3
 
 contains
 
@@ -259,5 +273,181 @@ contains
             call oce_tra_adv_flux2dtracer(dt, dttf_h, dttf_v, adv_flux_hor, adv_flux_ver, mesh, partit=partit)
         end if
     end subroutine do_oce_adv_tra
+
+    !===========================================================================
+    subroutine do_oce_adv_tra_rk3(dt, vel, w, wi, we, tr_num, stage, nsub, dynamics, tracers, mesh, partit)
+        ! RK3 tracer advection (module header). dt = the stage step tau_s (tau/3, tau/2, tau);
+        ! vel = the stage velocity at elements; w / we / wi = full / explicit / implicit vertical
+        ! velocity (stages 1-2 read w only). Accumulates into del_ttf_advhoriz / del_ttf_advvert
+        ! (the caller zeroes them, rk3_tracer_prep). nsub = the low-order substeps of stage 3.
+        real(kind=WP),  intent(in)            :: dt
+        type(t_mesh),   intent(in)            :: mesh
+        type(t_dyn),    intent(in)            :: dynamics
+        type(t_tracer), intent(inout), target :: tracers
+        integer,        intent(in)            :: tr_num, stage, nsub
+        real(kind=WP),  intent(in)            :: vel(2, mesh%nl-1, mesh%elem2D)
+        real(kind=WP),  intent(in)            :: w (mesh%nl, mesh%nod2D)
+        real(kind=WP),  intent(in)            :: wi(mesh%nl, mesh%nod2D)
+        real(kind=WP),  intent(in)            :: we(mesh%nl, mesh%nod2D)
+        type(t_partit), intent(in), optional  :: partit
+
+        real(kind=WP), pointer :: ttf(:,:), ttfAB(:,:), fct_LO(:,:)
+        real(kind=WP), pointer :: adv_flux_hor(:,:), adv_flux_ver(:,:)
+        real(kind=WP_full), pointer :: dttf_h(:,:), dttf_v(:,:)
+        real(kind=WP), pointer :: tr_xy(:,:,:)
+        real(kind=WP), pointer :: lo_T(:,:), lo_fh(:,:), lo_fv(:,:), lo_top(:)
+        real(kind=WP) :: opth, optv, rn, dts
+        integer       :: k, e, n, nz, enodes(2), el(2), nl1, nl2, nu1, nu2, nl12, nu12
+        integer       :: nNodO, nNodL, nEdgeO, nElemO
+
+        call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
+        ttf          => tracers%data(tr_num)%values
+        ttfAB        => tracers%data(tr_num)%valuesAB
+        opth         =  tracers%data(tr_num)%tra_adv_ph
+        optv         =  tracers%data(tr_num)%tra_adv_pv
+        fct_LO       => tracers%work%fct_LO
+        adv_flux_ver => tracers%work%adv_flux_ver
+        adv_flux_hor => tracers%work%adv_flux_hor
+        tr_xy        => tracers%work%tr_xy
+        dttf_h       => tracers%work%del_ttf_advhoriz
+        dttf_v       => tracers%work%del_ttf_advvert
+
+        if (stage < 1 .or. stage > 3) error stop 'do_oce_adv_tra_rk3: stage must be 1, 2 or 3'
+        if (stage < 3) then
+            ! stages 1-2: the high order of valuesAB with the full w, from zero, scattered
+            call rk3_ho_fluxes(.true.)
+            call oce_tra_adv_flux2dtracer(dt, dttf_h, dttf_v, adv_flux_hor, adv_flux_ver, mesh, partit=partit)
+            return
+        end if
+
+        ! stage 3: a non-FCT tracer is today's operator on valuesAB (T**)
+        if (trim(tracers%data(tr_num)%tra_adv_lim) /= 'FCT') then
+            call do_oce_adv_tra(dt, vel, w, wi, we, tr_num, dynamics, tracers, mesh, partit)
+            return
+        end if
+        if (nsub < 1) error stop 'do_oce_adv_tra_rk3: nsub must be >= 1'
+
+        ! ---- FCT: the low order in nsub substeps of dt/nsub (Technical Details §5) ----
+        if (.not. allocated(tracers%work%rk3_lo_T)) then
+            allocate(tracers%work%rk3_lo_T (size(fct_LO,1), size(fct_LO,2)))
+            allocate(tracers%work%rk3_lo_fh(size(adv_flux_hor,1), size(adv_flux_hor,2)))
+            allocate(tracers%work%rk3_lo_fv(size(adv_flux_ver,1), size(adv_flux_ver,2)))
+            allocate(tracers%work%rk3_lo_top(size(fct_LO,2)))
+        end if
+        lo_T   => tracers%work%rk3_lo_T
+        lo_fh  => tracers%work%rk3_lo_fh
+        lo_fv  => tracers%work%rk3_lo_fv
+        lo_top => tracers%work%rk3_lo_top
+        rn  = 1.0_WP/real(nsub, WP)
+        dts = dt/real(nsub, WP)
+        do n = 1, nNodL
+            lo_T(:, n)  = ttf(:, n)              ! T^(0) = T^n, halo-valid
+            lo_fv(:, n) = 0.0_WP
+            lo_top(n)   = 0.0_WP
+        end do
+        do e = 1, nEdgeO
+            lo_fh(:, e) = 0.0_WP
+        end do
+
+        do k = 1, nsub
+            ! explicit: horizontal upwind of T^(k-1) scattered into fct_LO, vertical upwind with w_e
+            call adv_tra_hor_upw1(vel, lo_T, mesh, adv_flux_hor, o_init_zero=.true., partit=partit)
+            do n = 1, nNodL
+                do nz = 1, mesh%nl-1
+                    fct_LO(nz,n) = 0.0_WP
+                end do
+            end do
+            do e = 1, nEdgeO
+                enodes = mesh%edges(:, e)
+                el     = mesh%edge_tri(:, e)
+                nl1 = mesh%nlevels(el(1))-1
+                nu1 = mesh%ulevels(el(1))
+                nl2 = 0; nu2 = 0
+                if (el(2) /= el(1)) then
+                    nl2 = mesh%nlevels(el(2))-1
+                    nu2 = mesh%ulevels(el(2))
+                end if
+                nl12 = max(nl1, nl2)
+                nu12 = nu1
+                if (nu2 > 0) nu12 = min(nu1, nu2)
+                do nz = nu12, nl12
+                    fct_LO(nz, enodes(1)) = fct_LO(nz, enodes(1)) + adv_flux_hor(nz, e)
+                    fct_LO(nz, enodes(2)) = fct_LO(nz, enodes(2)) - adv_flux_hor(nz, e)
+                end do
+            end do
+            call adv_tra_ver_upw1(we, lo_T, mesh, adv_flux_ver, o_init_zero=.true., partit=partit)
+            do n = 1, nNodO
+                nu1 = mesh%ulevels_nod2D(n)
+                nl1 = mesh%nlevels_nod2D(n)
+                do nz = nu1, nl1-1
+                    fct_LO(nz,n) = (lo_T(nz,n)*mesh%hnode(nz,n) &
+                                  + (fct_LO(nz,n) + (adv_flux_ver(nz,n)-adv_flux_ver(nz+1,n)))*dts/mesh%areasvol(n)) &
+                                  / mesh%hnode_new(nz,n)
+                end do
+            end do
+            ! implicit: w_i over dt/nsub, then the low-order vertical flux with the full w
+            if (dynamics%use_wsplit) then
+                call adv_tra_vert_impl(dts, wi, fct_LO, mesh, partit=partit)
+                call adv_tra_ver_upw1(w, lo_T, mesh, adv_flux_ver, o_init_zero=.true., partit=partit)
+            end if
+            ! the substep means: low-order fluxes and the surface transport
+            do e = 1, nEdgeO
+                lo_fh(:, e) = lo_fh(:, e) + rn*adv_flux_hor(:, e)
+            end do
+            do n = 1, nNodO
+                lo_fv(:, n) = lo_fv(:, n) + rn*adv_flux_ver(:, n)
+                nz = mesh%ulevels_nod2D(n)
+                lo_top(n) = lo_top(n) + rn*mesh%area(n)*(we(nz,n)*lo_T(nz,n) + wi(nz,n)*fct_LO(nz,n))
+            end do
+            ! T^(k) = the low-order solution, halo-valid for the next substep and the limiter
+            do n = 1, nNodO
+                lo_T(:, n) = fct_LO(:, n)
+            end do
+            if (is_multirank(partit)) call exchange_nod(lo_T, partit)
+        end do
+        do n = 1, nNodL
+            fct_LO(:, n) = lo_T(:, n)
+        end do
+        do e = 1, nEdgeO
+            adv_flux_hor(:, e) = lo_fh(:, e)
+        end do
+        do n = 1, nNodO
+            adv_flux_ver(:, n) = lo_fv(:, n)
+        end do
+
+        ! antidiffusive flux = HO(T**, full w) - mean LO, the limiter, the scatter
+        call rk3_ho_fluxes(.false.)
+        call oce_tra_adv_fct(dt, ttf, fct_LO, adv_flux_hor, adv_flux_ver, &
+                             tracers%work%fct_ttf_min, tracers%work%fct_ttf_max, &
+                             tracers%work%fct_plus, tracers%work%fct_minus, mesh, partit=partit)
+        call oce_tra_adv_flux2dtracer(dt, dttf_h, dttf_v, adv_flux_hor, adv_flux_ver, mesh, &
+                                      use_lo=.true., ttf=ttf, lo=fct_LO, partit=partit)
+
+    contains
+
+        subroutine rk3_ho_fluxes(init_zero)
+            ! the high-order fluxes of valuesAB with the FULL w: from zero (init_zero) or as
+            ! high order minus the fluxes already in adv_flux_hor / adv_flux_ver
+            logical, intent(in) :: init_zero
+            select case (trim(tracers%data(tr_num)%tra_adv_hor))
+            case ('MUSCL')
+                call adv_tra_hor_muscl(vel, ttfAB, mesh, opth, adv_flux_hor, tr_xy, tracers%work%edge_up_dn_tri, &
+                                       o_init_zero=init_zero, partit=partit)
+            case ('UPW1')
+                call adv_tra_hor_upw1(vel, ttfAB, mesh, adv_flux_hor, o_init_zero=init_zero, partit=partit)
+            case default
+                error stop 'do_oce_adv_tra_rk3: unknown tra_adv_hor (expected UPW1/MUSCL)'
+            end select
+            select case (trim(tracers%data(tr_num)%tra_adv_ver))
+            case ('QR4C')
+                call adv_tra_ver_qr4c(w, ttfAB, mesh, optv, adv_flux_ver, o_init_zero=init_zero, partit=partit)
+            case ('UPW1')
+                call adv_tra_ver_upw1(w, ttfAB, mesh, adv_flux_ver, o_init_zero=init_zero, partit=partit)
+            case default
+                error stop 'do_oce_adv_tra_rk3: unknown tra_adv_ver (expected UPW1/QR4C)'
+            end select
+        end subroutine rk3_ho_fluxes
+
+    end subroutine do_oce_adv_tra_rk3
 
 end module oce_adv_tra_driver

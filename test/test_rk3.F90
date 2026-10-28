@@ -27,8 +27,15 @@ program test_rk3
     !   P   pressure_bv(pressure_only=.true.) (Task 5): density_m_rho0 and hpressure equal the
     !       full call's bitwise on owned + halo nodes (the JM EOS on a hashed T/S); bvfreq,
     !       bvfreq_raw and dbsfc are not touched (a sentinel survives)
+    !   R5  a high-order stage (rk3_tracer_stage, Task 6), linfs, use_wsplit on but the stage's
+    !       full w (vert_vel_ale split=.false.), T FCT and S not (both take the HO path in
+    !       stages 1-2): a uniform T0 stays T0 to 1e-13 relative in stage 1 (u^n) and stage 2
+    !       (another velocity), w(top) of both signs (precondition asserted); open surface: the
+    !       content change of a hashed tracer is exactly tau_s times the top flux
+    !       -sum area*w(top)*T(top) (1e-13 of the content); closed surface (the depth mean
+    !       removed from u, so w(top) ~ 0): the content is conserved to 1e-13
     use mpi
-    use mod_precision,    only: WP, MP
+    use mod_precision,    only: WP, MP, WP_full
     use mod_constants,    only: density_0
     use mod_mesh,         only: t_mesh
     use mod_partit,       only: t_partit
@@ -36,11 +43,17 @@ program test_rk3
     use mod_dyn,          only: t_dyn
     use mod_part_bounds,  only: local_dims
     use mod_param_phys,   only: rvo_upwind, Fer_GM, N2smth_h
-    use oce_rk3,          only: rk3_env_requested, rk3_parse_knob
+    use oce_rk3,          only: rk3_env_requested, rk3_parse_knob, rk3_tracer_stage, rk3_tracer_prep
+    use mod_tracer,       only: t_tracer
+    use oce_muscl_adv,    only: muscl_adv_init
+    use oce_adv_tra_driver, only: do_oce_adv_tra, do_oce_adv_tra_rk3
+    use oce_adv_tra_hor,  only: adv_tra_hor_upw1, adv_tra_hor_muscl
+    use oce_adv_tra_ver,  only: adv_tra_ver_qr4c, adv_tra_ver_upw1
+    use oce_adv_tra_flux, only: oce_tra_adv_flux2dtracer
     use oce_dyn_velrhs,   only: compute_vel_rhs
     use oce_ale,          only: vert_vel_ale
     use oce_pressure_bv,  only: pressure_bv
-    use test_util,        only: setup_test_mesh, check, finish, sum_all, hval
+    use test_util,        only: setup_test_mesh, check, finish, sum_all, max_all, hval
     implicit none
 
     character(len=*), parameter :: PI_DIR = '/home/a/a270088/port2/fesom2/tests/data/MESHES/pi'
@@ -61,6 +74,7 @@ program test_rk3
     call r1c_vert_vel_hooks()
     call r2_split_off()
     call p_pressure_only()
+    call r5_ho_stage()
     call finish(partit, 'test_rk3')
 
 contains
@@ -164,6 +178,108 @@ contains
             end do
         end do
     end subroutine hashed_state
+
+    subroutine new_tracers(tr)
+        ! T (FCT) and S (not FCT), MUSCL + QR4C, the work arrays of fesom_conserve
+        type(t_tracer), intent(inout) :: tr
+        integer :: t
+        tr%num_tracers = 2
+        allocate(tr%data(2))
+        do t = 1, 2
+            allocate(tr%data(t)%values(nl-1, nNodL), tr%data(t)%valuesAB(nl-1, nNodL))
+            allocate(tr%data(t)%valuesold(2, nl-1, nNodL))
+            tr%data(t)%values = 0.0_WP; tr%data(t)%valuesAB = 0.0_WP; tr%data(t)%valuesold = 0.0_WP
+            tr%data(t)%ID = t
+            tr%data(t)%AB_order    = 2
+            tr%data(t)%tra_adv_hor = 'MUSCL'
+            tr%data(t)%tra_adv_ver = 'QR4C'
+            tr%data(t)%tra_adv_ph  = 0.0_WP
+            tr%data(t)%tra_adv_pv  = 1.0_WP
+            tr%data(t)%i_vert_diff = .true.
+        end do
+        tr%data(1)%tra_adv_lim = 'FCT'
+        tr%data(2)%tra_adv_lim = 'NONE'
+        allocate(tr%work%fct_LO(nl-1, nNodL), tr%work%adv_flux_hor(nl-1, nEdgeO), tr%work%adv_flux_ver(nl, nNodL))
+        allocate(tr%work%fct_ttf_max(nl-1, nNodL), tr%work%fct_ttf_min(nl-1, nNodL))
+        allocate(tr%work%fct_plus(nl-1, nNodL), tr%work%fct_minus(nl-1, nNodL))
+        allocate(tr%work%del_ttf(nl-1, nNodL), tr%work%del_ttf_advhoriz(nl-1, nNodL), tr%work%del_ttf_advvert(nl-1, nNodL))
+        tr%work%fct_LO = 0.0_WP; tr%work%adv_flux_hor = 0.0_WP; tr%work%adv_flux_ver = 0.0_WP
+        tr%work%fct_ttf_max = 0.0_WP; tr%work%fct_ttf_min = 0.0_WP
+        tr%work%fct_plus = 0.0_WP; tr%work%fct_minus = 0.0_WP
+        tr%work%del_ttf = 0.0_WP; tr%work%del_ttf_advhoriz = 0.0_WP; tr%work%del_ttf_advvert = 0.0_WP
+        call muscl_adv_init(tr%work, mesh, partit)
+    end subroutine new_tracers
+
+    subroutine set_tracer(T, base, amp, seed)
+        ! base + amp*hash on the wet levels of every owned + halo node (0 below the bottom)
+        real(kind=WP), intent(inout) :: T(:,:)
+        real(kind=WP), intent(in)    :: base, amp
+        integer,       intent(in)    :: seed
+        integer :: n, nz
+        T = 0.0_WP
+        do n = 1, nNodL
+            do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n) - 1
+                T(nz, n) = base + amp*hval(partit%myList_nod2D(n), nz + seed)
+            end do
+        end do
+    end subroutine set_tracer
+
+    real(kind=WP) function content(T)
+        ! sum over the owned nodes and wet layers of T*hnode*areasvol, all ranks
+        real(kind=WP), intent(in) :: T(:,:)
+        integer :: n, nz
+        content = 0.0_WP
+        do n = 1, nNodO
+            do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n) - 1
+                content = content + T(nz, n)*mesh%hnode(nz, n)*mesh%areasvol(n)
+            end do
+        end do
+        call sum_all(content, partit)
+    end function content
+
+    real(kind=WP) function maxdev(T, T0)
+        ! max over owned nodes and wet layers of |T - T0|, all ranks
+        real(kind=WP), intent(in) :: T(:,:), T0
+        integer :: n, nz
+        maxdev = 0.0_WP
+        do n = 1, nNodO
+            do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n) - 1
+                maxdev = max(maxdev, abs(T(nz, n) - T0))
+            end do
+        end do
+        call max_all(maxdev, partit)
+    end function maxdev
+
+    real(kind=WP) function top_flux(d, T)
+        ! the content rate of the high-order stage through the open surface: -sum area*w(top)*T(top)
+        type(t_dyn),   intent(in) :: d
+        real(kind=WP), intent(in) :: T(:,:)
+        integer :: n, nz
+        top_flux = 0.0_WP
+        do n = 1, nNodO
+            nz = mesh%ulevels_nod2D(n)
+            top_flux = top_flux - mesh%area(n)*d%w(nz, n)*T(nz, n)
+        end do
+        call sum_all(top_flux, partit)
+    end function top_flux
+
+    subroutine remove_depth_mean(u)
+        ! u -= sum_k helem*u / sum_k helem per element: zero depth-integrated transport
+        real(kind=WP), intent(inout) :: u(:,:,:)
+        integer :: e, nz
+        real(kind=WP) :: H, s(2)
+        do e = 1, size(u, 3)
+            H = 0.0_WP; s = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                H = H + mesh%helem(nz, e)
+                s = s + mesh%helem(nz, e)*u(:, nz, e)
+            end do
+            if (H <= 0.0_WP) cycle
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                u(:, nz, e) = u(:, nz, e) - s/H
+            end do
+        end do
+    end subroutine remove_depth_mean
 
     logical function same_elem(a, b)
         ! bitwise equal on the owned elements' wet layers
@@ -410,6 +526,84 @@ contains
                    all(db(:, 1:nNodL) == -777.0_WP), 'P pressure_only: bvfreq, bvfreq_raw, dbsfc untouched', mype)
         N2smth_h = smth_save
     end subroutine p_pressure_only
+
+    !===========================================================================
+    subroutine r5_ho_stage()
+        type(t_dyn)    :: d
+        type(t_tracer) :: tr
+        real(kind=WP), allocatable :: us(:,:,:)
+        real(kind=WP) :: dev, c0, c1, ex, wmax, rel
+        integer :: n, npos, nneg, t, mype
+        mype = partit%mype
+        call new_dyn(d, 2)
+        d%use_wsplit = .true.; d%wsplit_maxcfl = 1.0e-3_WP; d%wsplit_mincfl = 0.5e-3_WP
+        call new_tracers(tr)
+        call hashed_state(d, 41)
+        allocate(us(2, nl-1, nElemF))
+        call hashed_uv(us, 42)
+
+        ! (a) constancy through stages 1 and 2, open surface of both signs
+        call set_tracer(tr%data(1)%values, 7.3_WP, 0.0_WP, 0)
+        call set_tracer(tr%data(2)%values, 34.7_WP, 0.0_WP, 0)
+        call vert_vel_ale(d, mesh, dt, partit, split=.false.)
+        wmax = 0.0_WP; npos = 0; nneg = 0
+        do n = 1, nNodO
+            wmax = max(wmax, abs(d%w(1, n)))
+        end do
+        call max_all(wmax, partit)
+        do n = 1, nNodO
+            if (d%w(1, n) >  1.0e-6_WP*wmax) npos = npos + 1
+            if (d%w(1, n) < -1.0e-6_WP*wmax) nneg = nneg + 1
+        end do
+        call sum_all(npos, partit); call sum_all(nneg, partit)
+        call check(npos > 10 .and. nneg > 10, 'R5 precondition: w(top) of both signs', mype)
+        call rk3_tracer_stage(1, dt/3.0_WP, d%uv, d%w, d, tr, mesh, partit)
+        do t = 1, 2
+            dev = maxdev(tr%data(t)%valuesAB, tr%data(t)%values(1, 1))
+            call check(dev <= 1.0e-13_WP*tr%data(t)%values(1, 1), 'R5 stage 1 keeps a uniform tracer '// &
+                       trim(tr%data(t)%tra_adv_lim), mype)
+            if (mype == 0) write(*,'(a,i0,a,es9.2)') 'test_rk3: R5 stage 1 tracer ', t, ' max|T* - T0| = ', dev
+        end do
+        call vert_vel_ale(d, mesh, dt, partit, uv_in=us, split=.false.)
+        call rk3_tracer_stage(2, 0.5_WP*dt, us, d%w, d, tr, mesh, partit)
+        do t = 1, 2
+            dev = maxdev(tr%data(t)%valuesAB, tr%data(t)%values(1, 1))
+            call check(dev <= 1.0e-13_WP*tr%data(t)%values(1, 1), 'R5 stage 2 keeps a uniform tracer '// &
+                       trim(tr%data(t)%tra_adv_lim), mype)
+            if (mype == 0) write(*,'(a,i0,a,es9.2)') 'test_rk3: R5 stage 2 tracer ', t, ' max|T** - T0| = ', dev
+        end do
+
+        ! (b) open surface: the content change is tau_s times the top flux
+        call set_tracer(tr%data(1)%values, 10.0_WP, 4.0_WP, 5)
+        call set_tracer(tr%data(2)%values, 35.0_WP, 1.0_WP, 9)
+        call vert_vel_ale(d, mesh, dt, partit, split=.false.)
+        do t = 1, 2
+            tr%data(t)%valuesAB = tr%data(t)%values
+        end do
+        call rk3_tracer_stage(1, dt/3.0_WP, d%uv, d%w, d, tr, mesh, partit)
+        do t = 1, 2
+            c0 = content(tr%data(t)%values)
+            c1 = content(tr%data(t)%valuesAB)
+            ex = dt/3.0_WP*top_flux(d, tr%data(t)%values)
+            rel = abs(c1 - c0 - ex)/abs(c0)
+            call check(rel <= 1.0e-13_WP, 'R5 open surface: content change = tau_s*top flux', mype)
+            call check(abs(ex)/abs(c0) > 1.0e-11_WP, 'R5 open surface: the top flux is not negligible', mype)
+            if (mype == 0) write(*,'(a,i0,a,es9.2,a,es9.2)') 'test_rk3: R5 open tracer ', t, &
+                ' |dC - tau*F|/C = ', rel, ', tau*F/C = ', ex/c0
+        end do
+
+        ! (c) closed surface (depth mean removed): the content is conserved
+        call remove_depth_mean(d%uv)
+        call vert_vel_ale(d, mesh, dt, partit, split=.false.)
+        call rk3_tracer_stage(1, dt/3.0_WP, d%uv, d%w, d, tr, mesh, partit)
+        do t = 1, 2
+            c0 = content(tr%data(t)%values)
+            c1 = content(tr%data(t)%valuesAB)
+            rel = abs(c1 - c0)/abs(c0)
+            call check(rel <= 1.0e-13_WP, 'R5 closed surface: content conserved', mype)
+            if (mype == 0) write(*,'(a,i0,a,es9.2)') 'test_rk3: R5 closed tracer ', t, ' |dC|/C = ', rel
+        end do
+    end subroutine r5_ho_stage
 
     subroutine good(name, str)
         character(len=*), intent(in) :: name, str
