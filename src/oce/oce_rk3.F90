@@ -44,6 +44,17 @@ module oce_rk3
     ! which returns T^n bitwise at zero transport. Advection only: no GM, no diffusion, no
     ! surface flux (plan D8). With the full w of the stage, a uniform tracer stays uniform.
     !
+    ! MOMENTUM STAGES (Task 8). dyn%uv keeps u^n until the barotropic block of stage 3; the stage
+    ! velocity u*, u** is dyn%rk3_us. rk3_momentum_stage(s) evaluates R_s = tau_s*(Coriolis +
+    ! advection + PGF - g grad(eta^n)) on the stage velocity of s - 1 (compute_vel_rhs with
+    ! uv_in and no_history) and sets
+    !     u_s = u^n + R_s - <R_s>,     <X>_e = sum_k helem*X / H_e,  H_e = rk3_H(e)
+    ! (rk3.tex: the trim keeps the barotropic transport at U^n). rk3_viscosity takes the
+    ! horizontal viscosity of u^n over tau once (stage 1) into rk3_visc; stage 3 adds it to its
+    ! right-hand side. rk3_trim moves a velocity to a given transport, depth-uniformly. Every
+    ! update is on the owned elements, then the shared copies are synced (FESOM3_SHARED_SYNC, as
+    ! update_vel) and the eDim halo exchanged.
+    !
     ! The parser (rk3_parse_knob) returns its verdict instead of stopping, so test/test_rk3.F90
     ! checks every rejection; the driver-facing wrappers stop through rk3_die (MPI_Abort, so no
     ! rank is left waiting in a collective).
@@ -56,9 +67,11 @@ module oce_rk3
     use mod_tracer,      only: t_tracer
     use mod_partit,      only: t_partit
     use mod_part_bounds, only: local_dims, owned_bounds, is_multirank
-    use mod_halo,        only: exchange_nod, exchange_elem_full
+    use mod_halo,        only: exchange_nod, exchange_elem_full, exchange_elem, exchange_elem_shared
     use oce_tracer_grad, only: tracer_gradient_elements
     use oce_adv_tra_driver, only: do_oce_adv_tra_rk3
+    use oce_dyn_velrhs,  only: compute_vel_rhs
+    use oce_dyn_visc,    only: viscosity_filter
     use mod_param_phys,  only: alpha, theta
     use mod_config,      only: which_ALE
     use oce_ssh_se,      only: se_env_requested
@@ -66,6 +79,7 @@ module oce_rk3
     private
     public :: rk3_env_requested, rk3_read_env, rk3_parse_knob, rk3_init, rk3_step_guard, rk3_die
     public :: rk3_tracer_prep, rk3_tracer_stage
+    public :: rk3_depth, rk3_transport, rk3_momentum_stage, rk3_viscosity, rk3_trim, rk3_elem_sync
 
     ! the knobs rk3_read_env reads (FESOM3_RK3 itself: rk3_env_requested)
     character(len=20), parameter :: RK3_KNOBS(3) = [character(len=20) :: &
@@ -299,6 +313,137 @@ contains
             if (is_multirank(partit)) call exchange_nod(Ts, partit)
         end do
     end subroutine rk3_tracer_stage
+
+    !===========================================================================
+    subroutine rk3_depth(dyn, mesh, partit)
+        ! rk3_H(e) = sum_k helem over ulevels(e)..nlevels(e)-1 on the owned + eDim elements (the
+        ! loop of se_elem_depth). Every step: a restart rebuilds helem after rk3_init.
+        type(t_dyn),    intent(inout)        :: dyn
+        type(t_mesh),   intent(in)           :: mesh
+        type(t_partit), intent(in), optional :: partit
+        integer :: e, nz
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
+        real(kind=WP) :: H
+
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        do e = 1, nElemL
+            H = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                H = H + mesh%helem(nz, e)
+            end do
+            dyn%rk3_H(e) = H
+        end do
+    end subroutine rk3_depth
+
+    !===========================================================================
+    subroutine rk3_transport(vel, mesh, nelem, out)
+        ! out(:, e) = sum_k helem*vel(:, k, e) on the elements 1..nelem
+        real(kind=WP),  intent(in)  :: vel(:,:,:)
+        type(t_mesh),   intent(in)  :: mesh
+        integer,        intent(in)  :: nelem
+        real(kind=WP),  intent(out) :: out(:,:)
+        integer :: e, nz
+        real(kind=WP) :: s(2)
+        do e = 1, nelem
+            s = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                s(1) = s(1) + mesh%helem(nz, e)*vel(1, nz, e)
+                s(2) = s(2) + mesh%helem(nz, e)*vel(2, nz, e)
+            end do
+            out(:, e) = s
+        end do
+    end subroutine rk3_transport
+
+    !===========================================================================
+    subroutine rk3_elem_sync(vel, partit)
+        ! the shared-element sync of update_vel (FESOM3_SHARED_SYNC) and the eDim halo exchange
+        real(kind=WP),  intent(inout)        :: vel(:,:,:)
+        type(t_partit), intent(in), optional :: partit
+        if (.not. is_multirank(partit)) return
+        if (partit%sync_shared_elem) call exchange_elem_shared(vel, partit)
+        call exchange_elem(vel, partit)
+    end subroutine rk3_elem_sync
+
+    !===========================================================================
+    subroutine rk3_momentum_stage(stage, tau_s, dynamics, mesh, partit)
+        ! Stage s = 1, 2 of the momentum (module header): R_s from compute_vel_rhs on u^n (s = 1)
+        ! or u* (s = 2, dyn%rk3_us) into uv_rhs, then rk3_us = u^n + R_s - <R_s> on the owned
+        ! elements, synced and exchanged. Needs rk3_H (rk3_depth) and w_e (vert_vel_ale of the
+        ! stage, split off: w_e = w).
+        integer,        intent(in)            :: stage
+        real(kind=WP),  intent(in)            :: tau_s
+        type(t_dyn),    intent(inout), target :: dynamics
+        type(t_mesh),   intent(in),    target :: mesh
+        type(t_partit), intent(in), optional  :: partit
+        integer :: e, nz
+        integer :: nNodO, nNodL, nEdgeO, nElemO
+        real(kind=WP) :: s(2)
+
+        call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
+        select case (stage)
+        case (1)
+            call compute_vel_rhs(dynamics, mesh, tau_s, .true., partit, no_history=.true.)
+        case (2)
+            call compute_vel_rhs(dynamics, mesh, tau_s, .true., partit, uv_in=dynamics%rk3_us, no_history=.true.)
+        case default
+            call rk3_die('rk3_momentum_stage: stage must be 1 or 2', partit)
+        end select
+        do e = 1, nElemO
+            s = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                s(1) = s(1) + mesh%helem(nz, e)*dynamics%uv_rhs(1, nz, e)
+                s(2) = s(2) + mesh%helem(nz, e)*dynamics%uv_rhs(2, nz, e)
+            end do
+            s = s/dynamics%rk3_H(e)
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                dynamics%rk3_us(1, nz, e) = dynamics%uv(1, nz, e) + (dynamics%uv_rhs(1, nz, e) - s(1))
+                dynamics%rk3_us(2, nz, e) = dynamics%uv(2, nz, e) + (dynamics%uv_rhs(2, nz, e) - s(2))
+            end do
+        end do
+        call rk3_elem_sync(dynamics%rk3_us, partit)
+    end subroutine rk3_momentum_stage
+
+    !===========================================================================
+    subroutine rk3_viscosity(dynamics, mesh, tau, partit)
+        ! rk3_visc = the horizontal viscosity increment of u^n over tau (viscosity_filter adds
+        ! into uv_rhs, which starts at 0 here); stage 1, kept for stage 3 (and the SE forcing)
+        type(t_dyn),    intent(inout), target :: dynamics
+        type(t_mesh),   intent(in),    target :: mesh
+        real(kind=WP),  intent(in)            :: tau
+        type(t_partit), intent(in), optional  :: partit
+        dynamics%uv_rhs = 0.0_WP
+        call viscosity_filter(dynamics%opt_visc, dynamics, mesh, tau, partit)
+        dynamics%rk3_visc = dynamics%uv_rhs
+    end subroutine rk3_viscosity
+
+    !===========================================================================
+    subroutine rk3_trim(vel, target, dynamics, mesh, partit)
+        ! vel(:, k, e) += (target(:, e) - sum_k helem*vel)/H_e on the owned elements (rk3_H),
+        ! then synced and exchanged: the depth-uniform change that gives vel the transport target
+        real(kind=WP),  intent(inout)        :: vel(:,:,:)
+        real(kind=WP),  intent(in)           :: target(:,:)
+        type(t_dyn),    intent(in)           :: dynamics
+        type(t_mesh),   intent(in)           :: mesh
+        type(t_partit), intent(in), optional :: partit
+        integer :: e, nz
+        integer :: nNodO, nNodL, nEdgeO, nElemO
+        real(kind=WP) :: s(2)
+
+        call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
+        do e = 1, nElemO
+            s = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                s(1) = s(1) + mesh%helem(nz, e)*vel(1, nz, e)
+                s(2) = s(2) + mesh%helem(nz, e)*vel(2, nz, e)
+            end do
+            s = (target(:, e) - s)/dynamics%rk3_H(e)
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                vel(1, nz, e) = vel(1, nz, e) + s(1)
+                vel(2, nz, e) = vel(2, nz, e) + s(2)
+            end do
+        end do
+        call rk3_elem_sync(vel, partit)
+    end subroutine rk3_trim
 
     !===========================================================================
     ! ---- helpers (the knob helpers of oce_ssh_se are private there) ----

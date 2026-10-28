@@ -27,6 +27,17 @@ program test_rk3
     !   P   pressure_bv(pressure_only=.true.) (Task 5): density_m_rho0 and hpressure equal the
     !       full call's bitwise on owned + halo nodes (the JM EOS on a hashed T/S); bvfreq,
     !       bvfreq_raw and dbsfc are not touched (a sentinel survives)
+    !   R3  the momentum stages (rk3_momentum_stage, Task 8), momadv 1, use_wsplit on, stage 1
+    !       on u^n and stage 2 on u*: the stage transport sum_k helem*u_s equals sum_k helem*u^n
+    !       to 1e-14 of sum_k helem*|u|; u_s - (u^n + R_s) is depth-uniform (1e-15 of max|u|);
+    !       the copies of a shared element agree (np 2); rk3_trim to a hashed target gives that
+    !       transport (1e-14) by a depth-uniform change; rk3_viscosity == the viscosity_filter
+    !       increment of u^n from zero
+    !   R4  temporal order: momadv off, eta = 0, pgf = 0 (Coriolis alone), a baroclinic u^n (zero
+    !       depth mean, so the trims are idle): stage 1, stage 2 (rk3_momentum_stage) and the
+    !       stage-3 rhs on u** give, per element and layer, c^{n+1} = A(z) c^n with c = u + iv,
+    !       z = -i f tau, A = 1 + z + z^2/2 + z^3/6 (relative 1e-12, modulus and phase);
+    !       positive control: one Euler step misses A by more than 1e-3
     !   R5  a high-order stage (rk3_tracer_stage, Task 6), linfs, use_wsplit on but the stage's
     !       full w (vert_vel_ale split=.false.), T FCT and S not (both take the HO path in
     !       stages 1-2): a uniform T0 stays T0 to 1e-13 relative in stage 1 (u^n) and stage 2
@@ -68,7 +79,10 @@ program test_rk3
     use mod_dyn,          only: t_dyn
     use mod_part_bounds,  only: local_dims
     use mod_param_phys,   only: rvo_upwind, Fer_GM, N2smth_h
-    use oce_rk3,          only: rk3_env_requested, rk3_parse_knob, rk3_tracer_stage, rk3_tracer_prep
+    use oce_rk3,          only: rk3_env_requested, rk3_parse_knob, rk3_tracer_stage, rk3_tracer_prep, &
+                                rk3_depth, rk3_transport, rk3_momentum_stage, rk3_viscosity, rk3_trim
+    use oce_dyn_visc,     only: viscosity_filter
+    use mod_halo,         only: shared_copy_max_elem
     use mod_tracer,       only: t_tracer
     use oce_muscl_adv,    only: muscl_adv_init
     use oce_adv_tra_driver, only: do_oce_adv_tra, do_oce_adv_tra_rk3
@@ -99,6 +113,8 @@ program test_rk3
     call r1c_vert_vel_hooks()
     call r2_split_off()
     call p_pressure_only()
+    call r3_momentum_stage()
+    call r4_inertial()
     call r5_ho_stage()
     call r6_substep_n1()
     call r7_substeps()
@@ -555,6 +571,132 @@ contains
                    all(db(:, 1:nNodL) == -777.0_WP), 'P pressure_only: bvfreq, bvfreq_raw, dbsfc untouched', mype)
         N2smth_h = smth_save
     end subroutine p_pressure_only
+
+    !===========================================================================
+    subroutine new_rk3(d)
+        ! the RK3 stage arrays rk3_init allocates (without its env and guards)
+        type(t_dyn), intent(inout) :: d
+        allocate(d%rk3_us(2, nl-1, nElemF), d%rk3_visc(2, nl-1, nElemF), d%rk3_H(nElemL))
+        d%rk3_us = 0.0_WP; d%rk3_visc = 0.0_WP; d%rk3_H = 0.0_WP
+        d%use_rk3 = .true.; d%rk3_ready = .true.
+    end subroutine new_rk3
+
+    subroutine r3_momentum_stage()
+        type(t_dyn) :: d
+        real(kind=WP), allocatable :: s0(:,:), s1(:,:), tgt(:,:), u0(:,:,:), r(:,:,:), visc(:,:,:)
+        real(kind=WP) :: etr, edu, umax, smax, spread, c(2), ev
+        integer :: stage, e, nz, mype
+        mype = partit%mype
+        call new_dyn(d, 1)
+        call new_rk3(d)
+        d%use_wsplit = .true.; d%wsplit_maxcfl = 1.0e-3_WP; d%wsplit_mincfl = 0.5e-3_WP
+        call hashed_state(d, 101)
+        call rk3_depth(d, mesh, partit)
+        allocate(s0(2, nElemL), s1(2, nElemL), tgt(2, nElemL))
+        call rk3_transport(d%uv, mesh, nElemO, s0)
+        u0 = d%uv
+        do stage = 1, 2
+            if (stage == 1) then
+                call vert_vel_ale(d, mesh, dt, partit, split=.false., bolus=.false.)
+            else
+                call vert_vel_ale(d, mesh, dt, partit, uv_in=d%rk3_us, split=.false., bolus=.false.)
+            end if
+            call rk3_momentum_stage(stage, dt/real(4-stage, WP), d, mesh, partit)
+            r = d%uv_rhs
+            call rk3_transport(d%rk3_us, mesh, nElemO, s1)
+            etr = 0.0_WP; edu = 0.0_WP; umax = 0.0_WP; smax = 0.0_WP
+            do e = 1, nElemO
+                c = 0.0_WP
+                do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                    c = c + mesh%helem(nz, e)*abs(d%uv(:, nz, e))
+                    umax = max(umax, maxval(abs(d%uv(:, nz, e))))
+                end do
+                smax = max(smax, maxval(c))
+                etr  = max(etr, maxval(abs(s1(:, e) - s0(:, e))))
+                nz = mesh%ulevels(e)
+                c = d%rk3_us(:, nz, e) - (d%uv(:, nz, e) + r(:, nz, e))
+                do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                    edu = max(edu, maxval(abs(d%rk3_us(:, nz, e) - (d%uv(:, nz, e) + r(:, nz, e)) - c)))
+                end do
+            end do
+            call max_all(etr, partit); call max_all(edu, partit); call max_all(umax, partit); call max_all(smax, partit)
+            call check(etr <= 1.0e-14_WP*smax, 'R3 the stage transport equals sum_k helem*u^n', mype)
+            call check(edu <= 1.0e-15_WP*umax*10.0_WP, 'R3 u_s - (u^n + R_s) is depth-uniform', mype)
+            spread = shared_copy_max_elem(d%rk3_us, partit)
+            call check(spread == 0.0_WP, 'R3 shared copies of u_s agree', mype)
+            if (mype == 0) write(*,'(a,i0,a,es9.2,a,es9.2,a,es9.2)') 'test_rk3: R3 stage ', stage, &
+                ' |transport - U^n|/max = ', etr/smax, ', depth spread/umax = ', edu/umax, ', copy spread ', spread
+        end do
+        call check(all(d%uv == u0), 'R3 dyn%uv keeps u^n', mype)
+        ! rk3_trim to a hashed target
+        do e = 1, nElemL
+            tgt(1, e) = 50.0_WP*hval(partit%myList_elem2D(e), 3)
+            tgt(2, e) = 50.0_WP*hval(partit%myList_elem2D(e), 4)
+        end do
+        r = d%rk3_us
+        call rk3_trim(d%rk3_us, tgt, d, mesh, partit)
+        call rk3_transport(d%rk3_us, mesh, nElemO, s1)
+        etr = 0.0_WP; edu = 0.0_WP
+        do e = 1, nElemO
+            etr = max(etr, maxval(abs(s1(:, e) - tgt(:, e))))
+            nz = mesh%ulevels(e)
+            c = d%rk3_us(:, nz, e) - r(:, nz, e)
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                edu = max(edu, maxval(abs(d%rk3_us(:, nz, e) - r(:, nz, e) - c)))
+            end do
+        end do
+        call max_all(etr, partit); call max_all(edu, partit)
+        call check(etr <= 1.0e-14_WP*max(smax, 50.0_WP), 'R3 rk3_trim reaches the target transport', mype)
+        call check(edu <= 1.0e-14_WP, 'R3 rk3_trim changes u depth-uniformly', mype)
+        ! rk3_viscosity: the viscosity_filter increment of u^n from zero
+        call rk3_viscosity(d, mesh, dt, partit)
+        visc = d%rk3_visc
+        d%uv_rhs = 0.0_WP
+        call viscosity_filter(d%opt_visc, d, mesh, dt, partit)
+        call check(same_elem(visc, d%uv_rhs), 'R3 rk3_visc == the viscosity increment of u^n', mype)
+        ev = maxval(abs(visc(:, :, 1:nElemO)))
+        call max_all(ev, partit)
+        call check(ev > 0.0_WP, 'R3 the viscosity increment is not zero', mype)
+    end subroutine r3_momentum_stage
+
+    !===========================================================================
+    subroutine r4_inertial()
+        type(t_dyn) :: d
+        real(kind=WP), allocatable :: u0(:,:,:)
+        complex(kind=WP) :: z, A, c0, c1, ce
+        real(kind=WP) :: err, erre, zmax
+        integer :: e, nz, mype
+        mype = partit%mype
+        call new_dyn(d, 0)
+        call new_rk3(d)
+        call hashed_uv(d%uv, 111)
+        call remove_depth_mean(d%uv)
+        u0 = d%uv
+        call rk3_depth(d, mesh, partit)
+        call rk3_momentum_stage(1, dt/3.0_WP, d, mesh, partit)
+        call rk3_momentum_stage(2, 0.5_WP*dt, d, mesh, partit)
+        call compute_vel_rhs(d, mesh, dt, .true., partit, uv_in=d%rk3_us, no_history=.true.)
+        err = 0.0_WP; erre = 0.0_WP; zmax = 0.0_WP
+        do e = 1, nElemO
+            z = cmplx(0.0_WP, -mesh%coriolis(e)*dt, kind=WP)
+            zmax = max(zmax, abs(z))
+            A = 1.0_WP + z + z*z/2.0_WP + z*z*z/6.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                c0 = cmplx(u0(1, nz, e), u0(2, nz, e), kind=WP)
+                c1 = cmplx(u0(1, nz, e) + d%uv_rhs(1, nz, e), u0(2, nz, e) + d%uv_rhs(2, nz, e), kind=WP)
+                if (abs(c0) < 1.0e-6_WP) cycle
+                err = max(err, abs(c1 - A*c0)/abs(c0))
+                ce = c0*(1.0_WP + z)
+                erre = max(erre, abs(ce - A*c0)/abs(c0))
+            end do
+        end do
+        call max_all(err, partit); call max_all(erre, partit); call max_all(zmax, partit)
+        call check(zmax > 0.1_WP, 'R4 precondition: max |f tau| > 0.1', mype)
+        call check(err <= 1.0e-12_WP, 'R4 three stages = the RK3 amplification', mype)
+        call check(erre > 1.0e-3_WP, 'R4 positive control: Euler misses it', mype)
+        if (mype == 0) write(*,'(a,f6.3,a,es9.2,a,es9.2)') 'test_rk3: R4 max|f tau| = ', zmax, &
+            ', max|c - A c^n|/|c^n| = ', err, ', Euler ', erre
+    end subroutine r4_inertial
 
     !===========================================================================
     subroutine r5_ho_stage()
