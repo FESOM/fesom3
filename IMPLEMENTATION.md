@@ -222,8 +222,17 @@ work arrays; it is held at no less than single so that a future reduced-`WP` bui
 mesh to overflow. `MPI_WP` is the matching MPI datatype.
 
 At the v1 anchor, `WP = MP = 8`, so the scaffolding collapses to plain double precision and the build
-is bit-identical to FESOM2 (which hardcodes double). The mixed-precision machinery is therefore
-present but unexercised — a foundation for later work (§12), not a v1 feature.
+is bit-identical to FESOM2 (which hardcodes double).
+
+**Single precision** (`./configure.sh --precision sp`) follows upstream FESOM2's single-precision stack
+(FESOM/fesom2 #940 … #1207): `WP = MP = 4`, and a third kind **`WP_full = 8`** keeps in real64 what
+upstream keeps in real64 — the forcing time axis, global integrals and their reductions, the SSH CG
+scalars, the SSH stiffness accumulator, the TKE column solve, the tracer tendency accumulators, the
+layer thickness `hnode`/`hnode_new` — plus the single-precision-only algorithms (point-slope forcing
+interpolation, FCT low-order tendency in flux form, tracer carry). In double precision every `WP_full`
+cast is the identity and the single-precision algorithms are preprocessor-guarded, so the DP build stays
+bit-identical. The full policy, the PR mapping and the validation are in
+`docs/plans/2026-10-19-single-precision.md`.
 
 ### 7. Mesh-arity generalization
 
@@ -398,8 +407,8 @@ barotropic solver (§14, its stability defaults still open). The next milestone 
 
 **Foundations in place but not yet exercised:**
 
-- **Mixed / reduced precision.** The `WP`/`MP` split (§6) is built for it; the next step is to flip
-  `WP` to single and protect the cancellation-sensitive computations.
+- **Mixed / reduced precision.** Single precision is in place (§6; CORE2 dist_512 step time 0.83 of
+  double); half precision remains scaffolding only.
 - **Performance.** The "reproduce exactly" phase deliberately preceded optimization; one targeted
   win (the surface-forcing read) is already done. Systematic profiling and throughput (SYPD) work
   are future.

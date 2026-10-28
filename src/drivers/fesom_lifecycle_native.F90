@@ -35,7 +35,7 @@ program fesom_lifecycle_native
     !   FESOM3_NSTEPS       number of steps     (default: 3)
     use mpi
     use, intrinsic :: iso_fortran_env, only: int32, real64
-    use mod_precision,      only: WP, MP
+    use mod_precision,      only: WP, MP, WP_full
     use mod_constants,      only: density_0
     use mod_param_phys,     only: N2smth_h, alpha, theta, scale_area
     use mod_param_phys,     only: mix_coeff_PP, A_ver, K_ver, Kv0_const, mix_scheme_nmb
@@ -122,7 +122,8 @@ program fesom_lifecycle_native
     logical             :: native_forcing
     type(t_atm_forcing) :: frc
     integer             :: fld, fyear
-    real(kind=WP)       :: rdate_cold, rdate, timenew
+    real(kind=WP)       :: timenew
+    real(kind=WP_full)  :: rdate_cold, rdate
     real(kind=WP), allocatable :: nuw(:), nvw(:), nta(:), nsh(:), nswr(:), nlw(:), npr(:), nps(:)
     real(kind=WP), allocatable :: ncd(:), nch(:), nce(:), nsx(:), nsy(:), nix(:), niy(:)
     ! M3f-3b: native runoff + SSS (read once — CORE runoff is time-constant, the SSS climatology
@@ -710,7 +711,8 @@ contains
     subroutine compute_native_forcing(n)
         integer, intent(in) :: n
         integer :: nn
-        real(kind=WP) :: tnew, rcur
+        real(kind=WP) :: tnew
+        real(kind=WP_full) :: rcur
         nn = mesh%nod2D
         tnew = real(n,WP)*dt                          ! daynew=1 for n<48 (within forcing day 1)
         rcur = real(forcing_julday(fyear,1,1,'noleap'),WP) + real(1-1,WP) &

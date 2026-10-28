@@ -21,7 +21,7 @@ program fesom_advhordump
     !   FESOM3_MESH_DIR    mesh dir   (default: pi)
     !   FESOM3_ADVHOR_OUT  out path   (default: advhor_f3.bin)
     use mpi
-    use mod_precision,    only: WP, MP
+    use mod_precision,    only: WP, MP, WP_full
     use mod_mesh,         only: t_mesh
     use mod_partit,       only: t_partit
     use mod_partitioning, only: par_init, par_ex
@@ -52,16 +52,18 @@ program fesom_advhordump
     integer :: nsw, e, n, nz, nl, u, nzmin, nzmax
     real(kind=WP), allocatable :: vel(:,:,:), ttf(:,:), tr_xy(:,:,:)
     real(kind=WP), allocatable :: aflux_u(:,:)
-    real(kind=WP), allocatable :: dttf_u(:,:), dttf_v(:,:), flux_v(:,:)
+    real(kind=WP_full), allocatable :: dttf_u(:,:), dttf_v(:,:)
+    real(kind=WP), allocatable :: flux_v(:,:)
     real(kind=WP), allocatable :: wvel(:,:), aflux_vu(:,:), aflux_vq(:,:)
-    real(kind=WP), allocatable :: dttf_vu(:,:), dttf_vq(:,:), zero_h(:,:)
+    real(kind=WP_full), allocatable :: dttf_vu(:,:), dttf_vq(:,:)
+    real(kind=WP), allocatable :: zero_h(:,:)
     ! --- M1.3 FCT path ---
     real(kind=WP), allocatable :: ttfAB(:,:), aflux_mfct(:,:)
     real(kind=WP), allocatable :: fct_LO(:,:), fct_ttf_max(:,:), fct_ttf_min(:,:)
     real(kind=WP), allocatable :: fct_plus(:,:), fct_minus(:,:)
     real(kind=WP), allocatable :: adf_h(:,:), adf_v(:,:)
     real(kind=WP), allocatable :: aflux_h_ho(:,:), aflux_v_ho(:,:)
-    real(kind=WP), allocatable :: dttf_h_fct(:,:), dttf_v_fct(:,:)
+    real(kind=WP_full), allocatable :: dttf_h_fct(:,:), dttf_v_fct(:,:)
     integer :: e2, enodes(2), el(2), nl1, nl2, nu1, nu2, nl12, nu12
     real(kind=WP) :: lon, lat
     real(kind=MP) :: zbar_srf, zbar_bot
@@ -372,8 +374,8 @@ program fesom_advhordump
     ! --- M1.3 FCT fields ---
     call wr_r2(u, 'adv_flux_hor_mfct',      real(aflux_mfct, MP))
     call wr_r2(u, 'ttfAB',                  real(ttfAB, MP))
-    call wr_r2(u, 'hnode',                  mesh%hnode(1:nl-1, 1:mesh%nod2D))
-    call wr_r2(u, 'hnode_new',              mesh%hnode_new(1:nl-1, 1:mesh%nod2D))
+    call wr_r2(u, 'hnode',                  real(mesh%hnode(1:nl-1, 1:mesh%nod2D), MP))
+    call wr_r2(u, 'hnode_new',              real(mesh%hnode_new(1:nl-1, 1:mesh%nod2D), MP))
     call wr_r2(u, 'fct_LO',                 real(fct_LO, MP))
     call wr_r2(u, 'adv_flux_hor_fct_ho',    real(aflux_h_ho, MP))
     call wr_r2(u, 'adv_flux_ver_fct_ho',    real(aflux_v_ho, MP))

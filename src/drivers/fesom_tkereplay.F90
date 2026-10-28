@@ -1,5 +1,6 @@
 program fesom_tkereplay
     ! M7a-1 CONTROLLED REPLAY gate driver — the make-or-break test that locks the TKE
+    ! (single precision: the replay arrays are WP_full, the kind integrate_tke runs in.)
     ! column algebra (integrate_tke + solve_tridiag) in ISOLATION, exactly as the validated
     ! C port's controlled replay did (it caught the 6.6-literal bug, then hit 1.1e-16).
     !
@@ -20,7 +21,7 @@ program fesom_tkereplay
     !   FESOM3_TKE_OUT_DIR  replay output dir          (write OUTPUT tags; default '.')
     !   FESOM_TKE_DUMP_STEPS number of steps to replay (default 3)
     use mpi
-    use mod_precision,    only: WP, MP
+    use mod_precision,    only: WP, MP, WP_full
     use mod_constants,    only: density_0, g
     use mod_mesh,         only: t_mesh
     use mod_partit,       only: t_partit
@@ -35,22 +36,22 @@ program fesom_tkereplay
     implicit none
 
     ! work_*_tke column constants (dt=1800; density_0=1030/g=9.81 from mod_constants).
-    real(kind=WP), parameter :: dt_tke = 1800.0_WP
+    real(kind=WP_full), parameter :: dt_tke = 1800.0_WP_full
 
     character(len=512) :: mesh_dir, in_dir, out_dir, env_steps
     type(t_partit) :: partit
     type(t_mesh)   :: mesh
     integer :: nl, nsteps, ios, nsw, s, node, nz, nzmin, nzmax, nnod
     ! per-node oracle INPUT buffers (full nl columns; normstress is scalar per node)
-    real(kind=WP), allocatable :: d_norm(:,:), d_vsh(:,:), d_bvf(:,:), d_dzt(:,:), d_tko(:,:)
+    real(kind=WP_full), allocatable :: d_norm(:,:), d_vsh(:,:), d_bvf(:,:), d_dzt(:,:), d_tko(:,:)
     ! per-node OUTPUT buffers (full nl columns)
-    real(kind=WP), allocatable :: o_tke(:,:), o_km(:,:), o_kh(:,:), o_lmix(:,:), o_pr(:,:), &
+    real(kind=WP_full), allocatable :: o_tke(:,:), o_km(:,:), o_kh(:,:), o_lmix(:,:), o_pr(:,:), &
                                   o_tbpr(:,:), o_tspr(:,:), o_tdif(:,:), o_tdis(:,:), &
                                   o_twin(:,:), o_tiwf(:,:), o_tbck(:,:), o_ttot(:,:)
     ! column scratch (sized nl; the integrate_tke call uses 1:nlev / 1:nlev+1 slices)
     integer :: nun, nln, nlev
-    real(kind=WP), allocatable :: zero_c(:)
-    real(kind=WP), allocatable :: c_dzw(:)
+    real(kind=WP_full), allocatable :: zero_c(:)
+    real(kind=WP_full), allocatable :: c_dzw(:)
     logical :: ok
 
     call get_environment_variable('FESOM3_MESH_DIR', mesh_dir)
@@ -94,7 +95,7 @@ program fesom_tkereplay
              o_tbpr(nl,nnod), o_tspr(nl,nnod), o_tdif(nl,nnod), o_tdis(nl,nnod), &
              o_twin(nl,nnod), o_tiwf(nl,nnod), o_tbck(nl,nnod), o_ttot(nl,nnod))
     allocate(zero_c(nl), c_dzw(nl))
-    zero_c = 0.0_WP
+    zero_c = 0.0_WP_full
 
     do s = 1, nsteps
         ! --- ingest the oracle INPUT dumps for this step ---
@@ -106,9 +107,9 @@ program fesom_tkereplay
 
         ! --- zero the full-column outputs (mirror the oracle module arrays: nun..nln+1
         !     written by the column call, the rest stays 0 from init) ---
-        o_tke = 0.0_WP; o_km = 0.0_WP; o_kh = 0.0_WP; o_lmix = 0.0_WP; o_pr = 0.0_WP
-        o_tbpr = 0.0_WP; o_tspr = 0.0_WP; o_tdif = 0.0_WP; o_tdis = 0.0_WP
-        o_twin = 0.0_WP; o_tiwf = 0.0_WP; o_tbck = 0.0_WP; o_ttot = 0.0_WP
+        o_tke = 0.0_WP_full; o_km = 0.0_WP_full; o_kh = 0.0_WP_full; o_lmix = 0.0_WP_full; o_pr = 0.0_WP_full
+        o_tbpr = 0.0_WP_full; o_tspr = 0.0_WP_full; o_tdif = 0.0_WP_full; o_tdis = 0.0_WP_full
+        o_twin = 0.0_WP_full; o_tiwf = 0.0_WP_full; o_tbck = 0.0_WP_full; o_ttot = 0.0_WP_full
 
         ! --- per-node column solve on the oracle's bit-identical inputs ---
         do node = 1, nnod
@@ -141,13 +142,13 @@ program fesom_tkereplay
                  E_iw         = zero_c(1:nlev+1),       &
                  dtime        = dt_tke,                 &
                  iw_diss      = zero_c(1:nlev+1),       &
-                 forc_rho_surf= 0.0_WP,                 &
-                 rho_ref      = density_0,              &
-                 grav         = g,                      &
+                 forc_rho_surf= 0.0_WP_full,                 &
+                 rho_ref      = real(density_0, WP_full), &
+                 grav         = real(g, WP_full),       &
                  alpha_c      = zero_c(1:nlev+1))
             ! endpoint zeroing of tke_Av/tke_Kv (the driver does this; tke is NOT zeroed)
-            o_km(nln+1,node) = 0.0_WP; o_kh(nln+1,node) = 0.0_WP
-            o_km(nun  ,node) = 0.0_WP; o_kh(nun  ,node) = 0.0_WP
+            o_km(nln+1,node) = 0.0_WP_full; o_kh(nln+1,node) = 0.0_WP_full
+            o_km(nun  ,node) = 0.0_WP_full; o_kh(nun  ,node) = 0.0_WP_full
         end do
 
         ! --- emit the OUTPUT tags in the oracle's exact format ---
@@ -175,10 +176,10 @@ contains
     subroutine read_dump(dir, step, tag, ncomp, nnod, vals, ok)
         character(len=*), intent(in)  :: dir, tag
         integer,          intent(in)  :: step, ncomp, nnod
-        real(kind=WP),    intent(out) :: vals(:,:)
+        real(kind=WP_full),    intent(out) :: vals(:,:)
         logical,          intent(out) :: ok
         character(len=640) :: path, hdr
-        real(kind=WP)      :: row(ncomp)   ! read into a temp, THEN index by gid (don't use a
+        real(kind=WP_full)      :: row(ncomp)   ! read into a temp, THEN index by gid (don't use a
         integer :: u, iostat, r, gid, c    ! just-read var as a subscript in the same READ)
         write(path,'(a,"/tke_dump_s",i0,"_",a,"_rank0.txt")') trim(dir), step, trim(tag)
         ok = .false.
@@ -190,7 +191,7 @@ contains
         if (iostat /= 0) then
             write(*,'(a)') 'fesom_tkereplay: empty '//trim(path); close(u); return
         end if
-        vals = 0.0_WP
+        vals = 0.0_WP_full
         do r = 1, nnod
             read(u, *, iostat=iostat) gid, (row(c), c=1, ncomp)
             if (iostat /= 0) then
@@ -211,7 +212,7 @@ contains
     subroutine write_dump(dir, step, tag, ncomp, nnod, vals, partit)
         character(len=*), intent(in) :: dir, tag
         integer,          intent(in) :: step, ncomp, nnod
-        real(kind=WP),    intent(in) :: vals(:,:)
+        real(kind=WP_full),    intent(in) :: vals(:,:)
         type(t_partit),   intent(in) :: partit
         character(len=640) :: path
         integer :: u, nn, c, iostat

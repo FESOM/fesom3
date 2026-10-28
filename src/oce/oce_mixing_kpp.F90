@@ -34,7 +34,15 @@ module oce_mixing_kpp
     public :: Vtc, cg, deltaz, deltau, wmt, wst, nni, nnj
 
     ! --- KPP fixed parameters (oce_ale_mixing_kpp.F90:50-72) -------------------
+    ! KPP divide-by-zero guard (/(wm+epsln), /(hbl+epsln), ...). It must stay a NORMAL number
+    ! in the working precision: 1.0e-40 is a denormal in real32 and Intel -O3 flushes it to 0
+    ! (FTZ/DAZ), which defeats every guard -> 0/0 = NaN. Single precision uses 1.0e-20
+    ! (upstream FESOM/fesom2#940); double precision keeps 1.0e-40 and is unchanged.
+#if defined(USE_SINGLE_PRECISION)
+    real(kind=WP), parameter :: epsln       = 1.0e-20_WP   ! a small value (SP: normal, FTZ-safe)
+#else
     real(kind=WP), parameter :: epsln       = 1.0e-40_WP   ! a small value
+#endif
     real(kind=WP), parameter :: epsilon_kpp = 0.1_WP
     real(kind=WP), parameter :: vonk        = 0.4_WP       ! von Karman constant
     real(kind=WP), parameter :: conc1       = 5.0_WP
@@ -89,6 +97,7 @@ contains
         use mod_part_bounds, only: owned_bounds, is_multirank
         use mod_halo,        only: exchange_nod
         use mod_constants,   only: g, vcpw, density_0_r
+        use mod_param_phys,  only: S_ref_anomaly
         use oce_pressure_bv, only: smooth_nod
         type(t_dyn),    intent(inout), target :: dynamics
         type(t_tracer), intent(in),    target :: tracers
@@ -150,7 +159,7 @@ contains
             nzmin = mesh%ulevels_nod2D(node)
             ustar(node) = sqrt( sqrt( stress_node_surf(1,node)**2 + stress_node_surf(2,node)**2 )*density_0_r )
             Bo(node)    = -g*( sw_alpha(nzmin,node)*heat_flux(node)/vcpw &
-                             + sw_beta (nzmin,node)*water_flux(node)*salt(nzmin,node) )
+                             + sw_beta (nzmin,node)*water_flux(node)*(salt(nzmin,node)+S_ref_anomaly) )  ! absolute S
         end do
 
         !_______________________________________________________________________

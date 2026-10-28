@@ -13,7 +13,7 @@ program fesom_forcingdump
     ! Both on the noleap Julian scale (julday(1948,1,1,noleap)=365*1948=710820).
     use mpi
     use, intrinsic :: iso_fortran_env, only: real64
-    use mod_precision,    only: WP, MP
+    use mod_precision,    only: WP, MP, WP_full
     use mod_mesh,         only: t_mesh
     use mod_partit,       only: t_partit
     use mod_partitioning, only: par_init, par_ex
@@ -30,7 +30,8 @@ program fesom_forcingdump
     type(t_mesh)   :: mesh
     type(t_atm_forcing) :: frc
     integer :: nsw, u, fld, nn, year
-    real(WP) :: rdate_cold, rdate_eval, dt
+    real(WP) :: dt
+    real(WP_full) :: rdate_cold, rdate_eval
     real(WP), allocatable :: u_wind(:), v_wind(:), Tair(:), shum(:), &
                              shortwave(:), longwave(:), prec_rain(:), prec_snow(:)
     real(WP), allocatable :: sst(:), u_w(:), v_w(:), cd_oce(:), ch_oce(:), ce_oce(:), &

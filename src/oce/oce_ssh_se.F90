@@ -107,7 +107,7 @@ module oce_ssh_se
     use mpi
     use, intrinsic :: iso_fortran_env, only: output_unit, int64
     use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
-    use mod_precision,   only: WP, MPI_WP
+    use mod_precision,   only: WP, MPI_WP, WP_full
     use mod_constants,   only: g, r_earth
     use mod_param_phys,  only: C_d
     use mod_config,      only: ab_epsilon, which_ALE
@@ -1421,20 +1421,23 @@ contains
         real(kind=WP),  intent(in), optional :: water_flux(:)   ! (>= nNodO) + out of the ocean
         integer       :: n, e, nz, nbad
         integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
-        real(kind=WP) :: mx(6), sm(5), s(2)
+        real(kind=WP) :: mx(6), s(2)
+        ! the area integrals of the mean sea level: WP_full (diagnostic integrals, real64 in a
+        ! single-precision build; == WP in double precision, so the double build is unchanged)
+        real(kind=WP_full) :: sm(5)
         logical       :: fw
 
         call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
         fw = .false.
         if (present(water_flux)) fw = (trim(which_ALE) /= 'linfs')
-        mx = 0.0_WP; sm = 0.0_WP; nbad = 0
+        mx = 0.0_WP; sm = 0.0_WP_full; nbad = 0
         do n = 1, nNodO
             mx(1) = max(mx(1), abs(dyn%eta_n(n) - eta_old(n) - dt*dyn%ssh_rhs_old(n)/mesh%areasvol(n)))
             mx(5) = max(mx(5), abs(dyn%eta_n(n)))
-            sm(1) = sm(1) + mesh%areasvol(n)*dyn%eta_n(n)
-            sm(2) = sm(2) + mesh%areasvol(n)
-            sm(3) = sm(3) + mesh%areasvol(n)*eta_old(n)
-            if (fw .and. mesh%ulevels_nod2D(n) == 1) sm(5) = sm(5) + water_flux(n)*mesh%areasvol(n)
+            sm(1) = sm(1) + real(mesh%areasvol(n), WP_full)*dyn%eta_n(n)
+            sm(2) = sm(2) + real(mesh%areasvol(n), WP_full)
+            sm(3) = sm(3) + real(mesh%areasvol(n), WP_full)*eta_old(n)
+            if (fw .and. mesh%ulevels_nod2D(n) == 1) sm(5) = sm(5) + real(water_flux(n), WP_full)*mesh%areasvol(n)
             if (.not. (ieee_is_finite(dyn%eta_n(n)) .and. ieee_is_finite(dyn%ssh_rhs_old(n)))) nbad = nbad + 1
         end do
         do e = 1, nElemO
@@ -1453,7 +1456,7 @@ contains
         ! the spreads exchange with the neighbours: every rank calls them (0 without shared elements)
         mx(3) = shared_copy_max_elem(dyn%se_ubt(:, :, 0), partit)
         mx(4) = shared_copy_max_elem(dyn%se_umean, partit)
-        sm(4) = real(nbad, WP)
+        sm(4) = real(nbad, WP_full)
         if (is_multirank(partit)) then
             call allreduce_max(mx, partit)
             call allreduce_sum(sm, partit)
@@ -1461,18 +1464,18 @@ contains
         if (.not. dyn%se_msl0_set) then
             dyn%se_msl0     = sm(3)/sm(2)
             dyn%se_msl0_set = .true.
-            dyn%se_fwmsl    = 0.0_WP
+            dyn%se_fwmsl    = 0.0_WP_full
         end if
-        if (fw) dyn%se_fwmsl = dyn%se_fwmsl - dt*sm(5)/sm(2)
+        if (fw) dyn%se_fwmsl = dyn%se_fwmsl - real(dt, WP_full)*sm(5)/sm(2)
         vals(SE_CHK_ETACOMP)  = mx(1)
         vals(SE_CHK_TRIM)     = mx(2)
-        vals(SE_CHK_MSL)      = sm(1)/sm(2) - dyn%se_msl0 - dyn%se_fwmsl
+        vals(SE_CHK_MSL)      = real(sm(1)/sm(2) - dyn%se_msl0 - dyn%se_fwmsl, WP)
         vals(SE_CHK_SPREADU)  = mx(3)
         vals(SE_CHK_SPREADUM) = mx(4)
         vals(SE_CHK_MAXETA)   = mx(5)
         vals(SE_CHK_MAXU)     = mx(6)
-        vals(SE_CHK_NBAD)     = sm(4)
-        vals(SE_CHK_FW)       = dyn%se_fwmsl
+        vals(SE_CHK_NBAD)     = real(sm(4), WP)
+        vals(SE_CHK_FW)       = real(dyn%se_fwmsl, WP)
     end subroutine se_check_values
 
     !===========================================================================
@@ -1561,17 +1564,21 @@ contains
         integer       :: n, e, nz, nbad, elnodes(MAX_NV)
         integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
         real(kind=WP) :: mx(3), s, HA, nb(1)
+        ! the layer sum of the WP_full thickness hnode, kept in WP_full (in a single-precision
+        ! build a real32 sum of a ~4000 m column would round at 2.4e-4 m; == WP in double)
+        real(kind=WP_full) :: sh
 
         call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
         mx = 0.0_WP; nbad = 0
         do n = 1, nNodO
             if (mesh%ulevels_nod2D(n) /= 1) cycle
-            s = 0.0_WP
+            sh = 0.0_WP_full
             do nz = 1, mesh%nlevels_nod2D(n) - 1
-                s = s + mesh%hnode(nz, n)
+                sh = sh + mesh%hnode(nz, n)
                 if (.not. ieee_is_finite(real(mesh%hnode(nz, n), WP))) nbad = nbad + 1
             end do
-            mx(1) = max(mx(1), abs(s - ((mesh%zbar(1) - mesh%zbar(mesh%nlevels_nod2D(n))) + dyn%eta_n(n))))
+            mx(1) = max(mx(1), real(abs(sh - ((real(mesh%zbar(1), WP_full) &
+                    - real(mesh%zbar(mesh%nlevels_nod2D(n)), WP_full)) + real(dyn%eta_n(n), WP_full))), WP))
             mx(2) = max(mx(2), abs(dyn%w(1, n)))
             if (.not. ieee_is_finite(dyn%w(1, n))) nbad = nbad + 1
         end do

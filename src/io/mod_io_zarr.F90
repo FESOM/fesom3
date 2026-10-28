@@ -105,15 +105,20 @@ module mod_io_zarr
     public :: zarr_write_whole, zarr_write_chunk, zarr_read_chunk
     public :: zarr_check, zarr_mkdir
 
+    ! real32 specifics (the *_r4 wrappers) serve a single-precision build: they widen to
+    ! real64 (exact) and call the real64 writer, which narrows again for '<f4' arrays and
+    ! keeps every value for '<f8' ones (double on disk, cast at the I/O boundary).
     interface zarr_write_whole
         module procedure zarr_write_whole_1d_real, zarr_write_whole_2d_real, &
-                         zarr_write_whole_1d_int,  zarr_write_whole_2d_int
+                         zarr_write_whole_1d_int,  zarr_write_whole_2d_int, &
+                         zarr_write_whole_1d_r4,   zarr_write_whole_2d_r4
     end interface zarr_write_whole
 
     interface zarr_write_chunk
         module procedure zarr_write_chunk_1d_real, zarr_write_chunk_2d_real, &
                          zarr_write_chunk_3d_real, &
-                         zarr_write_chunk_1d_int,  zarr_write_chunk_2d_int
+                         zarr_write_chunk_1d_int,  zarr_write_chunk_2d_int, &
+                         zarr_write_chunk_1d_r4,   zarr_write_chunk_2d_r4,  zarr_write_chunk_3d_r4
     end interface zarr_write_chunk
 
     ! Read a chunk file back into a FULL chunk-sized Fortran array (codec-decoded, C->Fortran
@@ -612,6 +617,45 @@ contains
             call zarr_check(.false., 'real data into non-float array '//trim(arr%name))
         end if
     end subroutine zarr_write_chunk_3d_real
+
+    ! ------------------------------------------------------------------ chunk writers (real32 input)
+    subroutine zarr_write_chunk_1d_r4(store, arr, cidx, data)
+        type(t_zarr_store), intent(in) :: store
+        type(t_zarr_array), intent(in) :: arr
+        integer,            intent(in) :: cidx(:)
+        real(real32),       intent(in) :: data(:)
+        call zarr_write_chunk_1d_real(store, arr, cidx, real(data, real64))
+    end subroutine zarr_write_chunk_1d_r4
+
+    subroutine zarr_write_chunk_2d_r4(store, arr, cidx, data)
+        type(t_zarr_store), intent(in) :: store
+        type(t_zarr_array), intent(in) :: arr
+        integer,            intent(in) :: cidx(:)
+        real(real32),       intent(in) :: data(:,:)
+        call zarr_write_chunk_2d_real(store, arr, cidx, real(data, real64))
+    end subroutine zarr_write_chunk_2d_r4
+
+    subroutine zarr_write_chunk_3d_r4(store, arr, cidx, data)
+        type(t_zarr_store), intent(in) :: store
+        type(t_zarr_array), intent(in) :: arr
+        integer,            intent(in) :: cidx(:)
+        real(real32),       intent(in) :: data(:,:,:)
+        call zarr_write_chunk_3d_real(store, arr, cidx, real(data, real64))
+    end subroutine zarr_write_chunk_3d_r4
+
+    subroutine zarr_write_whole_1d_r4(store, arr, data)
+        type(t_zarr_store), intent(in) :: store
+        type(t_zarr_array), intent(in) :: arr
+        real(real32),       intent(in) :: data(:)
+        call zarr_write_whole_1d_real(store, arr, real(data, real64))
+    end subroutine zarr_write_whole_1d_r4
+
+    subroutine zarr_write_whole_2d_r4(store, arr, data)
+        type(t_zarr_store), intent(in) :: store
+        type(t_zarr_array), intent(in) :: arr
+        real(real32),       intent(in) :: data(:,:)
+        call zarr_write_whole_2d_real(store, arr, real(data, real64))
+    end subroutine zarr_write_whole_2d_r4
 
     ! ------------------------------------------------------------------ chunk writers (int input)
 

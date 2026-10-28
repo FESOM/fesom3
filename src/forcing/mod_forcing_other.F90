@@ -131,8 +131,20 @@ contains
 
         ! do interpolation
         flag = 0
+#if defined(USE_SINGLE_PRECISION)
+        ! the interpolation runs in real64; the model field is WP (narrowed once)
+        block
+            real(real64), allocatable :: dm(:)
+            allocate(dm(num))
+            call interp_2d_field(lonlen, latlen, lon, lat, ncdata, num, temp_x, temp_y, &
+                                 dm, flag)
+            model_2Darray(1:num) = real(dm, WP)
+            deallocate(dm)
+        end block
+#else
         call interp_2d_field(lonlen, latlen, lon, lat, ncdata, num, temp_x, temp_y, &
                              model_2Darray, flag)
+#endif
         deallocate(temp_y, temp_x, ncdata_temp, ncdata, lon, lat)
     end subroutine read_other_NetCDF
 

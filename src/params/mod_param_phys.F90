@@ -27,6 +27,15 @@ module mod_param_phys
     logical       :: SPP        = .false.          ! oce_modules.F90:96
 
     ! --- &oce_dyn: Gent-McWilliams ---
+    ! use_salt_anomaly (upstream FESOM/fesom2#986/#940, namelist &oce_dyn; FESOM_F env
+    ! FESOM3_SALT_ANOMALY=1, production driver only): store the salinity state as the anomaly
+    ! S - S_ref_anomaly, so the real32 spacing at open-ocean values (|S-35| < ~2) is 30-250x
+    ! finer than at S~35 (ulp 1.9e-6 psu). S_ref_anomaly is 35 when on and 0 otherwise, so every
+    ! absolute-salinity consumer adds it back unconditionally (+ 0.0 is a bit-identical no-op
+    ! when off). Not exactly DP-neutral when on (free-surface advection is not exactly
+    ! constancy-preserving; upstream measures a ~8e-6/step surface residual).
+    logical       :: use_salt_anomaly = .false.
+    real(kind=WP) :: S_ref_anomaly    = 0.0_WP
     logical       :: Fer_GM           = .false.    ! oce_modules.F90:38
     real(kind=WP) :: K_GM_max         = 3000.0_WP  ! oce_modules.F90:39
     real(kind=WP) :: K_GM_min         = 2.0_WP     ! oce_modules.F90:40

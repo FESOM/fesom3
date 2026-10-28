@@ -53,6 +53,7 @@ module mod_ice_dyn
     use mod_part_bounds, only: owned_bounds, is_multirank
     use mod_halo,        only: exchange_nod
     use mod_constants,   only: density_0, g
+    use mod_param_phys,  only: S_ref_anomaly
     implicit none
     private
     public :: ocean2ice, EVPdynamics, EVPdynamics_m, EVPdynamics_solve
@@ -95,7 +96,7 @@ contains
         do n = 1, nNodL
             if (mesh%ulevels_nod2D(n) > 1) cycle
             T_oc_array(n) = temp(1,n)
-            S_oc_array(n) = salt(1,n)
+            S_oc_array(n) = salt(1,n) + S_ref_anomaly   ! state stores S-S_ref (0 unless use_salt_anomaly)
             elevation(n)  = mesh%hbar(n)
         end do
 

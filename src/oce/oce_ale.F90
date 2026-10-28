@@ -29,14 +29,14 @@ module oce_ale
     ! d_eta (M2.6), UV/UV_rhs (the post-TDMA M2.5 value), gradient_sca/edge_cross_dxdy/
     ! helem/areasvol/area/levels (geometry + M2.5), g/density_0/dt/alpha/theta — so the
     ! whole chain is max|delta|=0 by transitivity (L9). hbar is prescribed identically.
-    use mod_precision,  only: WP, MP
+    use mod_precision,  only: WP, MP, WP_full
     use mod_constants,  only: g
     use mod_param_phys, only: alpha, theta, Fer_GM
     use mod_mesh,       only: t_mesh, MAX_NV
     use mod_dyn,        only: t_dyn
     use mod_partit,     only: t_partit
     use mod_part_bounds, only: owned_bounds, is_multirank
-    use mod_halo,       only: exchange_nod, exchange_elem, exchange_elem_full, exchange_elem_shared
+    use mod_halo,       only: exchange_nod, exchange_elem, exchange_elem_full, exchange_elem_shared, exchange_nod_h
     use mod_timer,      only: timer_start, timer_stop, TMR_OCE_SHSYNC
     use mod_config,     only: which_ALE          ! M6 ALE: 'linfs'/'zlevel'/'zstar'
     use oce_wsplit,     only: wsplit_implicit_fraction   ! the C^1 w_e/w_i split function
@@ -454,7 +454,7 @@ contains
         ! linfs: no zlevel/zstar free-surface correction; hnode_new unchanged (= hnode).
         if (is_multirank(partit)) then
             call exchange_nod(Wvel, partit)             ! FESOM2 :2870
-            call exchange_nod(mesh%hnode_new, partit)   ! FESOM2 :2871
+            call exchange_nod_h(mesh%hnode_new, partit) ! FESOM2 :2871 (WP_full: hi/lo split in SP, #1207)
             if (Fer_GM) call exchange_nod(fer_Wvel, partit)
         end if
 

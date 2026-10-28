@@ -110,17 +110,23 @@ contains
         nc_Ndepth = nc_dimlen(ncid, ['depth'])
         nc_Nlon   = nlon0 + 2                       ! +2 periodic-lon halo
         allocate(nc_lon(nc_Nlon), nc_lat(nc_Nlat), nc_depth(nc_Ndepth))
-        ! lat (no halo)
-        call nc_get_axis_dp(ncid, ['LAT      ','lat      ','latitude '], nc_lat)
+        ! lat (no halo); axes read as double (file type) and narrowed to WP (identity in DP)
+        allocate(tmp(nc_Nlat))
+        call nc_get_axis_dp(ncid, ['LAT      ','lat      ','latitude '], tmp)
+        nc_lat = real(tmp, WP)
+        deallocate(tmp)
         ! lon into interior 2:Nlon-1, then periodic halo
         allocate(tmp(nlon0))
         call nc_get_axis_dp(ncid, ['LON      ','lon      ','longitude'], tmp)
-        nc_lon(2:nc_Nlon-1) = tmp
+        nc_lon(2:nc_Nlon-1) = real(tmp, WP)
         nc_lon(1)       = nc_lon(nc_Nlon-1)
         nc_lon(nc_Nlon) = nc_lon(2)
         deallocate(tmp)
         ! depth (positive down)
-        call nc_get_axis_dp(ncid, ['depth'], nc_depth)
+        allocate(tmp(nc_Ndepth))
+        call nc_get_axis_dp(ncid, ['depth'], tmp)
+        nc_depth = real(tmp, WP)
+        deallocate(tmp)
         if (nc_depth(2) < 0.0_WP) nc_depth = -nc_depth
         call nc_close(ncid)
         ! cyclic lon: shift the two halo columns by +-360

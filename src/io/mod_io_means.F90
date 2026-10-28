@@ -127,6 +127,11 @@ module mod_io_means
         ! owned accumulator, in the OUTPUT precision (FESOM2-faithful) — one set per field
         real(real64), allocatable :: acc8(:),    acc8_3d(:,:)
         real(real32), allocatable :: acc4(:),    acc4_3d(:,:)
+        ! acc_r8: the running mean accumulates in real64. In double precision this is the
+        ! output precision ('<f8'), as FESOM2 v2.7.3 (a float32 stream accumulates and divides
+        ! in float32). In a single-precision build every stream accumulates in real64
+        ! (upstream FESOM/fesom2#1032), so a long mean of float32 samples keeps its digits.
+        logical                   :: acc_r8 = .false.
         integer                   :: count = 0
         ! vector pairing (Task 2.5): the (x,y) components of a velocity/wind pair are r2g-rotated
         ! TOGETHER at write time (io_meandata.F90:io_r2g). is_vec_x marks the x-component (drives the
@@ -307,19 +312,24 @@ contains
         io%f(k)%is_elem = is_elem
         io%f(k)%hdim = 'nod2'; if (is_elem) io%f(k)%hdim = 'elem'
         n = max(1, entity_owned(io, is_elem))
+#if defined(USE_SINGLE_PRECISION)
+        io%f(k)%acc_r8 = .true.
+#else
+        io%f(k)%acc_r8 = (io%f(k)%dtype == '<f8')
+#endif
         if (ndim == 3) then
             if (on_full_levels) then
                 io%f(k)%nlev = io%nl;   io%f(k)%voff = 0; io%f(k)%vdim = 'nz'
             else
                 io%f(k)%nlev = io%nl-1; io%f(k)%voff = 1; io%f(k)%vdim = 'nz1'
             end if
-            if (io%f(k)%dtype == '<f8') then
+            if (io%f(k)%acc_r8) then
                 allocate(io%f(k)%acc8_3d(io%f(k)%nlev, n)); io%f(k)%acc8_3d = 0.0_real64
             else
                 allocate(io%f(k)%acc4_3d(io%f(k)%nlev, n)); io%f(k)%acc4_3d = 0.0_real32
             end if
         else
-            if (io%f(k)%dtype == '<f8') then
+            if (io%f(k)%acc_r8) then
                 allocate(io%f(k)%acc8(n)); io%f(k)%acc8 = 0.0_real64
             else
                 allocate(io%f(k)%acc4(n)); io%f(k)%acc4 = 0.0_real32
@@ -441,14 +451,14 @@ contains
         call zarr_check(io%f(k)%ndim == 2, 'means_accumulate: 2-D call on 3-D field '//trim(name))
         nO = entity_owned(io, io%f(k)%is_elem)
         if (io%f(k)%is_mean) then
-            if (io%f(k)%dtype == '<f8') then
+            if (io%f(k)%acc_r8) then
                 do i = 1, nO; io%f(k)%acc8(i) = io%f(k)%acc8(i) + real(owned(i), real64); end do
             else
                 do i = 1, nO; io%f(k)%acc4(i) = io%f(k)%acc4(i) + real(owned(i), real32); end do
             end if
             io%f(k)%count = io%f(k)%count + 1
         else
-            if (io%f(k)%dtype == '<f8') then
+            if (io%f(k)%acc_r8) then
                 do i = 1, nO; io%f(k)%acc8(i) = real(owned(i), real64); end do
             else
                 do i = 1, nO; io%f(k)%acc4(i) = real(owned(i), real32); end do
@@ -468,7 +478,7 @@ contains
         call zarr_check(io%f(k)%ndim == 3, 'means_accumulate: 3-D call on 2-D field '//trim(name))
         nlev = io%f(k)%nlev; nO = entity_owned(io, io%f(k)%is_elem)
         if (io%f(k)%is_mean) then
-            if (io%f(k)%dtype == '<f8') then
+            if (io%f(k)%acc_r8) then
                 do i = 1, nO; do L = 1, nlev
                     io%f(k)%acc8_3d(L,i) = io%f(k)%acc8_3d(L,i) + real(owned(L,i), real64); end do; end do
             else
@@ -477,7 +487,7 @@ contains
             end if
             io%f(k)%count = io%f(k)%count + 1
         else
-            if (io%f(k)%dtype == '<f8') then
+            if (io%f(k)%acc_r8) then
                 do i = 1, nO; do L = 1, nlev
                     io%f(k)%acc8_3d(L,i) = real(owned(L,i), real64); end do; end do
             else
@@ -561,7 +571,7 @@ contains
         integer :: i, cnt
         allocate(owned_mean(max(1,nO)), buf(max(1, D%w_nbuf)))
         cnt = max(1, io%f(k)%count)
-        if (io%f(k)%dtype == '<f8') then
+        if (io%f(k)%acc_r8) then
             do i = 1, nO; owned_mean(i) = io%f(k)%acc8(i) / real(cnt, real64); end do
         else
             do i = 1, nO; owned_mean(i) = real(io%f(k)%acc4(i) / real(cnt, real32), WP); end do
@@ -589,7 +599,7 @@ contains
             nvalid = nlevown(i) - io%f(k)%voff
             do L = 1, nlev
                 if (L <= nvalid) then
-                    if (io%f(k)%dtype == '<f8') then
+                    if (io%f(k)%acc_r8) then
                         mean3(L,i) = io%f(k)%acc8_3d(L,i) / real(cnt, real64)
                     else
                         mean3(L,i) = real(io%f(k)%acc4_3d(L,i) / real(cnt, real32), WP)
@@ -635,7 +645,7 @@ contains
                     mx(L,i) = real(NC_FILL_DOUBLE, WP); my(L,i) = real(NC_FILL_DOUBLE, WP)
                     cycle
                 end if
-                if (io%f(kx)%dtype == '<f8') then
+                if (io%f(kx)%acc_r8) then
                     sx8 = io%f(kx)%acc8_3d(L,i); sy8 = io%f(ky)%acc8_3d(L,i)
                     if (io%autorotate) then
                         tx = real(sx8, WP); ty = real(sy8, WP)

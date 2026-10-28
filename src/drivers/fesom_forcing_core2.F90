@@ -22,7 +22,7 @@ program fesom_forcing_core2
     !   FESOM3_NSTEPS       steps      (default 3)
     use mpi
     use, intrinsic :: iso_fortran_env, only: int32, real64
-    use mod_precision,    only: WP
+    use mod_precision,    only: WP, WP_full
     use mod_mesh,         only: t_mesh
     use mod_partit,       only: t_partit
     use mod_partitioning, only: par_init, par_ex
@@ -38,7 +38,8 @@ program fesom_forcing_core2
     type(t_mesh)   :: mesh
     type(t_atm_forcing) :: frc
     integer :: nsw, fld, nn, year, n, nsteps, ios, env_len, atm_unit
-    real(WP) :: rdate_cold, rdate, timenew
+    real(WP) :: timenew
+    real(WP_full) :: rdate_cold, rdate
     real(WP), allocatable :: u_wind(:), v_wind(:), Tair(:), shum(:), &
                              shortwave(:), longwave(:), prec_rain(:), prec_snow(:)
     real(WP), allocatable :: rd(:)
