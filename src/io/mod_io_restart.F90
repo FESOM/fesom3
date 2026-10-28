@@ -83,6 +83,8 @@ module mod_io_restart
     public :: restart_init, restart_register_field, restart_register_field_mp, restart_register_state
     public :: restart_write_field, restart_write, restart_finalize
     public :: restart_resolve_latest
+    ! RK3 (docs/plans/2026-10-28-rk3.md, Task 16): the time scheme of a checkpoint
+    public :: write_checkpoint_json, read_checkpoint_json, restart_time_scheme
     ! READ path (Stage 4, Task 4.1) + the per-field halo-exchange variant selectors
     public :: restart_read, restart_read_field, restart_halo_exchange_all
     public :: RESTART_HALO_NONE, RESTART_HALO_NODE, RESTART_HALO_ELEM, RESTART_HALO_ELEM_FULL
@@ -133,6 +135,7 @@ module mod_io_restart
         integer               :: nf = 0
         type(t_restart_field) :: f(RESTART_MAXF)
         logical               :: se = .false.          ! split-explicit state registered (read pre-check)
+        logical               :: rk3 = .false.         ! RK3 run: checkpoint.json gets "time_scheme": "rk3"
         type(t_io_decomp)     :: Dn                    ! node decomp (node fields)
         type(t_io_decomp)     :: De                    ! element decomp (element fields)
         integer               :: nNodO = 0, nElemO = 0
@@ -336,6 +339,9 @@ contains
         integer           :: j, ms
         character(len=32) :: tn
         ms = 0; if (present(mix_scheme)) ms = mix_scheme
+        ! RK3 (FESOM3_RK3): the same stores as AB2 (the AB fields are written, an RK3 run never reads
+        ! them), only the checkpoint.json key differs
+        R%rk3 = dyn%use_rk3
 
         ! ---- ocean NODE 2-D ----
         p2 => dyn%eta_n;       call restart_register_field(R, 'eta_n',       'm', DECOMP_NODE, p2d=p2)
@@ -1061,15 +1067,18 @@ contains
 
     ! Minimal line-based reader for the manifest keys the safety check needs (year/day/time_sec) from the
     ! plain document write_checkpoint_json emits (one "key": value per line). ok=.false. if unreadable.
-    ! Not a general JSON parser — only the keys we wrote.
-    subroutine read_checkpoint_json(path, year, day, time_sec, ok)
+    ! Not a general JSON parser — only the keys we wrote. time_scheme (RK3, optional): 'rk3' when the
+    ! key "time_scheme": "rk3" is there, 'ab2' when it is absent (an AB2 checkpoint has no such key).
+    subroutine read_checkpoint_json(path, year, day, time_sec, ok, time_scheme)
         character(len=*), intent(in)  :: path
         integer,          intent(out) :: year, day
         real(real64),     intent(out) :: time_sec
         logical,          intent(out) :: ok
+        character(len=*), intent(out), optional :: time_scheme
         integer :: u, ios
         character(len=256) :: line
         year = 0; day = 0; time_sec = 0.0_real64; ok = .false.
+        if (present(time_scheme)) time_scheme = 'ab2'
         open(newunit=u, file=trim(path), status='old', action='read', form='formatted', iostat=ios)
         if (ios /= 0) return
         do
@@ -1078,10 +1087,28 @@ contains
             if (index(line, '"year"')     > 0) call json_value_int(line, year)
             if (index(line, '"day"')      > 0) call json_value_int(line, day)
             if (index(line, '"time_sec"') > 0) call json_value_real(line, time_sec)
+            if (present(time_scheme)) then
+                if (index(line, '"time_scheme"') > 0 .and. index(line, '"rk3"') > 0) time_scheme = 'rk3'
+            end if
         end do
         close(u)
         ok = .true.
     end subroutine read_checkpoint_json
+
+    ! The time scheme of the newest checkpoint under restart_dir ('ab2' or 'rk3', read_checkpoint_json);
+    ! 'ab2' when there is no complete checkpoint or no checkpoint.json. Every rank reads the small file.
+    subroutine restart_time_scheme(restart_dir, time_scheme)
+        character(len=*), intent(in)  :: restart_dir
+        character(len=*), intent(out) :: time_scheme
+        character(len=:), allocatable :: folder
+        logical      :: ok
+        integer      :: jyear, jday
+        real(real64) :: jtime
+        time_scheme = 'ab2'
+        call restart_resolve_latest(restart_dir, folder, ok)
+        if (.not. ok) return
+        call read_checkpoint_json(folder//'/checkpoint.json', jyear, jday, jtime, ok, time_scheme)
+    end subroutine restart_time_scheme
 
     subroutine json_value_int(line, v)
         character(len=*), intent(in)  :: line
@@ -1112,6 +1139,7 @@ contains
     ! Plain Fortran string writes (no JSON library): the small provenance manifest the reader uses for
     ! the time-vs-clock safety check + npes provenance. format_version/year/day/globalstep/npes_wrote
     ! are integers; time_sec a real (the sec-of-day passed in); fesom_git from $FESOM3_GIT else 'unknown'.
+    ! An RK3 run (R%rk3) appends "time_scheme": "rk3"; an AB2 document is unchanged (G0 compares it).
     subroutine write_checkpoint_json(R, path, year, day, time_sec, gstep)
         type(t_restart),  intent(in) :: R
         character(len=*), intent(in) :: path
@@ -1131,8 +1159,9 @@ contains
               '  "time_sec": '//rstr//','//char(10)// &
               '  "globalstep": '//itoa(gstep)//','//char(10)// &
               '  "fesom_git": "'//trim(git)//'",'//char(10)// &
-              '  "npes_wrote": '//itoa(R%npes)//char(10)// &
-              '}'
+              '  "npes_wrote": '//itoa(R%npes)
+        if (R%rk3) doc = doc//','//char(10)//'  "time_scheme": "rk3"'
+        doc = doc//char(10)//'}'
         call write_text_file(path, doc)
     end subroutine write_checkpoint_json
 

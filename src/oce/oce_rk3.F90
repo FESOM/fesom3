@@ -93,6 +93,7 @@ module oce_rk3
     public :: rk3_tracer_prep, rk3_tracer_stage
     public :: rk3_depth, rk3_transport, rk3_momentum_stage, rk3_viscosity, rk3_trim, rk3_elem_sync
     public :: rk3_check_begin, rk3_check_trim, rk3_check_finish, rk3_check_line, rk3_inflow
+    public :: rk3_cold_ab_start
     public :: RK3_NCHK, RK3_CHK_TRIM1, RK3_CHK_TRIM2, RK3_CHK_TRIM3, RK3_CHK_ETACOMP, RK3_CHK_TRIMM, &
               RK3_CHK_MAXU, RK3_CHK_NBAD
 
@@ -613,6 +614,29 @@ contains
             ' maxu=', trim(adjustl(v(6))), ' nbad=', trim(adjustl(v(7)))
         if (se) line = trim(line)//' trimM='//trim(adjustl(v(5)))
     end function rk3_check_line
+
+    !===========================================================================
+    subroutine rk3_cold_ab_start(dyn, tracers, partit)
+        ! An AB2 run that resumes an RK3 checkpoint (plan D11, Task 16): the AB history in the
+        ! checkpoint is not AB state (RK3 never rolls valuesold, and uv_rhsAB is its scratch), so the
+        ! resumed run starts AB2 cold, as a cold run does: uv_rhsAB = 0, valuesold(k) = values for
+        ! every history level, and with split-explicit se_sbar_old = 0 (lfirst sets only a2 = 1; the
+        ! a1*se_sbar_old term of se_bt_forcing stays, so the cold start depends on that zero). The
+        ! caller also takes lfirst on its first step. One rank-0 line.
+        type(t_dyn),    intent(inout) :: dyn
+        type(t_tracer), intent(inout) :: tracers
+        type(t_partit), intent(in)    :: partit
+        integer :: t, k
+        dyn%uv_rhsAB = 0.0_WP
+        do t = 1, tracers%num_tracers
+            do k = 1, size(tracers%data(t)%valuesold, 1)
+                tracers%data(t)%valuesold(k, :, :) = tracers%data(t)%values
+            end do
+        end do
+        if (allocated(dyn%se_sbar_old)) dyn%se_sbar_old = 0.0_WP
+        if (partit%mype == 0) write(*,'(a)') 'restart: RK3 checkpoint resumed by an AB2 run: cold AB start ' // &
+            '(Euler first step, uv_rhsAB = 0, valuesold = values, se_sbar_old = 0)'
+    end subroutine rk3_cold_ab_start
 
     !===========================================================================
     ! ---- helpers (the knob helpers of oce_ssh_se are private there) ----

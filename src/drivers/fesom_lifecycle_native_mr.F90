@@ -105,7 +105,7 @@ program fesom_lifecycle_native_mr
     use oce_ssh_solve,      only: ssh_solve_preconditioner   ! zstar exact resume (cold-matrix preconditioner)
     use mod_step_oce,       only: step_oce
     use oce_ssh_se,         only: se_init
-    use oce_rk3,            only: rk3_init
+    use oce_rk3,            only: rk3_init, rk3_cold_ab_start
     use mod_io_meshdiag,    only: meshdiag_write
     use mod_io_means,       only: t_io_means, t_io_config, t_io_entry, t_means_clock, MEANS_MAXF, &
                                   means_init, means_read_namelist, means_define_node2d, &
@@ -115,7 +115,7 @@ program fesom_lifecycle_native_mr
     use mod_dump,           only: dump_init, dump_finalize
     ! Restart Stage 5: checkpoint registry + register/write/read hooks (the lifecycle wiring of mod_io_restart).
     use mod_io_restart,     only: t_restart, restart_init, restart_register_state, restart_write, &
-                                  restart_read, restart_finalize, restart_resolve_latest
+                                  restart_read, restart_finalize, restart_resolve_latest, restart_time_scheme
     use oce_ale,            only: update_thickness_ale   ! zstar restart: rebuild the derived thicknesses
     implicit none
 
@@ -159,6 +159,8 @@ program fesom_lifecycle_native_mr
     ! Restart Stage 5 (Tasks 5.1/5.3): checkpoint registry + global cadence + restart-mode detection.
     type(t_restart)     :: rst
     logical             :: do_restart      ! FESOM3_RESTART set => register + write the checkpoint state
+    logical             :: cold_ab = .false.  ! an AB2 run resumed an RK3 checkpoint: lfirst on step 1 (RK3 D11)
+    character(len=8)    :: ckpt_scheme     ! the resumed checkpoint's time scheme ('ab2' / 'rk3')
     logical             :: restart_mode    ! restart launch: do_restart AND a complete checkpoint resolves
     logical             :: wrote_final     ! did the last in-loop step already checkpoint? (skip the final)
     logical             :: rl_ok
@@ -1011,6 +1013,15 @@ program fesom_lifecycle_native_mr
             if (partit%mype == 0) write(*,'(a,f9.1,a,i0,a,i0)') &
                 'restart: state restored (resumed run) at clock time=', timenew, ' day=', daynew, &
                 ' year=', yearnew
+            ! RK3 (plan D11): an AB2 run resuming an RK3 checkpoint starts AB2 cold (the history in the
+            ! checkpoint is not AB state); an RK3 run ignores the AB fields of any checkpoint
+            if (.not. dyn%use_rk3) then
+                call restart_time_scheme(trim(RestartInPath), ckpt_scheme)
+                if (trim(ckpt_scheme) == 'rk3') then
+                    call rk3_cold_ab_start(dyn, tracers, partit)
+                    cold_ab = .true.
+                end if
+            end if
             ! use_salt_anomaly (upstream fesom_init): a restart may hold ABSOLUTE salinity (from a run
             ! without the anomaly) or the anomaly. Detect by the global maximum (absolute peaks near
             ! 41 psu, the anomaly near 41-S_ref) and convert once; every AB level shifts alike.
@@ -1071,7 +1082,7 @@ program fesom_lifecycle_native_mr
         ! so the first step of a RESUMED run blends AB2 (ff=ab2) over the RESTORED uv_rhsAB instead of
         ! forward-Euler (ff=1.0) discarding it (oce_dyn_velrhs.F90:62-64,135-136). A cold run keeps the
         ! Euler first step (r_restart=.false.).
-        call step_oce(n, dt, (n == 1) .and. .not. r_restart, dyn, tracers, mesh, Ki, &
+        call step_oce(n, dt, (n == 1) .and. (cold_ab .or. .not. r_restart), dyn, tracers, mesh, Ki, &
                       atm%heat_flux, atm%water_flux, atm%virtual_salt, atm%relax_salt, &
                       atm%real_salt_flux, is_nonlinfs, stress_surf, partit, &   ! M6a-4: native rsf (zstar)
                       stress_node_surf=atm%stress_node_surf)

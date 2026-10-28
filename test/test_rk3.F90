@@ -80,6 +80,11 @@ program test_rk3
     !       open surface: T^{n+1} = T0 to 1e-13 relative. Positive control (the rule D7
     !       dropped): w_e in stages 1-2; the non-FCT defect is O(tau^2), its ratio between tau and
     !       tau/2 (the cap halved with tau, so the split fraction is the same) is 4 +- 1
+    !   R10 restart (Task 16): restart_register_state registers the same stores, in the same
+    !       order, with RK3 on and off (R%rk3 set with RK3 only); checkpoint.json written with RK3
+    !       ends with "time_scheme": "rk3" and reads back 'rk3', without RK3 it has no such key and
+    !       reads back 'ab2' (year, day, time_sec round-trip); rk3_cold_ab_start zeroes uv_rhsAB
+    !       and se_sbar_old and sets every valuesold level to values
     !   G   (FESOM3_TEST_RK3_GUARD=alpha|cavity, with FESOM3_RK3=1; separate ctest cases) the
     !       rk3_init guards stop the run: alpha = 0.5, or a node with ulevels_nod2D = 2. The run
     !       prints "test_rk3: GUARD NOT TRIGGERED" and fails if rk3_init returns.
@@ -96,6 +101,10 @@ program test_rk3
                                 rk3_depth, rk3_transport, rk3_momentum_stage, rk3_viscosity, rk3_trim
     use oce_dyn_visc,     only: viscosity_filter
     use oce_ale_tracer,   only: solve_tracers_ale, solve_tracers_rk3
+    use mod_io_restart,   only: t_restart, restart_register_state, write_checkpoint_json, read_checkpoint_json
+    use mod_ice,          only: t_ice
+    use oce_rk3,          only: rk3_cold_ab_start
+    use, intrinsic :: iso_fortran_env, only: real64
     use mod_halo,         only: shared_copy_max_elem
     use mod_tracer,       only: t_tracer
     use oce_muscl_adv,    only: muscl_adv_init
@@ -134,6 +143,7 @@ program test_rk3
     call r6_substep_n1()
     call r10t_rest()
     call r11_constancy()
+    call r10_restart()
     call r7_substeps()
     call r8_lo_bounded()
     call r9_fct_stage3()
@@ -1274,6 +1284,95 @@ contains
         dev(1) = maxdev(tr%data(1)%values, 7.3_WP)
         dev(2) = maxdev(tr%data(2)%values, 34.7_WP)
     end subroutine r11_run
+
+    !===========================================================================
+    subroutine r10_restart()
+        type(t_dyn),    target :: d
+        type(t_tracer), target :: tr
+        type(t_ice),    target :: ice
+        type(t_restart) :: Ron, Roff
+        character(len=64) :: path
+        character(len=8)  :: sch
+        character(len=512) :: line
+        integer :: k, y, dd, u, ios, mype
+        real(real64) :: ts
+        logical :: ok, same, haskey
+        mype = partit%mype
+        ! the registry: pointers only, so every model array at size 1 (no tracers)
+        allocate(d%eta_n(1), d%d_eta(1), d%ssh_rhs_old(1), d%uv(2, 1, 1), d%uv_rhsAB(1, 2, 1, 1))
+        allocate(d%w(1, 1), d%w_e(1, 1), d%w_i(1, 1))
+        d%AB_order = 2
+        tr%num_tracers = 0
+        allocate(ice%data(3))
+        do k = 1, 3
+            allocate(ice%data(k)%values(1))
+        end do
+        allocate(ice%uice(1), ice%vice(1), ice%thermo%t_skin(1))
+        allocate(ice%work%sigma11(1), ice%work%sigma12(1), ice%work%sigma22(1))
+        Ron%nl = mesh%nl; Roff%nl = mesh%nl
+        d%use_rk3 = .true.
+        call restart_register_state(Ron, d, tr, ice, mesh)
+        d%use_rk3 = .false.
+        call restart_register_state(Roff, d, tr, ice, mesh)
+        same = (Ron%nf == Roff%nf)
+        if (same) then
+            do k = 1, Ron%nf
+                if (trim(Ron%f(k)%name) /= trim(Roff%f(k)%name)) same = .false.
+            end do
+        end if
+        call check(same .and. Ron%nf > 0, 'R10 the same stores with RK3 on and off', mype)
+        call check(Ron%rk3 .and. .not. Roff%rk3, 'R10 R%rk3 set with RK3 only', mype)
+        ! the checkpoint.json round trip, with and without the key
+        write(path, '(a,i0,a)') 'test_rk3_ckpt_', mype, '.json'
+        do k = 1, 2
+            if (k == 1) then
+                call write_checkpoint_json(Ron, trim(path), 1958, 32, 1800.0_real64, 1584)
+            else
+                call write_checkpoint_json(Roff, trim(path), 1958, 32, 1800.0_real64, 1584)
+            end if
+            haskey = .false.
+            open(newunit=u, file=trim(path), status='old', action='read', iostat=ios)
+            do while (ios == 0)
+                read(u, '(a)', iostat=ios) line
+                if (ios == 0 .and. index(line, 'time_scheme') > 0) haskey = .true.
+            end do
+            close(u)
+            call read_checkpoint_json(trim(path), y, dd, ts, ok, sch)
+            if (k == 1) then
+                call check(ok .and. haskey .and. trim(sch) == 'rk3', 'R10 RK3 checkpoint.json: time_scheme rk3', mype)
+            else
+                call check(ok .and. .not. haskey .and. trim(sch) == 'ab2', &
+                           'R10 AB2 checkpoint.json: no time_scheme key, read as ab2', mype)
+            end if
+            call check(y == 1958 .and. dd == 32 .and. ts == 1800.0_real64, 'R10 json year/day/time_sec round trip', mype)
+        end do
+        open(newunit=u, file=trim(path), status='old', iostat=ios)
+        if (ios == 0) close(u, status='delete')
+        ! the cold AB start
+        call r10_cold_start()
+    end subroutine r10_restart
+
+    subroutine r10_cold_start()
+        type(t_dyn)    :: d
+        type(t_tracer) :: tr
+        integer :: t
+        logical :: ok
+        call new_dyn(d, 2)
+        call new_tracers(tr)
+        d%uv_rhsAB = 1.0_WP
+        allocate(d%se_sbar_old(2, nElemL)); d%se_sbar_old = 2.0_WP
+        do t = 1, 2
+            call set_tracer(tr%data(t)%values, 10.0_WP*t, 1.0_WP, 3*t)
+            tr%data(t)%valuesold = -5.0_WP
+        end do
+        call rk3_cold_ab_start(d, tr, partit)
+        ok = all(d%uv_rhsAB == 0.0_WP) .and. all(d%se_sbar_old == 0.0_WP)
+        do t = 1, 2
+            ok = ok .and. all(tr%data(t)%valuesold(1,:,:) == tr%data(t)%values) &
+                    .and. all(tr%data(t)%valuesold(2,:,:) == tr%data(t)%values)
+        end do
+        call check(ok, 'R10 cold AB start: uv_rhsAB = 0, se_sbar_old = 0, valuesold = values', partit%mype)
+    end subroutine r10_cold_start
 
     subroutine good(name, str)
         character(len=*), intent(in) :: name, str
