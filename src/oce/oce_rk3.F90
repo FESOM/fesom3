@@ -1,6 +1,6 @@
 module oce_rk3
     ! RK3 time stepping of the ocean, an alternative to the AB2 step (step_oce). Plan:
-    ! docs/plans/2026-10-28-rk3.md. The three-stage Wicker-Skamarock Runge-Kutta scheme of Sergey
+    ! docs/plans/completed/2026-10-28-rk3.md. The three-stage Wicker-Skamarock Runge-Kutta scheme of Sergey
     ! Danilov's quad FV prototype (~/qq_new2 oce_stepRK3.F90, oce_stepRK3_SE.F90) and of his notes
     ! (rk3.tex), self-starting (no AB history):
     !     phi*    = phi^n + tau/3*F(phi^n)

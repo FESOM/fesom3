@@ -134,7 +134,7 @@ program test_ssh_se
     !   Z1-Z6 zstar (Task 3.1): the depth law, the freshwater term and the zstar checks through the
     !       real ALE tail; their own block at the end of this file (run last).
     ! FESOM3_MESH_DIR (default pi), FESOM3_TEST_ROTATE=1 reads it rotated (setup_test_mesh).
-    !   S1  RK3 (docs/plans/2026-10-28-rk3.md, Task 13): se_bt_forcing_rk3 with momentum advection
+    !   S1  RK3 (docs/plans/completed/2026-10-28-rk3.md, Task 13): se_bt_forcing_rk3 with momentum advection
     !       off, pgf = 0, no viscosity, no wind and no bottom velocity (so no drag): R1 from the real
     !       compute_vel_rhs over tau/3 (no_history) on a hashed uv and eta_n; F = 0 to 1e-12 of
     !       max(H|grad p|, |f s|): the pressure and the Coriolis of s^n = sum_k helem*u^n are

@@ -1,6 +1,6 @@
 module mod_step_oce_rk3
     ! The RK3 ocean step (FESOM3_RK3=1), the alternative to step_oce's AB2 sequence. Plan:
-    ! docs/plans/2026-10-28-rk3.md, Technical Details §2; the scheme, the stage building blocks
+    ! docs/plans/completed/2026-10-28-rk3.md, Technical Details §2; the scheme, the stage building blocks
     ! and the knobs are documented in src/oce/oce_rk3.F90. step_oce hands over to step_oce_rk3
     ! right after its first-call guards, with its own argument list.
     !

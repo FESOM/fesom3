@@ -199,7 +199,7 @@ contains
         ! single precision: the low-order tendency in flux form gets the implicit increment
         ! tr*hnode_new too (upstream #1056 tend argument); the column scratch is WP_full (#1206)
         real(kind=WP_full), intent(inout), optional :: tend(mesh%nl-1, mesh%nod2D)
-        ! RK3 low-order substeps under zstar (docs/plans/2026-10-28-rk3.md, Task 19): the new
+        ! RK3 low-order substeps under zstar (docs/plans/completed/2026-10-28-rk3.md, Task 19): the new
         ! thickness of the substep, h^(k+1), in place of hnode_new (absent = hnode_new)
         real(kind=WP_full), intent(in), optional, target :: hnew(:,:)
         real(kind=WP_full) :: a(mesh%nl), b(mesh%nl), c(mesh%nl), tr(mesh%nl), cp(mesh%nl), tp(mesh%nl)

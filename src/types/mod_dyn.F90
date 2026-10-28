@@ -181,7 +181,7 @@ module mod_dyn
         real(kind=WP_full) :: se_fwmsl    = 0.0_WP_full
 
         ! ---- RK3 time stepping (FESOM3_RK3, src/oce/oce_rk3.F90) ----
-        ! The knobs (env, rk3_read_env) and the stage state of docs/plans/2026-10-28-rk3.md
+        ! The knobs (env, rk3_read_env) and the stage state of docs/plans/completed/2026-10-28-rk3.md
         ! (Technical Details §1). rk3_init sets them and allocates the arrays ONLY when RK3 is
         ! on; the AB2 path never touches them. Not in write/read_t_dyn and not in the
         ! checkpoint: RK3 is self-starting, the arrays are scratch within one step.

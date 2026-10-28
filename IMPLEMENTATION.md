@@ -696,3 +696,82 @@ the same global salt drift; sea-ice area within 0.009 × 10⁶ km²; the July an
 The scheme's author: the theory of Demange et al. (2019) predicts an SE instability that χ removes, so χ
 must be large enough to suppress it; the semi-implicit solver's strong damping hides it. LESSONS L77;
 plan Tasks 5.7, 5.8.
+
+### 15. RK3 time stepping
+
+An alternative to the AB2 ocean step, switched on with `FESOM3_RK3=1` (modules `src/oce/oce_rk3.F90` and
+`src/step/mod_step_oce_rk3.F90`, plan `docs/plans/completed/2026-10-28-rk3.md`, algorithm text `rk3.tex` by
+Sergey Danilov, reference code `~/qq_new2/oce_stepRK3*.F90`). With the switch unset `step_oce` runs AB2 and
+the results are byte-identical to the build before the RK3 work ([TESTING.md](TESTING.md) §6e). RK3 is not
+bitwise to AB2; it is gated by exact unit identities, per-step invariants, determinism and restart
+exactness.
+
+**Scheme.** The three-stage Wicker–Skamarock Runge–Kutta step, self-starting (no AB history):
+
+```
+φ*   = φⁿ + τ/3·F(φⁿ)
+φ**  = φⁿ + τ/2·F(φ*)
+φⁿ⁺¹ = φⁿ + τ·F(φ**)
+```
+
+Stages 1–2 are cheap. The tracers get the high-order advection only (MUSCL, QR4C; no limiter) of the
+stage tracer, which lives in `valuesAB` (`values` keeps Tⁿ until stage 3). The momentum gets Coriolis,
+advection, the pressure gradient of the stage density (the textbook p(T\*) in stage 2, computed before the
+stage-2 tracer update overwrites T\*) and −g∇ηⁿ, evaluated on the stage velocity (`dyn%rk3_us`; `dyn%uv`
+keeps uⁿ until the barotropic block). Both advect with the full w of the stage, made by `vert_vel_ale`
+from the stage velocity with the split off. Stage 3 does everything else once: N², the mixing (from the
+uⁿ shear and N²(T\*\*)), GM/Redi from T\*\*, the horizontal viscosity of uⁿ (taken in stage 1 and kept), the
+vertical viscosity TDMA with wind and drag, the barotropic step, the FCT limiter, the horizontal and
+vertical tracer diffusion and the surface fluxes.
+
+**Trims.** Stages 1–2 keep the barotropic transport at Uⁿ: u_s = uⁿ + R_s − ⟨R_s⟩ with ⟨X⟩ = Σₖ helem·X/H
+(rk3.tex's 2D–3D coupling). In stage 3 the momentum right-hand side is taken from the untrimmed u\*\*, then
+u\*\* is trimmed to the transport that changed η (CG: Σh·uⁿ⁺¹; SE: ⟨⟨Ū⟩⟩) and carries the tracers. Under SE
+uⁿ⁺¹ is also trimmed to U^M, the barotropic velocity at n+1.
+
+**The w split (plan D7).** Only stage 3 splits w: its momentum advection uses w_e and the TDMA w_i of the
+stage-3 w; the non-FCT tracers w_e explicitly and w_i in the diffusion TDMA; the FCT tracers the split in the
+low order only (the high order and the antidiffusive flux use the full w), which is `do_oce_adv_tra` on T\*\*.
+A uniform tracer then stays uniform through all three stages (LESSONS L79: w_e in stages 1–2 instead costs an
+O(τ²) defect). The cost is a stability limit for the unlimited quantities: the explicit w_e acts on stage
+values made with the full w, and a vertical upwind mode is stable up to a per-cell Courant number of about 9
+at maxcfl 1 (|1 + z_e·S(z)|/|1 − z_i| ≤ 1, S the stage polynomial); FCT tracers stay bounded by the limiter.
+
+**FCT low order.** One low-order step (`FESOM3_RK3_LO_NSUB=1`, the default) is today's low order with the
+split. `FESOM3_RK3_LO_NSUB=2, 3` run it in N substeps of τ/N (`do_oce_adv_tra_rk3`), each explicit with w_e
+from T⁽ᵏ⁾ and implicit with w_i on the interpolated thicknesses h⁽ᵏ⁾ = hⁿ + (k/N)(hⁿ⁺¹ − hⁿ); the
+antidiffusive flux is HO(T\*\*) minus the substep mean of the low-order fluxes. It is meant for a horizontal
+low-order Courant number near 1 (`RK3_CHECK cflh=`).
+
+**Barotropic step.** CG: the stage-3 corrector is step_oce's SSH block with uv = uⁿ and uv_rhs = the stage-3
+increment, i.e. qq's `vel_rhs_RK33` + `solve_ssh` + `update_vel_RK3`; this needs α = θ = 1 (`rk3_init` stops
+otherwise). SE: rk3.tex's first-stage strategy. `se_bt_forcing_rk3` forms F once in stage 1 from the stage-1
+increment (3R¹ = the increment over τ), the viscosity of uⁿ and the depth integral of the TDMA's wind and
+drag rows, with the pressure and the Coriolis of sⁿ = Σhuⁿ removed exactly (no AB2 weights); `se_subcycle`
+runs unchanged; `se_rk3_finish` replaces `se_trim_finish` in stage 3.
+
+**zstar.** Stage s = 1, 2 runs on the geometry h_{s−1} and ends on h_s: hbar = η̃_s = ηⁿ + τ_s·I(Σh·u_{s−1})/A
+(no W), `vert_vel_ale` over τ_s gives the diasurface w (w(top) = 0) and hnode_new = h_s by the zstar law, the
+tracers go Tⁿhⁿ → T_s·h_s with the flux thickness h_{s−1}, `rk3_stage_geometry` rebuilds helem, zbar_3d_n,
+Z_3d_n (hnode stays hⁿ), and u_s is trimmed with h_s weights. Stage 3 runs on h₂ and restores hbar = ηⁿ before
+the barotropic block, so `compute_hbar_ale` / `se_rk3_finish` see what AB2's do; its last `vert_vel_ale` (with
+W) gives hⁿ⁺¹, which `update_thickness_ale` commits. w(top) is 0 in stage 3 too (L82).
+
+**Restart.** RK3 reads only the state (uv, η, hbar, hnode, T/S, d_eta, TKE, the SE rings); the AB stores
+are still written, never read. `checkpoint.json` gets `"time_scheme": "rk3"` from an RK3 run only. An AB2
+run resuming such a checkpoint starts AB2 cold (`rk3_cold_ab_start`: uv_rhsAB = 0, valuesold = values,
+se_sbar_old = 0, lfirst on its first step). RK3 is self-starting, so split = straight bitwise with the
+existing restart gates (zstar CG with `FESOM3_RESTART_ZSTAR_EXACT=1`, as AB2).
+
+**Cost.** Per step three `vert_vel_ale` calls for the stages plus one for the trimmed transport, three
+pressure calls (two pressure-only), three momentum right-hand sides and three tracer advections; per stage
+an `exchange_nod(w)`, per tracer `exchange_elem_full(tr_xy)` + `exchange_nod(valuesAB)`, the momentum
+exchanges and the stage-velocity sync. Roughly three times AB2's 3-D halo traffic.
+Measured on one shared node (CORE2, np 8, production physics, 1800 s): `step_oce` 1650 ms/step with AB2,
+2678 (1.62×) with RK3 + CG and 2782 (1.69×) with RK3 + SE; the loop 2045 → 3068 / 3173 ms (1.50× / 1.55×). At twice
+the step that is about 1.33× (CG) and 1.2× (SE) the AB2 throughput; the compute-node timing at 3600 s is open.
+
+**Screens.** CORE2 cold starts, 480 steps at 1800 s, np 8, linfs and zstar, CG and SE: stable; RK3 + CG stays
+close to AB2 (max|η| 2.28 vs 2.04 m, max|u| 2.99 vs 2.97 m/s); RK3 + SE follows AB2 + SE through the SE
+solver's cold-start transient. max CFL_z 1.6 (D7's limit ~9), the horizontal low-order Courant number 0.22, so
+one LO step suffices at 1800 s; the invariants stay at roundoff (trims 2.7e-12 m²/s, etacomp ≤ 1.1e-13 m).

@@ -5,6 +5,17 @@ Full pre-M2.12 milestone detail + the per-gate recipes live in [`HANDOFF-archive
 
 ## Where we are
 
+- **RK3 time stepping ✅ (2026-10-28, branch `rk3`, opt-in `FESOM3_RK3=1`, plan
+  `plans/completed/2026-10-28-rk3.md`, unpushed):** the Wicker–Skamarock RK3 step of Sergey's quad FV
+  prototype (`rk3.tex`, `~/qq_new2`) in place of AB2: stages 1–2 advection (full w), Coriolis, PGF; stage 3
+  the rest, with the w split there only (D7). CG and split-explicit barotropic, linfs and zstar, np 1..8,
+  exact restarts (`"time_scheme": "rk3"` in `checkpoint.json`; an AB2 resume of it starts cold). RK3 off is
+  byte-identical to main `3bc68f5` (G0 against `/work/ab0995/a270029/fesom3_rk3_ref`). Unit identities in
+  `test_rk3` (K, R1–R11, Z1–Z3) and `test_ssh_se` S1–S3; RK3 blocks in `run_conserve_pi.sh` (hard gates);
+  `RK3_CHECK` invariant line. CORE2 480-step np 8 screens (CG/SE, linfs/zstar) stable — numbers in the
+  plan (Tasks 12, 15, 20, 21) and TESTING.md §6e. Open for Dmitry: the compute-node timing and the 3000-step
+  screens at Δt = 1800 s and 3600 s (env block in README §4), the 1-year twins, the questions for Sergey
+  (plan Post-Completion), push/PR.
 - **Exact zstar restart ✅ (2026-10-24, branch `zstar-exact-restart`, opt-in `FESOM3_RESTART_ZSTAR_EXACT=1`):**
   under zstar the checkpoint adds `ssh_stiff` (stiffness values in a partition-independent node-row
   layout, the format fesom3_jax shares) and `dhe`; the resume builds the SSH preconditioner from the

@@ -594,7 +594,7 @@ add_mesh_test(test_ssh_se_np2 test_ssh_se ${_mesh_pi} 2 ${_se_env})
 add_mesh_test(test_ssh_se_np8 test_ssh_se ${_mesh_pi} 8 ${_se_env})
 set_tests_properties(test_ssh_se_np1 PROPERTIES FIXTURES_SETUP se_p4_ref)
 set_tests_properties(test_ssh_se_np2 test_ssh_se_np8 PROPERTIES FIXTURES_REQUIRED se_p4_ref)
-# RK3 time stepping (docs/plans/2026-10-28-rk3.md), test_rk3 on the rotated pi at np 1 and 2: the
+# RK3 time stepping (docs/plans/completed/2026-10-28-rk3.md), test_rk3 on the rotated pi at np 1 and 2: the
 # knobs, the kernel hooks, the stage building blocks (parts K, R1-R11 in the file's header).
 add_fesom_test(test_rk3 1)
 set_tests_properties(test_rk3_np1 PROPERTIES ENVIRONMENT "FESOM3_MESH_DIR=${_mesh_pi};FESOM3_TEST_ROTATE=1")
@@ -639,7 +639,7 @@ foreach(_case badswitch badm cfl)
         FAIL_REGULAR_EXPRESSION "fesom_conserve: step "
         SKIP_REGULAR_EXPRESSION "cannot open;No such file")
 endforeach()
-# The RK3 step in fesom_conserve (docs/plans/2026-10-28-rk3.md, Task 9): pi, linfs, 20 steps, CG,
+# The RK3 step in fesom_conserve (docs/plans/completed/2026-10-28-rk3.md, Task 9): pi, linfs, 20 steps, CG,
 # FESOM3_LINFS_CONSERVE=TS as the hard heat/salt gate (FESOM3_CONSERVE_TOL), the per-step RK3_CHECK
 # line with FESOM3_RK3_CHECK_TOL stopping on a violation: one tolerance for every trim and etacomp, the
 # trim level measured over 1000 steps on pi x 100 (2.73e-12 m^2/s; etacomp 3.3e-14 m; tools/run_conserve_pi.sh

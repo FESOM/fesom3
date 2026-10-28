@@ -87,7 +87,7 @@
 #       5.7e-13 m^2/s, |msl| 6.9e-16 m, laysum 1.8e-11 m, w1 3.1e-18 m/s, hlaw 7.3e-12 m, spreads 0; heat/salt/volume
 #       drift <= 6e-15 / 1.6e-14 / 4.3e-14 (SI zstar: 1.1e-14 / 1.0e-14 / 1.4e-14).
 #
-#   linfs + RK3 (FESOM3_RK3=1, docs/plans/2026-10-28-rk3.md, Tasks 11, 12, 15), np 1/2/8 -> the RK3 step with
+#   linfs + RK3 (FESOM3_RK3=1, docs/plans/completed/2026-10-28-rk3.md, Tasks 11, 12, 15), np 1/2/8 -> the RK3 step with
 #       FESOM3_LINFS_CONSERVE=TS as the HARD conservation gate (FESOM3_CONSERVE_TOL=$TOL) and the per-step
 #       RK3_CHECK line of src/oce/oce_rk3.F90, whose run maxima are gated: the stage trims trim1/2/3 (and
 #       trimM, u^{n+1} to U^M, with SE) below RK3_TOL_TRIM and the eta-compatibility etacomp below

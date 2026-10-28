@@ -27,7 +27,7 @@ module oce_ale_tracer
     ! TDMA, Kv = 0) and are off for FCT tracers. 1-rank only; the FESOM2
     ! exchange_nod(values) loop tail is a no-op here (M2.12).
     !
-    ! RK3 (docs/plans/2026-10-28-rk3.md, Task 10): solve_tracers_rk3 is the stage-3 tracer solve,
+    ! RK3 (docs/plans/completed/2026-10-28-rk3.md, Task 10): solve_tracers_rk3 is the stage-3 tracer solve,
     ! next to solve_tracers_ale (untouched). values = T^n, valuesAB = T** (the stage-2 result),
     ! the transport velocity is dyn%rk3_us (u** trimmed to the transport that changed eta), w /
     ! w_e / w_i its stage-3 w and split. Per tracer: rk3_tracer_prep (del_ttf* zeroed, tr_xy of

@@ -81,7 +81,7 @@ contains
         ! M?: optional copy of N^2 BEFORE the horizontal smoother, for consumers whose
         ! answer depends on the true local sign (mo_convect). Absent -> nothing written.
         real(kind=WP), intent(inout), optional :: bvfreq_raw(mesh%nl, mesh%nod2D)
-        ! RK3 stages 1-2 (docs/plans/2026-10-28-rk3.md, Task 5): .true. -> the EOS,
+        ! RK3 stages 1-2 (docs/plans/completed/2026-10-28-rk3.md, Task 5): .true. -> the EOS,
         ! density_m_rho0 and hpressure only; bvfreq, bvfreq_raw and dbsfc are not touched (no
         ! N^2, no spline, no smoothing): nothing reads N^2 before stage 3 recomputes it, so
         ! this only keeps the cheap stages cheap. Absent or .false. -> the full call.

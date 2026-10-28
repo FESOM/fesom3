@@ -3140,3 +3140,73 @@ and the gap in the stiffness matrix; this closes the gap.
 **How to apply.** For each new physics option, list the arrays a step READS before it WRITES them
 (including "setup" objects that a step modifies, and lazily-built caches) and gate a straight-vs-split
 run with that option ON. Check that each restored piece is needed by skipping it once.
+
+## L79 — An RK3 stage keeps a uniform tracer uniform only if it advects with the same w its continuity used: splitting w before the last stage costs an O(τ²) defect, splitting it in the last stage costs nothing
+
+**Context.** RK3 time stepping (`FESOM3_RK3`, docs/plans/completed/2026-10-28-rk3.md, D7, 2026-10-28).
+The first plan used the AB2 rule in every stage (explicit w_e, implicit w_i); Dmitry changed it after
+reading `rk3.tex`: stages 1–2 advect with the full w of the stage, the split exists only in stage 3.
+
+**What happened.**
+- A stage update T_s h_s = Tⁿ hⁿ + τ_s·D(T_{s−1}; u_{s−1}, w_{s−1}) returns a uniform T₀ only if the
+  vertical flux uses the w that closes the stage's continuity. With w_e alone the w_i part of the
+  transport is missing and T\* ≠ T₀; stage 3 then advects that error. `test_rk3` R11 measures the
+  dropped rule: the non-FCT defect is 8.06e-3 at τ and 2.01e-3 at τ/2 (the cap halved with τ, so the
+  split fraction is the same): ratio 4.007, O(τ²). With the full w in stages 1–2 the three stages keep
+  T₀ to 1.4e-14.
+- In stage 3 the split is harmless for constancy: the explicit w_e step leaves T₀ plus the w_i part,
+  and the implicit w_i solve (the tracer TDMA for non-FCT tracers, `adv_tra_vert_impl` for the FCT low
+  order) takes it out again — the C2 argument of `test_wimpl_tra`, which holds for any split.
+- The price is stability, not accuracy: the explicit w_e of stage 3 acts on stage values made with the
+  full w, so momentum and non-FCT tracers are stable only up to a per-cell vertical Courant number of
+  about 9 at maxcfl 1 (plan §5); w_e in every stage is stable at any Courant number. The screens record
+  max CFL_z (`RK3_CHECK cflz=`).
+
+**How to apply.** In a multi-stage scheme, check each intermediate stage for the uniform-field identity
+with the stage's own w before thinking about stability; a split of w belongs where an implicit solve
+closes it. Pin the property with a unit test and a positive control that measures the order of the
+defect.
+
+## L80 — "No flux limited" cannot be arranged on a global coastline mesh: test the FCT identity on the cells whose every incident flux is unlimited
+
+**Context.** RK3 Task 7, `test_rk3` R9: on a smooth field at a small Courant number the stage-3 FCT result
+should equal the low order plus the full antidiffusive flux (HO(T\*\*) − the substep-mean LO flux).
+
+**What happened.**
+- A field linear in depth is clipped at the column ends (the drained-end argument of `test_wimpl_tra`
+  C6); a depth-uniform field linear in the 3-D position (no interior extremum on the sphere) is still
+  clipped at its coastal extrema on the global pi: 787 limited cells at Courant 0.01, min factor 0.
+- Zalesak's factor is per node; an edge flux is unlimited when the factors of both its nodes are 1. So
+  restrict the identity to the CLEAN cells: both factors 1 at the cell, at its edge neighbours on the
+  level and at the cells above and below. There it holds to 3.6e-15 on 97 470 of 101 749 wet cells, and
+  a positive control (the LO flux of one step from Tⁿ instead of the substep mean) misses by 1.4e-6.
+
+**How to apply.** When a premise ("the limiter is inactive") cannot be produced globally, test the
+identity where the premise holds locally, assert that this set is the large majority, and add a
+positive control that would fail on the same set.
+
+## L81 — fesom_conserve's cold start is partition-dependent; an np 1 vs np N comparison needs the deterministic IC fill
+
+**Context.** RK3 Task 12: np 1 vs np 8 to roundoff with `FESOM3_SSH_SOLTOL=1e-14` (L60).
+
+**What happened.** The heat content differed by 2.7e-6 already at step 0, for AB2 as for RK3: the IC hole
+filling of `do_ic3d` is the order-dependent sweep of L60. `fesom_conserve` now honours the lifecycle's
+opt-in `FESOM3_IC_EXTRAP_DET` (default off, so G0 is unchanged). With it np 1 and np 8 agree over 20 steps
+to 2.0e-14 in heat and salt, and max|u| is identical at the printed digits in every step (AB2: 2.2e-14).
+
+**How to apply.** Before a cross-decomposition comparison, compare the step-0 state; use one checkpoint or
+the deterministic fill.
+
+## L82 — Under zstar the free surface moves with the freshwater, so w(top) = 0 also in the forced stage
+
+**Context.** RK3 Task 18, `test_rk3` Z2. The plan expected w(top) = −W in stage 3.
+
+**What happened.** `compute_hbar_ale` (or `se_rk3_finish`) puts −W into ηⁿ⁺¹, `vert_vel_ale` takes the full
+Δη/τ out of the top face through the stretch and then subtracts `water_flux` once more: the two W terms
+cancel and w(top) = I/area − I/areasvol = 0 to rounding (5e-16 of max|w|). Without `water_flux` the
+residual is exactly W (the positive control). SE's `SE_CHECK_TAIL w1` has measured the same zero since
+the split-explicit work.
+
+**How to apply.** Derive an expected value from the code path, not from the continuous equations; when
+a plan's number disagrees with the code, test the code's identity, add the positive control that shows
+the term is live, and correct the plan.

@@ -44,7 +44,7 @@ module oce_dyn_velrhs
     !  - 1-rank only: the ported part of compute_vel_rhs has NO halo exchange (those
     !    live in the skipped momentum_adv_scalar); UV_rhs is element-local.
     !
-    ! RK3 (docs/plans/2026-10-28-rk3.md, D5): two optional arguments, absent = the code above.
+    ! RK3 (docs/plans/completed/2026-10-28-rk3.md, D5): two optional arguments, absent = the code above.
     !  - uv_in: the velocity the right-hand side is evaluated on (the RK3 stage velocity
     !    u*, u** in dyn%rk3_us; dyn%uv holds u^n during the step). It replaces dyn%uv in the
     !    Coriolis term and in the momentum advection (momentum_adv_vinv / relative_vorticity /

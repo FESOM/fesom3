@@ -83,7 +83,7 @@ module mod_io_restart
     public :: restart_init, restart_register_field, restart_register_field_mp, restart_register_state
     public :: restart_write_field, restart_write, restart_finalize
     public :: restart_resolve_latest
-    ! RK3 (docs/plans/2026-10-28-rk3.md, Task 16): the time scheme of a checkpoint
+    ! RK3 (docs/plans/completed/2026-10-28-rk3.md, Task 16): the time scheme of a checkpoint
     public :: write_checkpoint_json, read_checkpoint_json, restart_time_scheme
     ! READ path (Stage 4, Task 4.1) + the per-field halo-exchange variant selectors
     public :: restart_read, restart_read_field, restart_halo_exchange_all

@@ -1,5 +1,5 @@
 program test_rk3
-    ! RK3 time stepping (docs/plans/2026-10-28-rk3.md): the knobs, the kernel hooks, the stage
+    ! RK3 time stepping (docs/plans/completed/2026-10-28-rk3.md): the knobs, the kernel hooks, the stage
     ! building blocks and the stage-3 tracer solve of src/oce/oce_rk3.F90 and its callers, on the
     ! rotated pi mesh. Each part pins one property exactly (L54).
     !

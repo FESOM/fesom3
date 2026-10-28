@@ -100,7 +100,7 @@ module oce_ssh_se
     ! omega_max*res/c is mesh-dependent (3.29 at the CORE2 trenches), and its M_min = 35 blew up
     ! at step 5 at chi = 0.1 (plan Task 5.1 note).
     !
-    ! RK3 (FESOM3_RK3=1 with FESOM3_SSH_SE=1, docs/plans/2026-10-28-rk3.md, Technical Details §4): the
+    ! RK3 (FESOM3_RK3=1 with FESOM3_SSH_SE=1, docs/plans/completed/2026-10-28-rk3.md, Technical Details §4): the
     ! "first stage" strategy of rk3.tex. se_bt_forcing_rk3 forms F in RK3 stage 1 from the stage-1
     ! increment R1 (over tau/3) of the momentum on u^n, the viscosity of u^n over tau and the
     ! depth-integrated wind and bottom drag of the TDMA's boundary rows, with the pressure and the

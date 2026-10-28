@@ -34,7 +34,7 @@ module oce_adv_tra_driver
     !  * work arrays live in tracers%work (MP); kernels take WP. At the DP/SP anchor
     !    MP==WP so the pointers/args bind by kind value; revisit for FP16 (D3).
     !
-    ! do_oce_adv_tra_rk3 (docs/plans/2026-10-28-rk3.md, D6/D7, Technical Details §5) is the RK3
+    ! do_oce_adv_tra_rk3 (docs/plans/completed/2026-10-28-rk3.md, D6/D7, Technical Details §5) is the RK3
     ! counterpart for what do_oce_adv_tra cannot do; do_oce_adv_tra itself stays untouched:
     !  * stages 1-2: the HIGH ORDER only (no low order, no limiter) on the stage tracer in
     !    valuesAB, horizontal MUSCL/UPW1 and vertical QR4C/UPW1 with the FULL w for every

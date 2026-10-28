@@ -317,7 +317,7 @@ contains
         ! owned+halo) read a complete halo. The owned Wvel the ALE dump emits is computed
         ! directly (no halo dependence). hnode_new stays = hnode (linfs); its exchange is
         ! value-neutral but kept for faithfulness.
-        ! RK3 (docs/plans/2026-10-28-rk3.md, D5/D7): three optional arguments, absent = the code
+        ! RK3 (docs/plans/completed/2026-10-28-rk3.md, D5/D7): three optional arguments, absent = the code
         ! above. uv_in: the velocity whose divergence gives w (the stage velocity in dyn%rk3_us;
         ! dyn%uv holds u^n during the step). split=.false.: no CFL_z and no split, w_e = w and
         ! w_i = 0 over the faces of compute_Wvel_split (its off path, owned + halo) -- RK3

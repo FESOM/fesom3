@@ -360,6 +360,59 @@ and SI linfs/zstar baselines) all run stably; after the cold-start transient SE'
 m²/s, |msl| ≤ 2.6e-16 m, laysum ≤ 2.6e-11 m, spreads 0. The 1-year SE-vs-SI twins and the SSH-phase
 timing (plan Tasks 5.2, 5.3, 5.5–5.8) are in [IMPLEMENTATION.md](IMPLEMENTATION.md) §14.
 
+### 6e. The RK3 gates
+
+RK3 time stepping ([IMPLEMENTATION.md](IMPLEMENTATION.md) §15, plan `docs/plans/completed/2026-10-28-rk3.md`)
+is not bitwise to AB2. RK3 off is byte-identical (G0); RK3 on is gated by exact unit identities, per-step
+invariants, determinism and restart exactness:
+
+- **G0** — `tools/run_g0_se.sh` against fresh references of main `3bc68f5`
+  (`/work/ab0995/a270029/fesom3_rk3_ref/`, written by that binary; the compare mode with the same binary is
+  GREEN): CORE2 linfs and zstar with the production physics (99 checkpoint variables, 1 649 154 dump
+  records, the step lines) and the `run_conserve_pi.sh` log, all `max|Δ| = 0`. RK3 prints nothing when off,
+  its timers are quiet and `checkpoint.json` gets no new key.
+- **`test_rk3`** (np 1 and 2, rotated pi): K the knobs; R1/R2 the kernel hooks (`uv_in` transparent and
+  complete, `no_history` = lfirst, `split=.false.` gives w_e = w and w_i = 0); P `pressure_only`; R3 the stage
+  trims; R4 the RK3 amplification of an inertial oscillation (2.9e-16; Euler misses by 3.4e-2); R5 the HO
+  stages (constancy, conservation, the open-surface flux); R6 the N = 1 substep driver = `do_oce_adv_tra`
+  bitwise; R7/R8/R9 the low-order substeps (constancy, conservation, boundedness at Courant 1.5 with an
+  overshooting N = 1 control, the Zalesak bounds and the unlimited identity on the clean cells, LESSONS L80);
+  R10t at rest the stage-3 solve = `solve_tracers_ale` bitwise; R11 three-stage constancy with the split
+  (1.4e-14) and the O(τ²) control (ratio 4.007, L79); R10 the restart key and the cold AB start; Z1–Z3,
+  R7z zstar (layer sums, w(top) = 0 in every stage, constancy for N = 1..3); G the `rk3_init` guards
+  (separate cases). `test_ssh_se` S1–S3: the RK3 barotropic forcing removes pressure and Coriolis exactly.
+- **`FESOM3_RK3_CHECK=1`** — one `RK3_CHECK` line per step: `trim1/2/3` (the stage transports), `etacomp`
+  (η against the transport the tracers carry), `maxu`, `nbad`, `cflh` (horizontal low-order Courant number),
+  `cflz` (max CFL_z), and with SE `trimM` (uⁿ⁺¹ to U^M). `FESOM3_RK3_CHECK_TOL` makes a violation stop.
+- **ctest `fesom_conserve_rk3_*`** — pi, 20 steps: linfs with `FESOM3_LINFS_CONSERVE=TS` (np 1/2, with and
+  without the split), SE linfs, zstar CG and SE (np 1/2), each with the hard conservation of its case and
+  `FESOM3_RK3_CHECK_TOL=3e-10`; the stops (a bad switch or knob, zlevel, a driver without `rk3_init`).
+- **`tools/run_conserve_pi.sh` RK3 blocks** — linfs CG and SE at np 1/2/8 (plain, w split, the production
+  ocean set, two LO substeps, qq's SE setting) and zstar CG and SE at np 1/8, with the hard conservation
+  gates, the `RK3_CHECK` maxima below `RK3_TOL_TRIM=3e-10` m²/s and `RK3_TOL_ETACOMP=4e-12` m (the 1000-step
+  levels 2.73e-12 / 3.34e-14 × 100), and the SE checks at the SE thresholds.
+- **Determinism and decomposition** — two identical 1000-step pi runs print identical logs; np 1 and np 8
+  from the deterministic IC (`FESOM3_IC_EXTRAP_DET`, L81) agree to 2e-14 in heat and salt over 20 steps.
+- **Restart** — `run_restart_gate_core2.sh` with `FESOM3_RK3=1` (CG and SE, np 1 and 2, mid-run and
+  month-boundary splits) and `run_restart_gate_zstar.sh` (zstar exact): split = straight at `max|Δ| = 0`;
+  AB2 → RK3 and RK3 → AB2 resumes run (the latter with the cold AB start).
+
+Measured levels (pi: 1000 steps np 1 for linfs CG, 20 steps np 1/2/8 for the rest; CORE2: production physics, np 8,
+480 steps at Δt = 1800 s from a cold start, in an allocation):
+
+| invariant | pi linfs | pi zstar | threshold | CORE2 linfs CG / SE | CORE2 zstar CG / SE |
+|---|---|---|---|---|---|
+| trim1/2/3 [m²/s] | 2.7e-12 | 1.7e-13 | 3e-10 | 2.7e-12 / 2.7e-12 | 2.7e-12 / 2.3e-12 |
+| trimM [m²/s] (SE) | 1.7e-13 | 1.7e-13 | 3e-10 | — / 3.2e-12 | — / 3.2e-12 |
+| etacomp [m] | 3.3e-14 | 2.5e-15 | 4e-12 | 1.1e-13 / 7.4e-14 | 1.0e-13 / 7.5e-14 |
+| heat / salt / volume drift | ≤ 2.4e-14 (`TS`) | ≤ 4.2e-14 | 1e-12 | — | — |
+| cflh (LO Courant) | 0.006 | 0.006 | — | 0.22 / 0.21 | 0.22 / 0.21 |
+| cflz (max CFL_z) | 0.09 | 0.04 | ~9 (D7, §5) | 1.59 / 1.60 | 1.58 / 1.60 |
+
+The CORE2 screens are stable; RK3 + CG stays close to AB2 (max|η| 2.28 vs 2.04 m, max|u| 2.99 vs 2.97 m/s), and
+RK3 + SE follows AB2 + SE through the split-explicit solver's own cold-start transient (max|η| 4.7 m at step 67,
+2.06 m at step 480 in both).
+
 ### 6d. The conserving sea-ice cut_off gate
 
 **`tools/run_cutoff_conserve_pi.sh`.** FESOM2's `cut_off` deletes the ice and snow where `a_ice`
