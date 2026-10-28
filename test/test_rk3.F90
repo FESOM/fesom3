@@ -80,6 +80,9 @@ program test_rk3
     !       open surface: T^{n+1} = T0 to 1e-13 relative. Positive control (the rule D7
     !       dropped): w_e in stages 1-2; the non-FCT defect is O(tau^2), its ratio between tau and
     !       tau/2 (the cap halved with tau, so the split fraction is the same) is 4 +- 1
+    !   G   (FESOM3_TEST_RK3_GUARD=alpha|cavity, with FESOM3_RK3=1; separate ctest cases) the
+    !       rk3_init guards stop the run: alpha = 0.5, or a node with ulevels_nod2D = 2. The run
+    !       prints "test_rk3: GUARD NOT TRIGGERED" and fails if rk3_init returns.
     use mpi
     use mod_precision,    only: WP, MP, WP_full
     use mod_constants,    only: density_0
@@ -88,8 +91,8 @@ program test_rk3
     use mod_partitioning, only: par_init
     use mod_dyn,          only: t_dyn
     use mod_part_bounds,  only: local_dims
-    use mod_param_phys,   only: rvo_upwind, Fer_GM, N2smth_h
-    use oce_rk3,          only: rk3_env_requested, rk3_parse_knob, rk3_tracer_stage, rk3_tracer_prep, &
+    use mod_param_phys,   only: rvo_upwind, Fer_GM, N2smth_h, alpha
+    use oce_rk3,          only: rk3_env_requested, rk3_parse_knob, rk3_tracer_stage, rk3_tracer_prep, rk3_init, &
                                 rk3_depth, rk3_transport, rk3_momentum_stage, rk3_viscosity, rk3_trim
     use oce_dyn_visc,     only: viscosity_filter
     use oce_ale_tracer,   only: solve_tracers_ale, solve_tracers_rk3
@@ -118,6 +121,7 @@ program test_rk3
     call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
     nl = mesh%nl
     call setup_thickness()
+    call g_guard()
 
     call k_knobs()
     call r1_momentum_hooks()
@@ -361,6 +365,27 @@ contains
         real(kind=WP), intent(in) :: a(:,:), b(:,:)
         same_nod = all(a(:, 1:nNodL) == b(:, 1:nNodL))
     end function same_nod
+
+    !===========================================================================
+    subroutine g_guard()
+        ! FESOM3_TEST_RK3_GUARD: the run must stop inside rk3_init
+        type(t_dyn) :: d
+        character(len=32) :: mode
+        mode = ''
+        call get_environment_variable('FESOM3_TEST_RK3_GUARD', mode)
+        if (len_trim(mode) == 0) return
+        select case (trim(mode))
+        case ('alpha')
+            alpha = 0.5_WP
+        case ('cavity')
+            mesh%ulevels_nod2D(1) = 2
+        case default
+            error stop 'test_rk3: FESOM3_TEST_RK3_GUARD must be alpha or cavity'
+        end select
+        call rk3_init(d, mesh, partit)
+        write(*,'(a)') 'test_rk3: GUARD NOT TRIGGERED ('//trim(mode)//')'
+        error stop 1
+    end subroutine g_guard
 
     !===========================================================================
     subroutine k_knobs()

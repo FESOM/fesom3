@@ -600,6 +600,22 @@ add_fesom_test(test_rk3 1)
 set_tests_properties(test_rk3_np1 PROPERTIES ENVIRONMENT "FESOM3_MESH_DIR=${_mesh_pi};FESOM3_TEST_ROTATE=1")
 require_files(test_rk3_np1 ${_mesh_pi}/nod2d.out)
 add_mesh_test(test_rk3_np2 test_rk3 ${_mesh_pi} 2 FESOM3_TEST_ROTATE=1)
+# The rk3_init guards that fesom_conserve cannot reach (alpha is fixed there, pi has no cavity):
+# test_rk3 in its guard mode must stop with the guard's message.
+foreach(_g alpha cavity)
+    if(_g STREQUAL "alpha")
+        set(_msg "RK3 needs alpha = theta = 1")
+    else()
+        set(_msg "RK3 does not support cavities")
+    endif()
+    add_test(NAME test_rk3_guard_${_g}_np1
+             COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np 1 $<TARGET_FILE:test_rk3>)
+    set_tests_properties(test_rk3_guard_${_g}_np1 PROPERTIES
+        ENVIRONMENT "FESOM3_MESH_DIR=${_mesh_pi};FESOM3_TEST_ROTATE=1;FESOM3_RK3=1;FESOM3_TEST_RK3_GUARD=${_g}"
+        PASS_REGULAR_EXPRESSION "${_msg}"
+        FAIL_REGULAR_EXPRESSION "GUARD NOT TRIGGERED")
+    require_files(test_rk3_guard_${_g}_np1 ${_mesh_pi}/nod2d.out)
+endforeach()
 # The driver-facing stops in fesom_conserve's se_init (the regex pair of the wsplit guards: the
 # message, and the step-0 line the driver prints only if it went on): a bad FESOM3_SSH_SE, a bad
 # FESOM3_SE_M, and M = 1 below the CFL-guard minimum.
@@ -623,6 +639,54 @@ foreach(_case badswitch badm cfl)
         FAIL_REGULAR_EXPRESSION "fesom_conserve: step "
         SKIP_REGULAR_EXPRESSION "cannot open;No such file")
 endforeach()
+# The RK3 step in fesom_conserve (docs/plans/2026-10-28-rk3.md, Task 9): pi, linfs, 20 steps, CG,
+# FESOM3_LINFS_CONSERVE=TS as the hard heat/salt gate (FESOM3_CONSERVE_TOL), the per-step RK3_CHECK
+# line with FESOM3_RK3_CHECK_TOL (measured x 100: trims <= 1.1e-13 m^2/s, etacomp <= 1.5e-15 m, Task 11)
+# stopping on a violation; np 1 and 2, without and with the w split (the cap of _wsplit_cfg).
+set(_rk3_env "FESOM3_MESH_DIR=${_mesh_pi};FESOM3_IC_FILE=${_icf};FESOM3_NSTEPS=20;FESOM3_WHICH_ALE=linfs;FESOM3_LINFS_CONSERVE=TS;FESOM3_CONSERVE_TOL=1e-12;FESOM3_RK3=1;FESOM3_RK3_CHECK=1;FESOM3_RK3_CHECK_TOL=1e-11")
+foreach(_np 1 2)
+    add_test(NAME fesom_conserve_rk3_linfs_ts_np${_np}
+             COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np ${_np} $<TARGET_FILE:fesom_conserve>)
+    set_tests_properties(fesom_conserve_rk3_linfs_ts_np${_np} PROPERTIES
+        ENVIRONMENT "${_rk3_env};FESOM3_DIVSUM_TOL=1e-12"
+        PASS_REGULAR_EXPRESSION "RK3_CHECK step=20 trim1=.*fesom_conserve: CONSERVATION OK within tol"
+        FAIL_REGULAR_EXPRESSION "VIOLATED;non-finite"
+        SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+    add_test(NAME fesom_conserve_rk3_linfs_ts_wsplit_np${_np}
+             COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np ${_np} $<TARGET_FILE:fesom_conserve>)
+    set_tests_properties(fesom_conserve_rk3_linfs_ts_wsplit_np${_np} PROPERTIES
+        ENVIRONMENT "${_rk3_env};FESOM3_WSPLIT=1;FESOM3_WSPLIT_MAXCFL=0.005;FESOM3_WSPLIT_EXPECT_SPLIT=1000"
+        PASS_REGULAR_EXPRESSION "RK3_CHECK step=20 trim1=.*fesom_conserve: CONSERVATION OK within tol"
+        FAIL_REGULAR_EXPRESSION "VIOLATED;non-finite"
+        SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+endforeach()
+# the RK3 stops: a bad switch, a bad knob, zlevel (fesom_conserve's rk3_init), and a driver without
+# rk3_init (fesom_stepfull_mr: step_oce's rk3_step_guard)
+foreach(_case badswitch badnsub zlevel)
+    if(_case STREQUAL "badswitch")
+        set(_knobs "FESOM3_RK3=2")
+        set(_msg "FESOM3_RK3 must be 0 or 1: \"2\"")
+    elseif(_case STREQUAL "badnsub")
+        set(_knobs "FESOM3_RK3=1;FESOM3_RK3_LO_NSUB=4")
+        set(_msg "FESOM3_RK3_LO_NSUB must be 1, 2 or 3: \"4\"")
+    else()
+        set(_knobs "FESOM3_RK3=1;FESOM3_WHICH_ALE=zlevel")
+        set(_msg "RK3 supports which_ALE = linfs, not zlevel")
+    endif()
+    add_test(NAME fesom_conserve_rk3_${_case}_np1
+             COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np 1 $<TARGET_FILE:fesom_conserve>)
+    set_tests_properties(fesom_conserve_rk3_${_case}_np1 PROPERTIES
+        ENVIRONMENT "${_se_conserve};${_knobs}"
+        PASS_REGULAR_EXPRESSION "${_msg}"
+        FAIL_REGULAR_EXPRESSION "fesom_conserve: step "
+        SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+endforeach()
+add_test(NAME fesom_stepfull_mr_rk3_noinit_np1
+         COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np 1 $<TARGET_FILE:fesom_stepfull_mr>)
+set_tests_properties(fesom_stepfull_mr_rk3_noinit_np1 PROPERTIES
+    ENVIRONMENT "FESOM3_MESH_DIR=${_mesh_pi};FESOM3_RK3=1"
+    PASS_REGULAR_EXPRESSION "FESOM3_RK3=1 but this driver does not initialise RK3"
+    SKIP_REGULAR_EXPRESSION "cannot open;No such file")
 # The split-explicit step in fesom_conserve (step_oce's SE branch): pi, linfs, 20 steps with the
 # per-step SE_CHECK line; the driver's linfs invariants (T10, helem, finiteness) stop the run on a
 # violation, SE_CHECK on a non-finite value. The zstar tests below add the zstar depth law and the

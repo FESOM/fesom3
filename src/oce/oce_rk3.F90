@@ -55,19 +55,31 @@ module oce_rk3
     ! update is on the owned elements, then the shared copies are synced (FESOM3_SHARED_SYNC, as
     ! update_vel) and the eDim halo exchanged.
     !
+    ! FESOM3_RK3_CHECK (Task 9): one rank-0 line per step,
+    !     RK3_CHECK step=<n> trim1= trim2= trim3= etacomp= maxu= nbad=        (SE: + trimM=)
+    ! trim1, trim2 = max|sum_k helem*u_s - sum_k helem*u^n| after stages 1 and 2 [m^2/s];
+    ! trim3 = max|sum_k helem*u_tr - target| of the stage-3 transport velocity (CG: the
+    ! transport of u^{n+1}; SE: <<U>>); etacomp = max|eta^{n+1} - eta^n - tau*(I(sum_k helem*u_tr)
+    ! - W*areasvol)/areasvol| [m] (W only under zstar), the elevation is the one the tracers'
+    ! transport implies; trimM (SE) = max|sum_k helem*u^{n+1} - U^M|; maxu = max|u^{n+1}|; nbad =
+    ! the non-finite u^{n+1}, eta^{n+1}, T, S. Owned elements / nodes, reduced over the ranks. With
+    ! FESOM3_RK3_CHECK_TOL > 0 a trim or etacomp above it, or nbad > 0, stops the run (the ctest
+    ! and run_conserve_pi.sh hard gates); nbad > 0 stops in any case.
+    !
     ! The parser (rk3_parse_knob) returns its verdict instead of stopping, so test/test_rk3.F90
     ! checks every rejection; the driver-facing wrappers stop through rk3_die (MPI_Abort, so no
     ! rank is left waiting in a collective).
     use mpi
     use, intrinsic :: iso_fortran_env, only: output_unit
     use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
-    use mod_precision,   only: WP
+    use mod_precision,   only: WP, MP, MPI_WP
     use mod_mesh,        only: t_mesh
     use mod_dyn,         only: t_dyn
     use mod_tracer,      only: t_tracer
     use mod_partit,      only: t_partit
     use mod_part_bounds, only: local_dims, owned_bounds, is_multirank
-    use mod_halo,        only: exchange_nod, exchange_elem_full, exchange_elem, exchange_elem_shared
+    use mod_halo,        only: exchange_nod, exchange_elem_full, exchange_elem, exchange_elem_shared, &
+                               allreduce_max
     use oce_tracer_grad, only: tracer_gradient_elements
     use oce_adv_tra_driver, only: do_oce_adv_tra_rk3
     use oce_dyn_velrhs,  only: compute_vel_rhs
@@ -80,6 +92,16 @@ module oce_rk3
     public :: rk3_env_requested, rk3_read_env, rk3_parse_knob, rk3_init, rk3_step_guard, rk3_die
     public :: rk3_tracer_prep, rk3_tracer_stage
     public :: rk3_depth, rk3_transport, rk3_momentum_stage, rk3_viscosity, rk3_trim, rk3_elem_sync
+    public :: rk3_check_begin, rk3_check_trim, rk3_check_finish, rk3_check_line, rk3_inflow
+    public :: RK3_NCHK, RK3_CHK_TRIM1, RK3_CHK_TRIM2, RK3_CHK_TRIM3, RK3_CHK_ETACOMP, RK3_CHK_TRIMM, &
+              RK3_CHK_MAXU, RK3_CHK_NBAD
+
+    ! FESOM3_RK3_CHECK: the entries of the check values (meaning in the module header); the
+    ! running values of the current step
+    integer, parameter :: RK3_NCHK = 7
+    integer, parameter :: RK3_CHK_TRIM1 = 1, RK3_CHK_TRIM2 = 2, RK3_CHK_TRIM3 = 3, RK3_CHK_ETACOMP = 4, &
+                          RK3_CHK_TRIMM = 5, RK3_CHK_MAXU = 6, RK3_CHK_NBAD = 7
+    real(kind=WP), save :: chk(RK3_NCHK) = 0.0_WP
 
     ! the knobs rk3_read_env reads (FESOM3_RK3 itself: rk3_env_requested)
     character(len=20), parameter :: RK3_KNOBS(3) = [character(len=20) :: &
@@ -444,6 +466,153 @@ contains
         end do
         call rk3_elem_sync(vel, partit)
     end subroutine rk3_trim
+
+    !===========================================================================
+    subroutine rk3_check_begin(dyn, mesh, partit)
+        ! FESOM3_RK3_CHECK, start of a step: the values zeroed, rk3_sbar0 = sum_k helem*u^n
+        type(t_dyn),    intent(inout)        :: dyn
+        type(t_mesh),   intent(in)           :: mesh
+        type(t_partit), intent(in), optional :: partit
+        integer :: nNodO, nNodL, nEdgeO, nElemO
+        call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
+        chk = 0.0_WP
+        call rk3_transport(dyn%uv, mesh, nElemO, dyn%rk3_sbar0)
+    end subroutine rk3_check_begin
+
+    !===========================================================================
+    subroutine rk3_check_trim(k, vel, dyn, mesh, partit, target)
+        ! chk(k) = max over the owned elements of |sum_k helem*vel - target| (target absent:
+        ! rk3_sbar0, the transport of u^n); local, reduced in rk3_check_finish
+        integer,        intent(in)           :: k
+        real(kind=WP),  intent(in)           :: vel(:,:,:)
+        type(t_dyn),    intent(in)           :: dyn
+        type(t_mesh),   intent(in)           :: mesh
+        type(t_partit), intent(in), optional :: partit
+        real(kind=WP),  intent(in), optional :: target(:,:)
+        integer :: e, nNodO, nNodL, nEdgeO, nElemO
+        real(kind=WP), allocatable :: s(:,:)
+        call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
+        allocate(s(2, nElemO))
+        call rk3_transport(vel, mesh, nElemO, s)
+        do e = 1, nElemO
+            if (present(target)) then
+                chk(k) = max(chk(k), maxval(abs(s(:, e) - target(:, e))))
+            else
+                chk(k) = max(chk(k), maxval(abs(s(:, e) - dyn%rk3_sbar0(:, e))))
+            end if
+        end do
+    end subroutine rk3_check_trim
+
+    !===========================================================================
+    subroutine rk3_inflow(vel, mesh, partit, out)
+        ! out = I(sum_k helem*vel): the edge scatter of compute_hbar_ale (positive = convergence)
+        ! over the owned edges into owned + halo nodes; complete on the owned nodes
+        real(kind=WP),  intent(in)           :: vel(:,:,:)
+        type(t_mesh),   intent(in)           :: mesh
+        type(t_partit), intent(in), optional :: partit
+        real(kind=WP),  intent(out)          :: out(:)
+        integer :: ed, el(2), enodes(2), nz, nNodO, nNodL, nEdgeO, nElemO
+        real(kind=WP) :: c1, c2
+        call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
+        out(1:nNodL) = 0.0_WP
+        do ed = 1, nEdgeO
+            enodes = mesh%edges(:, ed)
+            el     = mesh%edge_tri(:, ed)
+            c1 = 0.0_WP
+            do nz = mesh%ulevels(el(1)), mesh%nlevels(el(1)) - 1
+                c1 = c1 + (vel(2,nz,el(1))*mesh%edge_cross_dxdy(1,ed) - vel(1,nz,el(1))*mesh%edge_cross_dxdy(2,ed)) &
+                        *mesh%helem(nz,el(1))
+            end do
+            c2 = 0.0_WP
+            if (el(2) /= el(1)) then
+                do nz = mesh%ulevels(el(2)), mesh%nlevels(el(2)) - 1
+                    c2 = c2 - (vel(2,nz,el(2))*mesh%edge_cross_dxdy(3,ed) - vel(1,nz,el(2))*mesh%edge_cross_dxdy(4,ed)) &
+                            *mesh%helem(nz,el(2))
+                end do
+            end if
+            out(enodes(1)) = out(enodes(1)) + (c1 + c2)
+            out(enodes(2)) = out(enodes(2)) - (c1 + c2)
+        end do
+    end subroutine rk3_inflow
+
+    !===========================================================================
+    subroutine rk3_check_finish(step, dt, eta_old, vel_tr, dyn, tracers, mesh, partit, water_flux)
+        ! FESOM3_RK3_CHECK, end of a step: etacomp, maxu and nbad, the reductions, the rank-0 line
+        ! and the stops (module header). eta_old = eta^n (owned + halo), vel_tr = the stage-3
+        ! transport velocity, water_flux = W (non-linfs only).
+        integer,        intent(in)           :: step
+        real(kind=WP),  intent(in)           :: dt
+        real(kind=WP),  intent(in)           :: eta_old(:)
+        real(kind=WP),  intent(in)           :: vel_tr(:,:,:)
+        type(t_dyn),    intent(in)           :: dyn
+        type(t_tracer), intent(in)           :: tracers
+        type(t_mesh),   intent(in)           :: mesh
+        type(t_partit), intent(in)           :: partit
+        real(kind=WP),  intent(in), optional :: water_flux(:)
+        integer :: n, e, nz, t, ierr, nNodO, nNodL, nEdgeO, nElemO
+        real(kind=WP) :: res, fw
+        real(kind=WP), allocatable :: inflow(:)
+        logical :: bad
+        character(len=320) :: line
+
+        call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
+        allocate(inflow(nNodL))
+        call rk3_inflow(vel_tr, mesh, partit, inflow)
+        do n = 1, nNodO
+            fw = 0.0_WP
+            if (trim(which_ALE) /= 'linfs' .and. present(water_flux)) fw = water_flux(n)*mesh%areasvol(n)
+            res = dyn%eta_n(n) - eta_old(n) - dt*(inflow(n) - fw)/mesh%areasvol(n)
+            chk(RK3_CHK_ETACOMP) = max(chk(RK3_CHK_ETACOMP), abs(res))
+            if (.not. ieee_is_finite(dyn%eta_n(n))) chk(RK3_CHK_NBAD) = chk(RK3_CHK_NBAD) + 1.0_WP
+            do t = 1, tracers%num_tracers
+                do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n) - 1
+                    if (.not. ieee_is_finite(tracers%data(t)%values(nz, n))) chk(RK3_CHK_NBAD) = chk(RK3_CHK_NBAD) + 1.0_WP
+                end do
+            end do
+        end do
+        do e = 1, nElemO
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                if (.not. (ieee_is_finite(dyn%uv(1, nz, e)) .and. ieee_is_finite(dyn%uv(2, nz, e)))) then
+                    chk(RK3_CHK_NBAD) = chk(RK3_CHK_NBAD) + 1.0_WP
+                else
+                    chk(RK3_CHK_MAXU) = max(chk(RK3_CHK_MAXU), abs(dyn%uv(1, nz, e)), abs(dyn%uv(2, nz, e)))
+                end if
+            end do
+        end do
+        ! nbad is a count: reduce it as a sum (the others as a max)
+        res = chk(RK3_CHK_NBAD)
+        if (partit%npes > 1) then
+            call allreduce_max(chk, partit)
+            call MPI_Allreduce(MPI_IN_PLACE, res, 1, MPI_WP, MPI_SUM, partit%MPI_COMM_FESOM, ierr)
+        end if
+        chk(RK3_CHK_NBAD) = res
+        line = rk3_check_line(step, chk, dyn%use_ssh_se)
+        if (partit%mype == 0) write(*,'(a)') trim(line)
+        bad = (chk(RK3_CHK_NBAD) > 0.0_WP)
+        if (dyn%rk3_check_tol > 0.0_WP) then
+            bad = bad .or. chk(RK3_CHK_TRIM1) > dyn%rk3_check_tol .or. chk(RK3_CHK_TRIM2) > dyn%rk3_check_tol &
+                      .or. chk(RK3_CHK_TRIM3) > dyn%rk3_check_tol .or. chk(RK3_CHK_ETACOMP) > dyn%rk3_check_tol
+            if (dyn%use_ssh_se) bad = bad .or. chk(RK3_CHK_TRIMM) > dyn%rk3_check_tol
+        end if
+        if (bad) call rk3_die('RK3_CHECK VIOLATED (FESOM3_RK3_CHECK_TOL or a non-finite value): '//trim(line), partit)
+    end subroutine rk3_check_finish
+
+    !===========================================================================
+    function rk3_check_line(step, vals, se) result(line)
+        integer,       intent(in) :: step
+        real(kind=WP), intent(in) :: vals(RK3_NCHK)
+        logical,       intent(in) :: se
+        character(len=320) :: line
+        character(len=24)  :: v(RK3_NCHK)
+        integer :: k
+        do k = 1, RK3_NCHK
+            write(v(k), '(es12.4)') vals(k)
+        end do
+        write(line, '(a,i0,6(a,a))') 'RK3_CHECK step=', step, ' trim1=', trim(adjustl(v(1))), &
+            ' trim2=', trim(adjustl(v(2))), ' trim3=', trim(adjustl(v(3))), ' etacomp=', trim(adjustl(v(4))), &
+            ' maxu=', trim(adjustl(v(6))), ' nbad=', trim(adjustl(v(7)))
+        if (se) line = trim(line)//' trimM='//trim(adjustl(v(5)))
+    end function rk3_check_line
 
     !===========================================================================
     ! ---- helpers (the knob helpers of oce_ssh_se are private there) ----
