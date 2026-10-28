@@ -26,6 +26,21 @@ module oce_ale_tracer
     ! terms (use_wsplit, non-FCT tracers) are pinned by test_wsplit part X (QR4C + this
     ! TDMA, Kv = 0) and are off for FCT tracers. 1-rank only; the FESOM2
     ! exchange_nod(values) loop tail is a no-op here (M2.12).
+    !
+    ! RK3 (docs/plans/2026-10-28-rk3.md, Task 10): solve_tracers_rk3 is the stage-3 tracer solve,
+    ! next to solve_tracers_ale (untouched). values = T^n, valuesAB = T** (the stage-2 result),
+    ! the transport velocity is dyn%rk3_us (u** trimmed to the transport that changed eta), w /
+    ! w_e / w_i its stage-3 w and split. Per tracer: rk3_tracer_prep (del_ttf* zeroed, tr_xy of
+    ! T**), the advection (do_oce_adv_tra on T**, or do_oce_adv_tra_rk3 for N > 1 low-order
+    ! substeps of an FCT tracer), the Redi tr_z of T**, diff_tracers_ale (the horizontal
+    ! diffusion and Redi from the T** gradients, the reconstruct from T^n, the TDMA with Kv,
+    ! the surface fluxes and, for non-FCT tracers, w_i), FESOM3_LINFS_CONSERVE from the
+    ! stage-3 surface flux, exchange_nod; the GM bolus around the loop and the S clamp as AB2.
+    ! TIME LEVELS of the stage-3 slow physics (the plan's audit): the horizontal diffusion,
+    ! Redi (diff_part_hor_redi, diff_ver_part_redi_expl read only tr_xy / tr_z), N^2, GM and the
+    ! slopes are from T**; the mixing from the u^n shear; KPP's surface buoyancy flux Bo reads
+    ! S^n (oce_mixing_kpp: salt => values, the salinity factor of the virtual salt flux), a
+    ! slowly varying factor kept at n.
     use mod_precision,      only: WP, MP, WP_full, use_tracer_carry
     use mod_constants,      only: vcpw
     use mod_mesh,           only: t_mesh
@@ -39,13 +54,14 @@ module oce_ale_tracer
     use mod_config,         only: use_sw_pene, which_ALE
     use oce_tracer_mod,     only: init_tracers_AB
     use oce_tracer_grad,    only: tracer_gradient_z
-    use oce_adv_tra_driver, only: do_oce_adv_tra
+    use oce_adv_tra_driver, only: do_oce_adv_tra, do_oce_adv_tra_rk3
+    use oce_rk3,            only: rk3_tracer_prep
     implicit none
     private
     public :: adv_tracers_ale, advect_tracer, diff_tracers_ale, diff_ver_part_impl_ale
     ! M2.9b (step assembly): solve_tracers_ale is the full per-tracer wrapper
     ! (advection + diffusion solve + salinity clamp) the ocean step calls.
-    public :: solve_tracers_ale
+    public :: solve_tracers_ale, solve_tracers_rk3
 
     ! FESOM3_LINFS_CONSERVE (not in FESOM2): 'S', 'T' or 'TS' returns the tracer that the vertical advection moves
     ! out through the linear free surface (linfs_surface_flux); unset = FESOM2. Read at the first
@@ -211,6 +227,105 @@ contains
     end subroutine solve_tracers_ale
 
     !===========================================================================
+    subroutine solve_tracers_rk3(dt, nsub, dynamics, tracers, mesh, Ki, &
+                                 heat_flux, water_flux, virtual_salt, relax_salt, &
+                                 real_salt_flux, is_nonlinfs, partit)
+        ! The RK3 stage-3 tracer solve (module header); dt = tau, nsub = FESOM3_RK3_LO_NSUB.
+        ! The structure of solve_tracers_ale with the RK3 changes: the transport velocity
+        ! dyn%rk3_us in place of uv, rk3_tracer_prep in place of init_tracers_AB (no AB
+        ! interpolation, no history roll: valuesAB is T**), the N > 1 substep driver, the Redi
+        ! tr_z of T**, and the substep-mean low-order surface flux for FESOM3_LINFS_CONSERVE.
+        real(kind=WP),  intent(in)            :: dt
+        integer,        intent(in)            :: nsub
+        type(t_dyn),    intent(inout), target :: dynamics
+        type(t_tracer), intent(inout), target :: tracers
+        type(t_mesh),   intent(in),    target :: mesh
+        real(kind=WP),  intent(in)            :: Ki(mesh%nl-1, mesh%nod2D)
+        real(kind=WP),  intent(in)            :: heat_flux(mesh%nod2D), water_flux(mesh%nod2D)
+        real(kind=WP),  intent(in)            :: virtual_salt(mesh%nod2D), relax_salt(mesh%nod2D)
+        real(kind=WP),  intent(in)            :: real_salt_flux(mesh%nod2D), is_nonlinfs
+        type(t_partit), intent(in), optional  :: partit
+        integer :: tr_num, node, elem, nzmin, nzmax, n
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
+        logical :: subs
+        real(kind=WP), dimension(:,:), pointer :: Svalues
+        real(kind=WP), allocatable :: hf(:), rs(:)
+
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+
+        ! GM bolus ADD, as solve_tracers_ale, onto the RK3 transport velocity
+        if (Fer_GM) then
+            do elem = 1, nElemL
+                dynamics%rk3_us(:,:,elem) = dynamics%rk3_us(:,:,elem) + dynamics%fer_uv(:,:,elem)
+            end do
+            do node = 1, nNodL
+                dynamics%w_e(:,node) = dynamics%w_e(:,node) + dynamics%fer_w(:,node)
+                dynamics%w(:,node)   = dynamics%w(:,node)   + dynamics%fer_w(:,node)
+            end do
+        end if
+
+        if (.not. linfs_conserve_read) call linfs_conserve_env(partit)
+        if (len_trim(linfs_conserve) > 0) allocate(hf(nNodL), rs(nNodL))
+
+        do tr_num = 1, tracers%num_tracers
+            ! the stage-3 advection of T** (valuesAB) from T^n (values)
+            call rk3_tracer_prep(tr_num, tracers, mesh, partit)
+            subs = (nsub > 1 .and. trim(tracers%data(tr_num)%tra_adv_lim) == 'FCT')
+            if (subs) then
+                call do_oce_adv_tra_rk3(dt, dynamics%rk3_us, dynamics%w, dynamics%w_i, dynamics%w_e, &
+                                        tr_num, 3, nsub, dynamics, tracers, mesh, partit)
+            else
+                call do_oce_adv_tra(dt, dynamics%rk3_us, dynamics%w, dynamics%w_i, dynamics%w_e, &
+                                    tr_num, dynamics, tracers, mesh, partit)
+            end if
+            do n = 1, nNodO
+                tracers%work%del_ttf(:, n) = tracers%work%del_ttf(:, n) &
+                                           + tracers%work%del_ttf_advhoriz(:, n) &
+                                           + tracers%work%del_ttf_advvert(:, n)
+            end do
+            if (Redi) call tracer_gradient_z(tracers%data(tr_num)%valuesAB, tracers%work%tr_z, mesh, partit)
+            if (len_trim(linfs_conserve) > 0) then
+                hf = heat_flux(1:nNodL)
+                rs = relax_salt(1:nNodL)
+                if (subs) then
+                    call linfs_corrected_fluxes(tr_num, dynamics, tracers, mesh, hf, rs, partit, &
+                                                lo_top=tracers%work%rk3_lo_top)
+                else
+                    call linfs_corrected_fluxes(tr_num, dynamics, tracers, mesh, hf, rs, partit)
+                end if
+                call diff_tracers_ale(tr_num, dt, dynamics, tracers, mesh, tracers%work%tr_xy, Ki, &
+                                      hf, water_flux, virtual_salt, rs, &
+                                      real_salt_flux, is_nonlinfs, partit)
+            else
+                call diff_tracers_ale(tr_num, dt, dynamics, tracers, mesh, tracers%work%tr_xy, Ki, &
+                                      heat_flux, water_flux, virtual_salt, relax_salt, &
+                                      real_salt_flux, is_nonlinfs, partit)
+            end if
+            if (is_multirank(partit)) call exchange_nod(tracers%data(tr_num)%values, partit)
+        end do
+
+        ! GM bolus SUBTRACT
+        if (Fer_GM) then
+            do elem = 1, nElemL
+                dynamics%rk3_us(:,:,elem) = dynamics%rk3_us(:,:,elem) - dynamics%fer_uv(:,:,elem)
+            end do
+            do node = 1, nNodL
+                dynamics%w_e(:,node) = dynamics%w_e(:,node) - dynamics%fer_w(:,node)
+                dynamics%w(:,node)   = dynamics%w(:,node)   - dynamics%fer_w(:,node)
+            end do
+        end if
+
+        ! salinity clamp, as solve_tracers_ale
+        Svalues => tracers%data(2)%values
+        do node = 1, nNodL
+            nzmax = mesh%nlevels_nod2D(node) - 1
+            nzmin = mesh%ulevels_nod2D(node)
+            where (Svalues(nzmin:nzmax,node) > 45.0_WP - S_ref_anomaly) Svalues(nzmin:nzmax,node) = 45.0_WP - S_ref_anomaly
+            where (Svalues(nzmin:nzmax,node) <  3.0_WP - S_ref_anomaly) Svalues(nzmin:nzmax,node) =  3.0_WP - S_ref_anomaly
+        end do
+    end subroutine solve_tracers_rk3
+
+    !===========================================================================
     subroutine linfs_conserve_env(partit)
         ! FESOM3_LINFS_CONSERVE (not in FESOM2; unset = FESOM2): 'S', 'T' or 'TS', the tracers whose flux
         ! through the linear free surface solve_tracers_ale returns (linfs_corrected_fluxes). linfs only: zstar
@@ -242,7 +357,7 @@ contains
     end subroutine linfs_conserve_env
 
     !===========================================================================
-    real(kind=WP) function linfs_surface_flux(tr_num, dynamics, tracers, mesh, partit)
+    real(kind=WP) function linfs_surface_flux(tr_num, dynamics, tracers, mesh, partit, lo_top)
         ! Not in FESOM2 (FESOM3_LINFS_CONSERVE): the tracer that this tracer's vertical advection (its
         ! do_oce_adv_tra, just run) moved out through the linear free surface, per unit ocean area (tracer*m/s).
         ! With linfs hnode is frozen while w at the surface is not zero, so the top-interface flux changes the
@@ -254,28 +369,38 @@ contains
         ! WP_full and rounded once into the WP result, as integrate_nod_2D (FESOM/fesom2#993): in single
         ! precision a WP sum's rounding would itself be a net source; in double precision this is the same
         ! arithmetic.
+        ! RK3 with N > 1 low-order substeps (lo_top present): the low-order part is the substep
+        ! mean rk3_lo_top of do_oce_adv_tra_rk3 in place of area*(w_e*T^n + w_i*fct_LO).
         integer,        intent(in)           :: tr_num
         type(t_dyn),    intent(in)           :: dynamics
         type(t_tracer), intent(in)           :: tracers
         type(t_mesh),   intent(in)           :: mesh
         type(t_partit), intent(in), optional :: partit
+        real(kind=WP),  intent(in), optional :: lo_top(:)
         integer       :: n, nz, nNodO, nNodL, nEdgeO, nElemO
         real(kind=WP_full) :: s
 
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
         s = 0.0_WP_full
-        do n = 1, nNodO
-            nz = mesh%ulevels_nod2D(n)
-            s = s + mesh%area(n)*(dynamics%w_e(nz,n)*tracers%data(tr_num)%values(nz,n) &
-                                + dynamics%w_i(nz,n)*tracers%work%fct_LO(nz,n)) &
-                  - tracers%work%adv_flux_ver(nz,n)
-        end do
+        if (present(lo_top)) then
+            do n = 1, nNodO
+                nz = mesh%ulevels_nod2D(n)
+                s = s + lo_top(n) - tracers%work%adv_flux_ver(nz,n)
+            end do
+        else
+            do n = 1, nNodO
+                nz = mesh%ulevels_nod2D(n)
+                s = s + mesh%area(n)*(dynamics%w_e(nz,n)*tracers%data(tr_num)%values(nz,n) &
+                                    + dynamics%w_i(nz,n)*tracers%work%fct_LO(nz,n)) &
+                      - tracers%work%adv_flux_ver(nz,n)
+            end do
+        end if
         if (is_multirank(partit)) call allreduce_sum(s, partit)
         linfs_surface_flux = real(s/mesh%ocean_area, WP)
     end function linfs_surface_flux
 
     !===========================================================================
-    subroutine linfs_corrected_fluxes(tr_num, dynamics, tracers, mesh, heat_flux, relax_salt, partit)
+    subroutine linfs_corrected_fluxes(tr_num, dynamics, tracers, mesh, heat_flux, relax_salt, partit, lo_top)
         ! heat_flux (tracer 1, T) or relax_salt (tracer 2, S) plus this tracer's linfs_surface_flux c on every
         ! node without a cavity, when FESOM3_LINFS_CONSERVE names the tracer. bc_surface then adds dt*c to each
         ! top layer (T: -dt*heat_flux/vcpw), dt*c*ocean_area of content in all, what the surface flux took.
@@ -286,6 +411,7 @@ contains
         type(t_mesh),   intent(in)           :: mesh
         real(kind=WP),  intent(inout)        :: heat_flux(:), relax_salt(:)
         type(t_partit), intent(in), optional :: partit
+        real(kind=WP),  intent(in), optional :: lo_top(:)   ! RK3, N > 1 (linfs_surface_flux)
         integer       :: n
         real(kind=WP) :: c
 
@@ -295,7 +421,7 @@ contains
             write(*,'(a)') 'solve_tracers_ale: FESOM3_LINFS_CONSERVE needs the FCT limiter (tra_adv_lim)'
             error stop 1
         end if
-        c = linfs_surface_flux(tr_num, dynamics, tracers, mesh, partit)
+        c = linfs_surface_flux(tr_num, dynamics, tracers, mesh, partit, lo_top)
         do n = 1, size(heat_flux)
             if (mesh%ulevels_nod2D(n) > 1) cycle  ! cavity node
             if (tr_num == 1) then

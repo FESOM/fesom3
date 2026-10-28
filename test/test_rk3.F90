@@ -70,6 +70,16 @@ program test_rk3
     !       (rk3_lo_fh/fv), the HO recomputed here from the kernels, to 1e-13; positive
     !       control: with the low-order flux of ONE step from T^n in place of the substep mean,
     !       the clean cells differ by more than 1e-9
+    !   R10t the stage-3 tracer solve at rest (Task 10): u = 0, w = 0, one LO step: stages 1-2
+    !       leave T** = T^n bitwise (the identity form of the stage update) and
+    !       solve_tracers_rk3 equals solve_tracers_ale bitwise (owned + halo), with hashed Kv,
+    !       Ki and surface fluxes (horizontal diffusion, TDMA, surface fluxes)
+    !   R11 three-stage constancy with the split on (Task 10): a uniform T0 in T (FCT) and S
+    !       (not) through stage 1 (u^n, full w), stage 2 (u*, full w) and solve_tracers_rk3 on
+    !       u** (split: w_e explicit, w_i in the LO / the TDMA; split faces asserted), Kv /= 0,
+    !       open surface: T^{n+1} = T0 to 1e-13 relative. Positive control (the rule D7
+    !       dropped): w_e in stages 1-2; the non-FCT defect is O(tau^2), its ratio between tau and
+    !       tau/2 (the cap halved with tau, so the split fraction is the same) is 4 +- 1
     use mpi
     use mod_precision,    only: WP, MP, WP_full
     use mod_constants,    only: density_0
@@ -82,6 +92,7 @@ program test_rk3
     use oce_rk3,          only: rk3_env_requested, rk3_parse_knob, rk3_tracer_stage, rk3_tracer_prep, &
                                 rk3_depth, rk3_transport, rk3_momentum_stage, rk3_viscosity, rk3_trim
     use oce_dyn_visc,     only: viscosity_filter
+    use oce_ale_tracer,   only: solve_tracers_ale, solve_tracers_rk3
     use mod_halo,         only: shared_copy_max_elem
     use mod_tracer,       only: t_tracer
     use oce_muscl_adv,    only: muscl_adv_init
@@ -117,6 +128,8 @@ program test_rk3
     call r4_inertial()
     call r5_ho_stage()
     call r6_substep_n1()
+    call r10t_rest()
+    call r11_constancy()
     call r7_substeps()
     call r8_lo_bounded()
     call r9_fct_stage3()
@@ -1116,6 +1129,126 @@ contains
             end do
         end do
     end subroutine full_adf
+
+    !===========================================================================
+    subroutine r10t_rest()
+        type(t_dyn)    :: d
+        type(t_tracer) :: ta, tb
+        real(kind=WP), allocatable :: Ki(:,:), hf(:), wf(:), vs(:), rs(:), sf(:)
+        integer :: t, mype
+        logical :: same
+        mype = partit%mype
+        call new_dyn(d, 2)
+        call new_rk3(d)
+        d%use_wsplit = .true.; d%wsplit_maxcfl = 1.0e-3_WP; d%wsplit_mincfl = 0.5e-3_WP
+        call rest_inputs(d, Ki, hf, wf, vs, rs, sf)
+        call new_tracers(ta)
+        do t = 1, 2
+            call set_tracer(ta%data(t)%values, 10.0_WP + 20.0_WP*(t-1), 3.0_WP, 31*t)
+            call set_tracer(ta%data(t)%valuesold(1,:,:), 10.0_WP + 20.0_WP*(t-1), 3.0_WP, 37*t)
+        end do
+        tb = ta
+        call vert_vel_ale(d, mesh, dt, partit)                    ! u = 0: w = w_e = w_i = 0
+        call check(all(d%w == 0.0_WP), 'R10t precondition: w = 0', mype)
+        call solve_tracers_ale(dt, d, ta, mesh, Ki, hf, wf, vs, rs, sf, 0.0_WP, partit)
+        call rk3_tracer_stage(1, dt/3.0_WP, d%rk3_us, d%w, d, tb, mesh, partit)
+        call rk3_tracer_stage(2, 0.5_WP*dt, d%rk3_us, d%w, d, tb, mesh, partit)
+        same = .true.
+        do t = 1, 2
+            same = same .and. same_nod(tb%data(t)%valuesAB, tb%data(t)%values)
+        end do
+        call check(same, 'R10t at rest T** == T^n bitwise', mype)
+        call solve_tracers_rk3(dt, 1, d, tb, mesh, Ki, hf, wf, vs, rs, sf, 0.0_WP, partit)
+        do t = 1, 2
+            call check(same_nod(tb%data(t)%values, ta%data(t)%values), &
+                       'R10t at rest solve_tracers_rk3 == solve_tracers_ale bitwise', mype)
+            call check(any(ta%data(t)%values(:, 1:nNodO) /= tb%data(t)%valuesAB(:, 1:nNodO)), &
+                       'R10t the solve changes the tracer (non-vacuous)', mype)
+        end do
+    end subroutine r10t_rest
+
+    subroutine rest_inputs(d, Ki, hf, wf, vs, rs, sf)
+        ! hashed Kv (> 0), Ki and surface fluxes for the stage-3 solve
+        type(t_dyn), intent(inout) :: d
+        real(kind=WP), allocatable, intent(out) :: Ki(:,:), hf(:), wf(:), vs(:), rs(:), sf(:)
+        integer :: n, nz
+        allocate(Ki(nl-1, nNodL), hf(nNodL), wf(nNodL), vs(nNodL), rs(nNodL), sf(nNodL))
+        do n = 1, nNodL
+            do nz = 1, nl
+                d%work%Kv(nz, n) = 1.0e-4_WP*(1.5_WP + hval(partit%myList_nod2D(n), nz + 70))
+            end do
+            do nz = 1, nl-1
+                Ki(nz, n) = 500.0_WP*(1.5_WP + hval(partit%myList_nod2D(n), nz + 90))
+            end do
+            hf(n) = 50.0_WP*hval(partit%myList_nod2D(n), 1)
+            wf(n) = 1.0e-8_WP*hval(partit%myList_nod2D(n), 2)
+            vs(n) = 1.0e-7_WP*hval(partit%myList_nod2D(n), 3)
+            rs(n) = 1.0e-7_WP*hval(partit%myList_nod2D(n), 4)
+            sf(n) = 0.0_WP
+        end do
+    end subroutine rest_inputs
+
+    !===========================================================================
+    subroutine r11_constancy()
+        real(kind=WP) :: dev(2), devc1(2), devc2(2), ratio
+        integer :: mype
+        mype = partit%mype
+        call r11_run(dt, 1.0e-3_WP, .false., dev)
+        call check(dev(1) <= 1.0e-13_WP*7.3_WP,  'R11 three-stage constancy, FCT tracer', mype)
+        call check(dev(2) <= 1.0e-13_WP*34.7_WP, 'R11 three-stage constancy, non-FCT tracer', mype)
+        call r11_run(dt, 1.0e-3_WP, .true., devc1)
+        call r11_run(0.5_WP*dt, 0.5e-3_WP, .true., devc2)
+        ratio = devc1(2)/max(devc2(2), tiny(1.0_WP))
+        call check(devc1(2) > 1.0e-10_WP, 'R11 positive control: w_e in stages 1-2 breaks constancy', mype)
+        call check(abs(ratio - 4.0_WP) <= 1.0_WP, 'R11 positive control: the defect is O(tau^2)', mype)
+        if (mype == 0) write(*,'(a,2es9.2,a,es9.2,a,es9.2,a,f6.3)') 'test_rk3: R11 max|T - T0| (FCT, not) =', dev, &
+            '; control (w_e in stages 1-2): non-FCT tau ', devc1(2), ', tau/2 ', devc2(2), ', ratio ', ratio
+    end subroutine r11_constancy
+
+    subroutine r11_run(tau, maxcfl, control, dev)
+        ! the three stages of the tracers on hashed u^n, u*, u** (each stage's w from its own
+        ! velocity), uniform T0 = 7.3 (FCT) and 34.7 (not), split on; dev = max|T^{n+1} - T0|
+        real(kind=WP), intent(in)  :: tau, maxcfl
+        logical,       intent(in)  :: control
+        real(kind=WP), intent(out) :: dev(2)
+        type(t_dyn)    :: d
+        type(t_tracer) :: tr
+        real(kind=WP), allocatable :: Ki(:,:), hf(:), wf(:), vs(:), rs(:), sf(:), u2(:,:,:)
+        integer :: nsplit
+        call new_dyn(d, 2)
+        call new_rk3(d)
+        d%use_wsplit = .true.; d%wsplit_maxcfl = maxcfl; d%wsplit_mincfl = 0.5_WP*maxcfl
+        call rest_inputs(d, Ki, hf, wf, vs, rs, sf)
+        hf = 0.0_WP; wf = 0.0_WP; vs = 0.0_WP; rs = 0.0_WP
+        call new_tracers(tr)
+        call set_tracer(tr%data(1)%values, 7.3_WP, 0.0_WP, 0)
+        call set_tracer(tr%data(2)%values, 34.7_WP, 0.0_WP, 0)
+        call hashed_uv(d%uv, 121)
+        allocate(u2(2, nl-1, nElemF))
+        call hashed_uv(u2, 122)
+        call hashed_uv(d%rk3_us, 123)
+        ! stage 1 on u^n, stage 2 on u2 (u*), full w -- or w_e of the stage's split (control)
+        call vert_vel_ale(d, mesh, tau, partit, split=control)
+        if (control) then
+            call rk3_tracer_stage(1, tau/3.0_WP, d%uv, d%w_e, d, tr, mesh, partit)
+        else
+            call rk3_tracer_stage(1, tau/3.0_WP, d%uv, d%w, d, tr, mesh, partit)
+        end if
+        call vert_vel_ale(d, mesh, tau, partit, uv_in=u2, split=control)
+        if (control) then
+            call rk3_tracer_stage(2, 0.5_WP*tau, u2, d%w_e, d, tr, mesh, partit)
+        else
+            call rk3_tracer_stage(2, 0.5_WP*tau, u2, d%w, d, tr, mesh, partit)
+        end if
+        ! stage 3 on u** (rk3_us) with the split
+        call vert_vel_ale(d, mesh, tau, partit, uv_in=d%rk3_us)
+        nsplit = count(d%w_i(:, 1:nNodO) /= 0.0_WP)
+        call sum_all(nsplit, partit)
+        call check(nsplit > 100, 'R11 precondition: split faces in stage 3', partit%mype)
+        call solve_tracers_rk3(tau, 1, d, tr, mesh, Ki, hf, wf, vs, rs, sf, 0.0_WP, partit)
+        dev(1) = maxdev(tr%data(1)%values, 7.3_WP)
+        dev(2) = maxdev(tr%data(2)%values, 34.7_WP)
+    end subroutine r11_run
 
     subroutine good(name, str)
         character(len=*), intent(in) :: name, str
