@@ -80,6 +80,18 @@ conservation, mesh-delta, regression and self-consistency gates take its place
     Without the drag χ = 0.1 blows up a cold-started CORE2 run after about 7 days (a shelf mode fed
     through the sea ice).
   - See [IMPLEMENTATION.md](IMPLEMENTATION.md) §14.
+- **RK3 time stepping (`FESOM3_RK3=1`, branch `rk3`, opt-in):**
+  - The three-stage Wicker–Skamarock Runge–Kutta step of Sergey Danilov's quad FV prototype in place of
+    AB2. Stages 1–2 are cheap (tracer advection; momentum advection, Coriolis, pressure gradient), stage 3
+    does the rest (viscosity, mixing, diffusion, GM/Redi, surface fluxes, the FCT limiter, the w split).
+  - Both barotropic solvers: the semi-implicit CG solve (default) or the split-explicit substeps
+    (`FESOM3_SSH_SE=1`); linfs and zstar; any rank count; exact restarts. Off by default, and with it off
+    the results are byte-identical to the build before it.
+  - Stages 1–2 advect with the full w of the stage, so a uniform tracer stays uniform; the w split is made
+    in stage 3 only. Momentum and non-FCT tracers are then stable up to a vertical Courant number of about
+    9 at `FESOM3_WSPLIT_MAXCFL=1` (the `RK3_CHECK` line reports it as `cflz=`).
+  - Meant to run at about twice the AB2 time step; the longer-Δt screens and the timing on compute nodes
+    are open (see the env block in §4). See [IMPLEMENTATION.md](IMPLEMENTATION.md) §15.
 - **Conserving sea-ice cut_off (`FESOM3_ICE_CUTOFF_CONSERVE=1`, opt-in).** FESOM2's `cut_off` deletes
   the ice and snow where `a_ice` or `m_ice` falls below 1e-9 without any flux. The ice FCT limits
   `a_ice` and `m_ice` separately and leaves `a_ice` ~ 0 with `m_ice` 1e-5 to 2e-4 m at open-water nodes
@@ -228,8 +240,8 @@ export FESOM3_STEP_PER_DAY=48                        # 1800 s on CORE2; 72 (1200
 > `FESOM3_MIX_KPP`, `FESOM3_SW_PENE`, `FESOM3_CHL_SWEENEY`, `FESOM3_WSPLIT`, `FESOM3_SHEAR_SPLINES`,
 > `FESOM3_N2_SPLINES` and `FESOM3_STEP_DIAG` are on whenever the variable is set and not empty, also
 > for `=0`; leave it unset to turn the option off. `FESOM3_MOMADV_OPT`, `FESOM3_RVO_UPWIND`,
-> `FESOM3_WSPLIT_MAXCFL`/`_MINCFL`, `FESOM3_SHARED_SYNC`, `FESOM3_SSH_SE` and the `FESOM3_SE_*`
-> knobs take values.
+> `FESOM3_WSPLIT_MAXCFL`/`_MINCFL`, `FESOM3_SHARED_SYNC`, `FESOM3_SSH_SE`, the `FESOM3_SE_*` knobs,
+> `FESOM3_RK3` and the `FESOM3_RK3_*` knobs take values.
 
 **Where the knobs are defined.** The authoritative, always-current list of run variables is the
 environment block at the top of **`src/drivers/fesom_lifecycle_native_mr.F90`** (each is read with
@@ -271,11 +283,29 @@ examples. The most common variables:
 | `FESOM3_SE_VISC_FLOW` | `1` = the flow-dependent barotropic viscosity of the Zenodo SE code in place of A_h (`FESOM3_SE_VISC_GAMMA0`/`_GAMMA1`, default `10` / `2750`); default `0` |
 | `FESOM3_SE_BOTTDRAG` | barotropic bottom drag in the substeps, r = C_d·\|u_bottom\| frozen over the step: `1` (default) = on, `0` = off (the 3-D drag stays in the forcing either way) |
 | `FESOM3_SE_CHECK` | `1` = one `SE_CHECK` invariant line per step (η compatibility, trim, mean sea level, shared-copy spreads; zstar adds `SE_CHECK_TAIL`); default `0` |
+| `FESOM3_RK3` | time stepping: `0` (default) = AB2, `1` = RK3 (Wicker–Skamarock; production driver and `fesom_conserve` only; linfs or zstar, double precision, no cavities, α = θ = 1). Combines with `FESOM3_SSH_SE`. Read in `src/oce/oce_rk3.F90`, like the knobs below; a value other than 0/1 stops |
+| `FESOM3_RK3_LO_NSUB` | substeps of the FCT low order in stage 3: `1` (default, the AB2 low order with the w split), `2` or `3` (only for a horizontal low-order Courant number near 1, `RK3_CHECK cflh=`) |
+| `FESOM3_RK3_CHECK`, `FESOM3_RK3_CHECK_TOL` | `1` = one `RK3_CHECK` line per step: the stage trims `trim1/2/3` (and `trimM` with SE), the η compatibility `etacomp`, `maxu`, `nbad`, the horizontal low-order Courant number `cflh` and max CFL_z `cflz`; with `_TOL` > 0 a trim or etacomp above it stops the run (a non-finite value always does). Default `0` / `0` |
 
 > **Configuration today vs. intent.** The production drivers are configured by these `FESOM3_*`
 > variables plus in-code defaults. A write-once configuration *module* (`mod_config`, reading a
 > single `namelist.config`) already exists, but the lifecycle drivers do not read it yet;
 > consolidating run configuration into one namelist file is the intended future interface.
+
+**RK3 runs.** The env block for a CORE2 RK3 run on top of the production physics (the twice-longer time
+step is the point of RK3; compare with the AB2 run at 48 steps per day first):
+
+```bash
+export FESOM3_RK3=1                     # RK3 in place of AB2 (unset = AB2)
+export FESOM3_STEP_PER_DAY=24           # 3600 s; 48 (1800 s) for the AB2-vs-RK3 twin
+# optional
+export FESOM3_RK3_CHECK=1               # one RK3_CHECK line per step (trims, etacomp, cflh, cflz)
+export FESOM3_SSH_SE=1 FESOM3_SE_M=80   # split-explicit; M must be >= the CFL-guard minimum printed at
+                                        # startup, which scales with the step (40 at 1800 s on CORE2)
+```
+
+An RK3 checkpoint carries `"time_scheme": "rk3"` in `checkpoint.json`. An AB2 run that resumes it starts
+AB2 cold (an Euler first step, one log line); an RK3 run resumes any checkpoint.
 
 **Restart.** Set `FESOM3_RESTART=<dir>` to write checkpoints (cadence via `FESOM3_RESTART_LENGTH` /
 `FESOM3_RESTART_UNIT`). On the next launch, if a complete checkpoint is found under that directory
