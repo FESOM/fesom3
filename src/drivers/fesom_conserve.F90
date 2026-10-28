@@ -44,6 +44,8 @@ program fesom_conserve
     !   FESOM3_DIVSUM_TOL  shared-element gate (below); unset/0 = report only
     !   FESOM3_SSH_SE      1 = split-explicit barotropic solver (knobs FESOM3_SE_*, src/oce/oce_ssh_se.F90)
     !   FESOM3_RK3         1 = RK3 time stepping (knobs FESOM3_RK3_*, src/oce/oce_rk3.F90)
+    !   FESOM3_IC_EXTRAP_DET  presence: the deterministic IC hole filling of the lifecycle driver
+    !                      (decomposition-independent, LESSONS L60), so np 1 and np N start alike
     !
     ! SHARED ELEMENTS (docs/plans/completed/20261012-shared-element-sync.md). A border element is owned by
     ! every rank that owns one of its vertices; update_vel syncs uv to the designated owner's
@@ -107,7 +109,7 @@ program fesom_conserve
     use mod_mesh_areas,     only: compute_geometry
     use mod_dyn,            only: t_dyn
     use mod_tracer,         only: t_tracer
-    use oce_initial_state,  only: t_ic3d_config, do_ic3d
+    use oce_initial_state,  only: t_ic3d_config, do_ic3d, ic3d_extrap_from_env
     use oce_muscl_adv,      only: muscl_adv_init
     use oce_ssh_rhs,        only: init_stiff_mat_ale
     use mod_step_oce,       only: step_oce
@@ -378,6 +380,7 @@ program fesom_conserve
     ic%t_insitu    = .true.
     ic%ic_cyclic   = .true.
     ic%dummy       = 1.e10_WP
+    call ic3d_extrap_from_env(ic)       ! FESOM3_IC_EXTRAP_DET / FESOM3_IC_EXTRAP_TOL (default off)
     call do_ic3d(tracers, ic, mesh, partit)
     if (partit%mype == 0) &
         write(*,'(a,2es12.4,a,2es12.4)') 'fesom_conserve: IC(rank0 owned) T=', &

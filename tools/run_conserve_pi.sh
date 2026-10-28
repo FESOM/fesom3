@@ -87,6 +87,17 @@
 #       5.7e-13 m^2/s, |msl| 6.9e-16 m, laysum 1.8e-11 m, w1 3.1e-18 m/s, hlaw 7.3e-12 m, spreads 0; heat/salt/volume
 #       drift <= 6e-15 / 1.6e-14 / 4.3e-14 (SI zstar: 1.1e-14 / 1.0e-14 / 1.4e-14).
 #
+#   linfs + RK3 (FESOM3_RK3=1, docs/plans/2026-10-28-rk3.md, Tasks 11, 12, 15), np 1/2/8 -> the RK3 step with
+#       FESOM3_LINFS_CONSERVE=TS as the HARD conservation gate (FESOM3_CONSERVE_TOL=$TOL) and the per-step
+#       RK3_CHECK line of src/oce/oce_rk3.F90, whose run maxima are gated: the stage trims trim1/2/3 (and
+#       trimM, u^{n+1} to U^M, with SE) below RK3_TOL_TRIM and the eta-compatibility etacomp below
+#       RK3_TOL_ETACOMP = the levels measured over 1000 steps x 100, nbad = 0, one line per step. CG: plain,
+#       w split, the production ocean set, two LO substeps; SE (FESOM3_SSH_SE=1, its SE_CHECK gated as the
+#       linfs SE block: etacomp, trim of the transport velocity, msl, spreads 0): default knobs and qq's
+#       setting (FESOM3_SE_VISC_AH=0, FESOM3_SE_BOTTDRAG=0). np 2/8 add the shared-element gate
+#       (FESOM3_DIVSUM_TOL). Measured 2026-10-28 (pi, 1000 steps, np 1, CG: plain / w split / production
+#       set): trim <= 2.73e-12 m^2/s, etacomp <= 3.34e-14 m, heat/salt drift <= 2.4e-14, divsum <= 1.0e-15;
+#       two identical runs print identical logs.
 # Measured zstar baseline on pi, 20 steps, before any bottom change:
 #   np=1  heat -4.87e-15  salt -1.66e-14
 #   np=2  heat  0.00e+00  salt -7.80e-15
@@ -318,6 +329,60 @@ default 8
 momadv-vinv-upw1+ice 1 FESOM3_MOMADV_OPT=1 FESOM3_RVO_UPWIND=1.0 FESOM3_CONSERVE_ICE=1
 momadv-vinv-upw1+ice 8 FESOM3_MOMADV_OPT=1 FESOM3_RVO_UPWIND=1.0 FESOM3_CONSERVE_ICE=1
 GM+Redi+TKE+wsplit 1 FESOM3_FER_GM=1 FESOM3_REDI=1 FESOM3_MIX_TKE=1 $WSPLIT_CFG
+CFG
+
+# RK3: linfs + FESOM3_RK3=1 with the RK3_CHECK gate (header). The tolerances are the 1000-step levels x 100.
+RK3_TOL_TRIM="${RK3_TOL_TRIM:-3e-10}"         # m^2/s (2.73e-12 x 100)
+RK3_TOL_ETACOMP="${RK3_TOL_ETACOMP:-4e-12}"   # m (3.34e-14 x 100)
+RK3_ENV="FESOM3_WHICH_ALE=linfs FESOM3_LINFS_CONSERVE=TS FESOM3_RK3=1 FESOM3_RK3_CHECK=1"
+RK3_SE="FESOM3_SSH_SE=1 FESOM3_SE_CHECK=1"
+while read -r -u 3 label np vars; do
+    [ -z "$label" ] && continue
+    echo "=== linfs + RK3 + $label, np=$np, $NSTEPS steps (conservation gate, tol=$TOL; RK3_CHECK gate) ==="
+    se=0; case " $vars " in *" FESOM3_SSH_SE=1 "*) se=1 ;; esac
+    rc=0
+    out=$(env $RK3_ENV $vars FESOM3_CONSERVE_TOL="$TOL" mpirun $MPIFLAGS -n "$np" "$BIN" < /dev/null 2>&1) || rc=$?
+    { echo "$out" | grep -vE '^(RK3_CHECK|SE_CHECK) ' || true; } | tail -8
+    # run maxima of the RK3_CHECK (and SE_CHECK) tokens; one line of each per step
+    echo "$out" | awk -v ns="$NSTEPS" -v se="$se" -v tt="$RK3_TOL_TRIM" -v te="$RK3_TOL_ETACOMP" \
+                      -v ste="$SE_TOL_ETACOMP" -v stt="$SE_TOL_TRIM" -v stm="$SE_TOL_MSL" '
+        /^RK3_CHECK / { n++
+                        for (i = 3; i <= NF; i++) { split($i, kv, "="); v = kv[2] + 0; if (v < 0) v = -v
+                                                    if (v > mx[kv[1]]) mx[kv[1]] = v } }
+        /^SE_CHECK /  { m++
+                        for (i = 3; i <= NF; i++) { split($i, kv, "="); v = kv[2] + 0; if (v < 0) v = -v
+                                                    if (v > sx[kv[1]]) sx[kv[1]] = v } }
+        END { printf "run_conserve_pi: RK3_CHECK max over %d steps: trim1=%.3e trim2=%.3e trim3=%.3e trimM=%.3e " \
+                     "etacomp=%.3e maxu=%.3e nbad=%d (tol %s %s)\n", n, mx["trim1"], mx["trim2"], mx["trim3"], \
+                     mx["trimM"], mx["etacomp"], mx["maxu"], mx["nbad"], tt, te
+              ok = (n == ns && mx["trim1"] <= tt + 0 && mx["trim2"] <= tt + 0 && mx["trim3"] <= tt + 0 &&
+                    mx["trimM"] <= tt + 0 && mx["etacomp"] <= te + 0 && mx["nbad"] == 0)
+              if (se == 1) {
+                  printf "run_conserve_pi: SE_CHECK max over %d steps: etacomp=%.3e trim=%.3e |msl|=%.3e " \
+                         "spreadU=%.3e spreadUm=%.3e (tol %s %s %s)\n", m, sx["etacomp"], sx["trim"], sx["msl"], \
+                         sx["spreadU"], sx["spreadUm"], ste, stt, stm
+                  ok = ok && m == ns && sx["etacomp"] <= ste + 0 && sx["trim"] <= stt + 0 && sx["msl"] <= stm + 0 &&
+                       sx["spreadU"] == 0 && sx["spreadUm"] == 0
+              }
+              exit !ok }' || rc=1
+    if [ "$rc" -ne 0 ]; then
+        echo "run_conserve_pi: FAILED (linfs+RK3+$label np=$np)"; fail=1
+    fi
+done 3<<CFG
+plain 1
+plain 2 FESOM3_DIVSUM_TOL=$TOL
+plain 8 FESOM3_DIVSUM_TOL=$TOL
+wsplit 1 $WSPLIT_CFG
+wsplit 8 $WSPLIT_CFG FESOM3_DIVSUM_TOL=$TOL
+prod 1 $PROD_OCEAN $WSPLIT_CFG
+prod 8 $PROD_OCEAN $WSPLIT_CFG FESOM3_DIVSUM_TOL=$TOL
+lonsub2 1 FESOM3_RK3_LO_NSUB=2 $WSPLIT_CFG
+SE 1 $RK3_SE
+SE 2 $RK3_SE FESOM3_DIVSUM_TOL=$TOL
+SE 8 $RK3_SE FESOM3_DIVSUM_TOL=$TOL
+SE-qq 1 $RK3_SE FESOM3_SE_VISC_AH=0 FESOM3_SE_BOTTDRAG=0
+SE-qq 8 $RK3_SE FESOM3_SE_VISC_AH=0 FESOM3_SE_BOTTDRAG=0 FESOM3_DIVSUM_TOL=$TOL
+SE-prod 8 $RK3_SE $PROD_OCEAN $WSPLIT_CFG FESOM3_DIVSUM_TOL=$TOL
 CFG
 
 if [ "$fail" -ne 0 ]; then

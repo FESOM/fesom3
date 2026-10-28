@@ -641,9 +641,10 @@ foreach(_case badswitch badm cfl)
 endforeach()
 # The RK3 step in fesom_conserve (docs/plans/2026-10-28-rk3.md, Task 9): pi, linfs, 20 steps, CG,
 # FESOM3_LINFS_CONSERVE=TS as the hard heat/salt gate (FESOM3_CONSERVE_TOL), the per-step RK3_CHECK
-# line with FESOM3_RK3_CHECK_TOL (measured x 100: trims <= 1.1e-13 m^2/s, etacomp <= 1.5e-15 m, Task 11)
-# stopping on a violation; np 1 and 2, without and with the w split (the cap of _wsplit_cfg).
-set(_rk3_env "FESOM3_MESH_DIR=${_mesh_pi};FESOM3_IC_FILE=${_icf};FESOM3_NSTEPS=20;FESOM3_WHICH_ALE=linfs;FESOM3_LINFS_CONSERVE=TS;FESOM3_CONSERVE_TOL=1e-12;FESOM3_RK3=1;FESOM3_RK3_CHECK=1;FESOM3_RK3_CHECK_TOL=1e-11")
+# line with FESOM3_RK3_CHECK_TOL stopping on a violation: one tolerance for every trim and etacomp, the
+# trim level measured over 1000 steps on pi x 100 (2.73e-12 m^2/s; etacomp 3.3e-14 m; tools/run_conserve_pi.sh
+# gates the two separately, Task 11); np 1 and 2, without and with the w split (the cap of _wsplit_cfg).
+set(_rk3_env "FESOM3_MESH_DIR=${_mesh_pi};FESOM3_IC_FILE=${_icf};FESOM3_NSTEPS=20;FESOM3_WHICH_ALE=linfs;FESOM3_LINFS_CONSERVE=TS;FESOM3_CONSERVE_TOL=1e-12;FESOM3_RK3=1;FESOM3_RK3_CHECK=1;FESOM3_RK3_CHECK_TOL=3e-10")
 foreach(_np 1 2)
     add_test(NAME fesom_conserve_rk3_linfs_ts_np${_np}
              COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np ${_np} $<TARGET_FILE:fesom_conserve>)
