@@ -594,6 +594,12 @@ add_mesh_test(test_ssh_se_np2 test_ssh_se ${_mesh_pi} 2 ${_se_env})
 add_mesh_test(test_ssh_se_np8 test_ssh_se ${_mesh_pi} 8 ${_se_env})
 set_tests_properties(test_ssh_se_np1 PROPERTIES FIXTURES_SETUP se_p4_ref)
 set_tests_properties(test_ssh_se_np2 test_ssh_se_np8 PROPERTIES FIXTURES_REQUIRED se_p4_ref)
+# RK3 time stepping (docs/plans/2026-10-28-rk3.md), test_rk3 on the rotated pi at np 1 and 2: the
+# knobs, the kernel hooks, the stage building blocks (parts K, R1-R11 in the file's header).
+add_fesom_test(test_rk3 1)
+set_tests_properties(test_rk3_np1 PROPERTIES ENVIRONMENT "FESOM3_MESH_DIR=${_mesh_pi};FESOM3_TEST_ROTATE=1")
+require_files(test_rk3_np1 ${_mesh_pi}/nod2d.out)
+add_mesh_test(test_rk3_np2 test_rk3 ${_mesh_pi} 2 FESOM3_TEST_ROTATE=1)
 # The driver-facing stops in fesom_conserve's se_init (the regex pair of the wsplit guards: the
 # message, and the step-0 line the driver prints only if it went on): a bad FESOM3_SSH_SE, a bad
 # FESOM3_SE_M, and M = 1 below the CFL-guard minimum.

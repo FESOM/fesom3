@@ -105,6 +105,7 @@ program fesom_lifecycle_native_mr
     use oce_ssh_solve,      only: ssh_solve_preconditioner   ! zstar exact resume (cold-matrix preconditioner)
     use mod_step_oce,       only: step_oce
     use oce_ssh_se,         only: se_init
+    use oce_rk3,            only: rk3_init
     use mod_io_meshdiag,    only: meshdiag_write
     use mod_io_means,       only: t_io_means, t_io_config, t_io_entry, t_means_clock, MEANS_MAXF, &
                                   means_init, means_read_namelist, means_define_node2d, &
@@ -969,7 +970,9 @@ program fesom_lifecycle_native_mr
     !===========================================================================
     ! Split-explicit barotropic solver (FESOM3_SSH_SE; a silent no-op when unset): knobs, SE
     ! state, cold-start rings from eta_n/uv, CFL guard. After the whole cold init, before the
-    ! restart block, so that a restart read overwrites the cold rings.
+    ! restart block, so that a restart read overwrites the cold rings. RK3 (FESOM3_RK3, also a
+    ! silent no-op when unset) comes first: knobs, guards, the stage arrays.
+    call rk3_init(dyn, mesh, partit)
     call se_init(dyn, mesh, partit, dt)
 
     !===========================================================================

@@ -180,6 +180,21 @@ module mod_dyn
         logical            :: se_msl0_set = .false.
         real(kind=WP_full) :: se_fwmsl    = 0.0_WP_full
 
+        ! ---- RK3 time stepping (FESOM3_RK3, src/oce/oce_rk3.F90) ----
+        ! The knobs (env, rk3_read_env) and the stage state of docs/plans/2026-10-28-rk3.md
+        ! (Technical Details §1). rk3_init sets them and allocates the arrays ONLY when RK3 is
+        ! on; the AB2 path never touches them. Not in write/read_t_dyn and not in the
+        ! checkpoint: RK3 is self-starting, the arrays are scratch within one step.
+        logical       :: use_rk3       = .false.   ! FESOM3_RK3=1
+        integer       :: rk3_lo_nsub   = 1         ! FCT low-order substeps in stage 3 (FESOM3_RK3_LO_NSUB)
+        logical       :: rk3_check     = .false.   ! per-step invariant line (FESOM3_RK3_CHECK)
+        real(kind=WP) :: rk3_check_tol = 0.0_WP    ! stop above it, 0 = report only (FESOM3_RK3_CHECK_TOL)
+        logical       :: rk3_ready     = .false.   ! rk3_init done; step_oce refuses FESOM3_RK3=1 otherwise
+        real(kind=WP), allocatable, dimension(:,:,:) :: rk3_us     ! (2,nl-1,nElemF): the stage velocity u*, u**
+        real(kind=WP), allocatable, dimension(:,:,:) :: rk3_visc   ! (2,nl-1,nElemF): viscous increment of u^n over tau
+        real(kind=WP), allocatable, dimension(:)     :: rk3_H      ! (nElemL): H_e = sum_k helem, every step
+        real(kind=WP), allocatable, dimension(:,:)   :: rk3_sbar0  ! (2,nElemL): sum_k helem*u^n (FESOM3_RK3_CHECK)
+
         ! ---- sub-objects ----
         type(t_solverinfo) :: solverinfo
         type(t_dyn_work)   :: work
