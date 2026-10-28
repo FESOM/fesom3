@@ -46,7 +46,7 @@ module oce_dyn_vinv
 
 contains
 
-    subroutine relative_vorticity(dynamics, mesh, partit)
+    subroutine relative_vorticity(dynamics, mesh, partit, uv_in)
         ! Block A. zeta = curl(u) at nodes, as the circulation integral around the median-
         ! dual contour (qq oce_vinv_mom_adv.F90:5-61).
         !
@@ -68,9 +68,11 @@ contains
         ! Cavity: the TOP asymmetry (one adjacent element shallower at the surface) is NOT
         ! handled -- the ranges below start at the deeper ulevels. Untested without a
         ! cavity mesh, like the rest of the tree's cavity paths.
+        ! uv_in: RK3, the velocity whose curl is taken (absent = dyn%uv; compute_vel_rhs).
         type(t_mesh),   intent(in)              :: mesh
         type(t_dyn),    intent(inout), target   :: dynamics
         type(t_partit), intent(in),    optional :: partit
+        real(kind=WP),  intent(in),    optional, target :: uv_in(:,:,:)
         integer       :: n, nz, edge, el(2), enodes(2), ul1, ul2, nl1, nl2, nboth, ultop
         integer       :: nNodO, nNodL, nEdgeO, nElemO
         real(kind=WP) :: dx1, dy1, dx2, dy2, c1
@@ -78,7 +80,11 @@ contains
         real(kind=WP), dimension(:,:,:), pointer :: UV
 
         vort => dynamics%work%vorticity
-        UV   => dynamics%uv
+        if (present(uv_in)) then
+            UV => uv_in
+        else
+            UV => dynamics%uv
+        end if
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
 
         ! Zero the FULL local range -- owned AND halo, all levels. The scatter below writes
@@ -149,12 +155,14 @@ contains
         if (is_multirank(partit)) call exchange_nod(vort, partit)
     end subroutine relative_vorticity
 
-    subroutine momentum_adv_vinv(dynamics, mesh, partit)
+    subroutine momentum_adv_vinv(dynamics, mesh, partit, uv_in)
         ! Blocks B and C. ADDS  zeta x u - grad(KE) - w du/dz  into UV_rhsAB(1,1:2,:).
         ! compute_vel_rhs step (3) already put f x u there, so the sum is (f+zeta) x u.
+        ! uv_in: RK3, the velocity of the whole operator (absent = dyn%uv; compute_vel_rhs).
         type(t_mesh),   intent(in)              :: mesh
         type(t_dyn),    intent(inout), target   :: dynamics
         type(t_partit), intent(in),    optional :: partit
+        real(kind=WP),  intent(in),    optional, target :: uv_in(:,:,:)
         integer       :: n, nz, elem, ed, elnodes(MAX_NV), ul, nl1, k, k2, nb, nElemF
         integer       :: nNodO, nNodL, nEdgeO, nElemO
         real(kind=WP) :: ea, pre(MAX_NV), Fx, Fy, zb, w, umean, vmean, h1, h2, da, hinv, ke_e
@@ -168,12 +176,16 @@ contains
         real(kind=WP), dimension(:,:,:,:), pointer :: UV_rhsAB
 
         vort     => dynamics%work%vorticity
-        UV       => dynamics%uv
+        if (present(uv_in)) then
+            UV => uv_in
+        else
+            UV => dynamics%uv
+        end if
         UV_rhsAB => dynamics%uv_rhsAB
         Wv       => dynamics%w_e
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
 
-        call relative_vorticity(dynamics, mesh, partit)
+        call relative_vorticity(dynamics, mesh, partit, uv_in=uv_in)
 
         !___________________________________________________________________
         ! rvo_upwind: element-centre vorticity for the upwind face reconstruction.

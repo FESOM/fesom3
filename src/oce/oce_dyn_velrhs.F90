@@ -43,6 +43,14 @@ module oce_dyn_velrhs
     !    convention (ab_lvl=1, comp, nz, elem) for AB_order==2.
     !  - 1-rank only: the ported part of compute_vel_rhs has NO halo exchange (those
     !    live in the skipped momentum_adv_scalar); UV_rhs is element-local.
+    !
+    ! RK3 (docs/plans/2026-10-28-rk3.md, D5): two optional arguments, absent = the code above.
+    !  - uv_in: the velocity the right-hand side is evaluated on (the RK3 stage velocity
+    !    u*, u** in dyn%rk3_us; dyn%uv holds u^n during the step). It replaces dyn%uv in the
+    !    Coriolis term and in the momentum advection (momentum_adv_vinv / relative_vorticity /
+    !    momentum_adv_scalar). Same extents as dyn%uv (owned + eDim elements valid).
+    !  - no_history: the Euler weights without the AB history, UV_rhs starts at 0 (uv_rhsAB
+    !    of the previous step is not read) and ff = 1. Under RK3 uv_rhsAB is scratch.
     use mod_precision, only: WP
     use mod_mesh,      only: t_mesh, MAX_NV
     use mod_dyn,       only: t_dyn
@@ -58,27 +66,37 @@ module oce_dyn_velrhs
 
 contains
 
-    subroutine compute_vel_rhs(dynamics, mesh, dt, lfirst, partit)
+    subroutine compute_vel_rhs(dynamics, mesh, dt, lfirst, partit, uv_in, no_history)
         ! dynamics: uv/uv_rhs/uv_rhsAB/eta_n + work%pgf_x/pgf_y (intent inout).
         ! lfirst: first Euler timestep (ff=1.0). FESOM2's guard is
         !   lfirst .and. .not. r_restart ; v1 has no restart yet (M2.11), so r_restart
         !   is folded out into the lfirst argument supplied by the caller.
+        ! uv_in, no_history: RK3 (module header); absent = dyn%uv and the AB2 weights.
         type(t_dyn),   intent(inout), target :: dynamics
         type(t_mesh),  intent(in),    target :: mesh
         real(kind=WP), intent(in) :: dt
         logical,       intent(in) :: lfirst
         type(t_partit), intent(in), optional :: partit
+        real(kind=WP),  intent(in), optional, target :: uv_in(:,:,:)
+        logical,        intent(in), optional :: no_history
         !_______________________________________________________________________
         integer       :: elem, elnodes(MAX_NV), nz, nzmax, nzmin
         integer       :: nNodO, nNodL, nEdgeO, nElemO
         real(kind=WP) :: ff, Fx, Fy, pre(MAX_NV), p_eta(MAX_NV)
         real(kind=WP) :: ab1, ab2
+        logical       :: nohist
         real(kind=WP), dimension(:,:,:),   pointer :: UV, UV_rhs
         real(kind=WP), dimension(:,:,:,:), pointer :: UV_rhsAB
         real(kind=WP), dimension(:),       pointer :: eta_n
         real(kind=WP), dimension(:,:),     pointer :: pgf_x, pgf_y
 
-        UV       => dynamics%uv
+        if (present(uv_in)) then
+            UV => uv_in
+        else
+            UV => dynamics%uv
+        end if
+        nohist = .false.
+        if (present(no_history)) nohist = no_history
         UV_rhs   => dynamics%uv_rhs
         UV_rhsAB => dynamics%uv_rhsAB
         eta_n    => dynamics%eta_n
@@ -96,11 +114,18 @@ contains
             nzmax = mesh%nlevels(elem)
             nzmin = mesh%ulevels(elem)
 
-            ! (1) AB part: init UV_rhs from the previous-step AB array (AB2)
-            do nz = nzmin, nzmax-1
-                UV_rhs(1,nz,elem) = ab1*UV_rhsAB(1,1,nz,elem)
-                UV_rhs(2,nz,elem) = ab1*UV_rhsAB(1,2,nz,elem)
-            end do
+            ! (1) AB part: init UV_rhs from the previous-step AB array (AB2); RK3: from 0
+            if (nohist) then
+                do nz = nzmin, nzmax-1
+                    UV_rhs(1,nz,elem) = 0.0_WP
+                    UV_rhs(2,nz,elem) = 0.0_WP
+                end do
+            else
+                do nz = nzmin, nzmax-1
+                    UV_rhs(1,nz,elem) = ab1*UV_rhsAB(1,1,nz,elem)
+                    UV_rhs(2,nz,elem) = ab1*UV_rhsAB(1,2,nz,elem)
+                end do
+            end if
 
             ! (2) SSH gradient contribution -g*grad(eta) + Coriolis factor.
             !     p_air (l_mslp) and p_ice (use_pice, linfs) are 0 on pi -> dropped.
@@ -130,15 +155,15 @@ contains
         ! ALE, oce_ale_vel_rhs.F90:268), so ours has no oracle -- see that module's header.
         ! Both branches only ADD into UV_rhsAB, so (4) below is common to them.
         if (dynamics%momadv_opt == 1) then
-            call momentum_adv_vinv(dynamics, mesh, partit)
+            call momentum_adv_vinv(dynamics, mesh, partit, uv_in=uv_in)
         else if (dynamics%momadv_opt == 2) then
-            call momentum_adv_scalar(dynamics, mesh, partit)
+            call momentum_adv_scalar(dynamics, mesh, partit, uv_in=uv_in)
         end if
 
         !_______________________________________________________________________
         ! (4) AB blend + scale by dt/elem_area. First Euler step -> ff=1.0 else ab2.
         ff = ab2
-        if (lfirst) ff = 1.0_WP
+        if (lfirst .or. nohist) ff = 1.0_WP
         do elem = 1, nElemO
             nzmin = mesh%ulevels(elem)
             nzmax = mesh%nlevels(elem)
@@ -150,7 +175,7 @@ contains
     end subroutine compute_vel_rhs
 
     !==========================================================================
-    subroutine momentum_adv_scalar(dynamics, mesh, partit)
+    subroutine momentum_adv_scalar(dynamics, mesh, partit, uv_in)
         ! Momentum advection on scalar (nodal) control volumes with ALE adaption.
         ! Transcribed VERBATIM from FESOM2 v2.7.3 oce_ale_vel_rhs.F90:335-589. Three
         ! passes:
@@ -179,9 +204,11 @@ contains
         !  - 1-rank only: exchange_nod(UVnode_rhs) is a no-op (lifted at M2.12). The
         !    `nod(1:2) <= nod2D` guards are always true at 1-rank (kept for multi-rank
         !    fidelity). OpenMP locks/ordered are dropped (FESOM3 v1 is serial).
+        ! uv_in: RK3, the velocity advected and advecting (absent = dyn%uv; compute_vel_rhs).
         type(t_dyn),  intent(inout), target :: dynamics
         type(t_mesh), intent(in),    target :: mesh
         type(t_partit), intent(in), optional :: partit
+        real(kind=WP),  intent(in), optional, target :: uv_in(:,:,:)
         !______________________________________________________________________
         integer :: n, nz, el1, el2, nl1, nl2, ul1, ul2, nod(2), el, ed, k, nle, ule
         integer :: nNodO, nNodL, nEdgeO, nElemO
@@ -191,7 +218,11 @@ contains
         real(kind=WP), dimension(:,:,:,:), pointer :: UV_rhsAB
         real(kind=WP), dimension(:,:),     pointer :: Wvel_e
 
-        UV         => dynamics%uv
+        if (present(uv_in)) then
+            UV => uv_in
+        else
+            UV => dynamics%uv
+        end if
         UV_rhsAB   => dynamics%uv_rhsAB
         UVnode_rhs => dynamics%work%uvnode_rhs
         Wvel_e     => dynamics%w_e
