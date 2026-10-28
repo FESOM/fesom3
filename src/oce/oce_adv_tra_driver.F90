@@ -43,7 +43,10 @@ module oce_adv_tra_driver
     !    explicit with w_e from T^(k) and implicit with w_i (the stage-3 split), the low-order
     !    fluxes (horizontal; vertical with the full w) averaged over the substeps; then the
     !    high order on valuesAB (T**) minus that mean as the antidiffusive flux, the limiter
-    !    against T^n and the low-order solution T^(N), and the scatter. At N = 1 this is
+    !    against T^n and the low-order solution T^(N), and the scatter. Under zstar the substeps
+    !    run on the interpolated thicknesses h^(k) = h^n + (k/N)(h^{n+1} - h^n) (h^(0) = hnode,
+    !    h^(N) = hnode_new exactly): each goes h^(k) -> h^(k+1) with 1/N of the transport, so the
+    !    substeps keep constants. At N = 1 this is
     !    do_oce_adv_tra's FCT path bitwise (test_rk3 R6); the RK3 step itself calls
     !    do_oce_adv_tra there and for every non-FCT tracer (stage 3 with N = 1 is today's
     !    operator on T**).
@@ -296,6 +299,7 @@ contains
         real(kind=WP_full), pointer :: dttf_h(:,:), dttf_v(:,:)
         real(kind=WP), pointer :: tr_xy(:,:,:)
         real(kind=WP), pointer :: lo_T(:,:), lo_fh(:,:), lo_fv(:,:), lo_top(:)
+        real(kind=WP_full), allocatable :: hk(:,:), hk1(:,:)
         real(kind=WP) :: opth, optv, rn, dts
         integer       :: k, e, n, nz, enodes(2), el(2), nl1, nl2, nu1, nu2, nl12, nu12
         integer       :: nNodO, nNodL, nEdgeO, nElemO
@@ -348,8 +352,18 @@ contains
         do e = 1, nEdgeO
             lo_fh(:, e) = 0.0_WP
         end do
+        ! the substep thicknesses h^(k-1) -> h^(k) (both hnode under linfs)
+        allocate(hk(size(fct_LO,1), size(fct_LO,2)), hk1(size(fct_LO,1), size(fct_LO,2)))
+        hk1 = mesh%hnode(:, 1:size(fct_LO,2))
 
         do k = 1, nsub
+            hk = hk1
+            if (k == nsub) then
+                hk1 = mesh%hnode_new(:, 1:size(fct_LO,2))
+            else
+                hk1 = mesh%hnode(:, 1:size(fct_LO,2)) + (real(k, WP)/real(nsub, WP)) &
+                    *(mesh%hnode_new(:, 1:size(fct_LO,2)) - mesh%hnode(:, 1:size(fct_LO,2)))
+            end if
             ! explicit: horizontal upwind of T^(k-1) scattered into fct_LO, vertical upwind with w_e
             call adv_tra_hor_upw1(vel, lo_T, mesh, adv_flux_hor, o_init_zero=.true., partit=partit)
             do n = 1, nNodL
@@ -380,14 +394,14 @@ contains
                 nu1 = mesh%ulevels_nod2D(n)
                 nl1 = mesh%nlevels_nod2D(n)
                 do nz = nu1, nl1-1
-                    fct_LO(nz,n) = (lo_T(nz,n)*mesh%hnode(nz,n) &
+                    fct_LO(nz,n) = (lo_T(nz,n)*hk(nz,n) &
                                   + (fct_LO(nz,n) + (adv_flux_ver(nz,n)-adv_flux_ver(nz+1,n)))*dts/mesh%areasvol(n)) &
-                                  / mesh%hnode_new(nz,n)
+                                  / hk1(nz,n)
                 end do
             end do
             ! implicit: w_i over dt/nsub, then the low-order vertical flux with the full w
             if (dynamics%use_wsplit) then
-                call adv_tra_vert_impl(dts, wi, fct_LO, mesh, partit=partit)
+                call adv_tra_vert_impl(dts, wi, fct_LO, mesh, partit=partit, hnew=hk1)
                 call adv_tra_ver_upw1(w, lo_T, mesh, adv_flux_ver, o_init_zero=.true., partit=partit)
             end if
             ! the substep means: low-order fluxes and the surface transport

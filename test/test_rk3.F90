@@ -94,6 +94,11 @@ program test_rk3
     !       stage 3 the W of the stretch cancels vert_vel_ale's -W (the free surface moves with the
     !       freshwater; SE_CHECK_TAIL's w1 measures the same; the plan's "-W" was a slip).
     !       Positive control: stage 3 without water_flux leaves w(top) = W
+    !   Z3  zstar three-stage constancy: uniform T0 (FCT T, non-FCT S) through the stages on h_1,
+    !       h_2 and solve_tracers_rk3 to h^{n+1} /= h^n, N = 1, 2, 3: T^{n+1} = T0 to 1e-13 relative
+    !   R7z the stage-3 low order on h^n -> h^{n+1} /= h^n (Task 19), N = 1, 2, 3: a uniform T0 stays
+    !       T0 (fct_LO and T^{n+1}, 1e-13); a hashed tracer keeps its content sum T*h*areasvol
+    !       (zstar: w(top) = 0, no surface flux), 1e-13
     !   G   (FESOM3_TEST_RK3_GUARD=alpha|cavity, with FESOM3_RK3=1; separate ctest cases) the
     !       rk3_init guards stop the run: alpha = 0.5, or a node with ulevels_nod2D = 2. The run
     !       prints "test_rk3: GUARD NOT TRIGGERED" and fails if rk3_init returns.
@@ -1389,9 +1394,13 @@ contains
 
     !===========================================================================
     subroutine z_zstar()
-        ! Z1, Z2 (header) under which_ALE = zstar; the linfs geometry is restored after
+        ! Z1, Z2, Z3, R7z (header) under which_ALE = zstar; the linfs geometry is restored after
         which_ALE = 'zstar'
         call z12_geometry()
+        call setup_thickness()
+        call r7z_substeps()
+        call setup_thickness()
+        call z3_constancy()
         which_ALE = 'linfs'
         call setup_thickness()
     end subroutine z_zstar
@@ -1489,6 +1498,110 @@ contains
         call wtop(d, wt, wmax, wf)
         call check(wt <= 1.0e-12_WP*wmax, 'Z2 positive control: without water_flux w(top) = W', mype)
     end subroutine z12_geometry
+
+    real(kind=WP) function content_h(T, h)
+        ! sum over the owned nodes and wet layers of T*h*areasvol, all ranks
+        real(kind=WP), intent(in) :: T(:,:), h(:,:)
+        integer :: n, nz
+        content_h = 0.0_WP
+        do n = 1, nNodO
+            do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n) - 1
+                content_h = content_h + T(nz, n)*h(nz, n)*mesh%areasvol(n)
+            end do
+        end do
+        call sum_all(content_h, partit)
+    end function content_h
+
+    subroutine r7z_substeps()
+        type(t_dyn)    :: d
+        type(t_tracer) :: tr
+        real(kind=WP), allocatable :: Tnew(:,:)
+        real(kind=WP) :: dev, devlo, c0, c1, dh
+        integer :: nsub, nsplit, mype
+        character(len=8) :: tag
+        mype = partit%mype
+        call new_dyn(d, 2)
+        call new_rk3(d)
+        d%use_wsplit = .true.; d%wsplit_maxcfl = 1.0e-3_WP; d%wsplit_mincfl = 0.5e-3_WP
+        call new_tracers(tr)
+        call hashed_state(d, 141)
+        d%eta_n = 0.0_WP; mesh%hbar = 0.0_MP; mesh%hbar_old = 0.0_MP
+        call rk3_implied_eta(dt, d%uv, d, mesh, partit)
+        call vert_vel_ale(d, mesh, dt, partit)
+        dh = maxval(abs(mesh%hnode_new(:, 1:nNodO) - mesh%hnode(:, 1:nNodO)))
+        call max_all(dh, partit)
+        nsplit = count(d%w_i(:, 1:nNodO) /= 0.0_WP)
+        call sum_all(nsplit, partit)
+        call check(dh > 1.0e-6_WP .and. nsplit > 100, 'R7z precondition: h^{n+1} /= h^n, split faces', mype)
+        allocate(Tnew(nl-1, nNodL))
+        do nsub = 1, 3
+            write(tag, '(a,i0)') 'N=', nsub
+            call set_tracer(tr%data(1)%values, 7.3_WP, 0.0_WP, 0)
+            tr%data(1)%valuesAB = tr%data(1)%values
+            call rk3_tracer_prep(1, tr, mesh, partit)
+            call do_oce_adv_tra_rk3(dt, d%uv, d%w, d%w_i, d%w_e, 1, 3, nsub, d, tr, mesh, partit)
+            call stage3_update(tr, 1, Tnew)
+            devlo = maxdev(tr%work%fct_LO, 7.3_WP); dev = maxdev(Tnew, 7.3_WP)
+            call check(devlo <= 1.0e-13_WP*7.3_WP .and. dev <= 1.0e-13_WP*7.3_WP, &
+                       'R7z zstar constancy of fct_LO and T^{n+1}, '//trim(tag), mype)
+            call set_tracer(tr%data(1)%values,   10.0_WP, 4.0_WP, 17)
+            call set_tracer(tr%data(1)%valuesAB, 10.0_WP, 4.0_WP, 19)
+            call rk3_tracer_prep(1, tr, mesh, partit)
+            call do_oce_adv_tra_rk3(dt, d%uv, d%w, d%w_i, d%w_e, 1, 3, nsub, d, tr, mesh, partit)
+            call stage3_update(tr, 1, Tnew)
+            c0 = content_h(tr%data(1)%values, real(mesh%hnode, WP)); c1 = content_h(Tnew, real(mesh%hnode_new, WP))
+            call check(abs(c1 - c0) <= 1.0e-13_WP*abs(c0), 'R7z zstar content conserved, '//trim(tag), mype)
+            if (mype == 0) write(*,'(a,a,a,es9.2,a,es9.2,a,es9.2)') 'test_rk3: R7z ', trim(tag), ' max|LO - T0| ', &
+                devlo, ', max|T - T0| ', dev, ', |dC|/C ', abs(c1 - c0)/abs(c0)
+        end do
+    end subroutine r7z_substeps
+
+    subroutine z3_constancy()
+        type(t_dyn)    :: d
+        type(t_tracer) :: tr, tr0
+        real(kind=WP), allocatable :: Ki(:,:), hf(:), wf(:), vs(:), rs(:), sf(:), u2(:,:,:)
+        real(kind=WP) :: dev(2)
+        integer :: nsub, mype
+        character(len=8) :: tag
+        mype = partit%mype
+        do nsub = 1, 3
+            write(tag, '(a,i0)') 'N=', nsub
+            call setup_thickness()
+            call new_dyn(d, 2)
+            call new_rk3(d)
+            d%use_wsplit = .true.; d%wsplit_maxcfl = 1.0e-3_WP; d%wsplit_mincfl = 0.5e-3_WP
+            call rest_inputs(d, Ki, hf, wf, vs, rs, sf)
+            hf = 0.0_WP; wf = 0.0_WP; vs = 0.0_WP; rs = 0.0_WP
+            call new_tracers(tr)
+            call set_tracer(tr%data(1)%values, 7.3_WP, 0.0_WP, 0)
+            call set_tracer(tr%data(2)%values, 34.7_WP, 0.0_WP, 0)
+            call hashed_uv(d%uv, 151)
+            allocate(u2(2, nl-1, nElemF))
+            call hashed_uv(u2, 152)
+            call hashed_uv(d%rk3_us, 153)
+            d%eta_n = 0.0_WP; mesh%hbar = 0.0_MP; mesh%hbar_old = 0.0_MP
+            call rk3_depth(d, mesh, partit)
+            call rk3_implied_eta(dt/3.0_WP, d%uv, d, mesh, partit)
+            call vert_vel_ale(d, mesh, dt/3.0_WP, partit, split=.false., bolus=.false.)
+            call rk3_tracer_stage(1, dt/3.0_WP, d%uv, d%w, d, tr, mesh, partit)
+            call rk3_stage_geometry(d, mesh, partit)
+            call rk3_implied_eta(0.5_WP*dt, u2, d, mesh, partit)
+            call vert_vel_ale(d, mesh, 0.5_WP*dt, partit, uv_in=u2, split=.false., bolus=.false.)
+            call rk3_tracer_stage(2, 0.5_WP*dt, u2, d%w, d, tr, mesh, partit)
+            call rk3_stage_geometry(d, mesh, partit)
+            call rk3_implied_eta(dt, d%rk3_us, d, mesh, partit)
+            call vert_vel_ale(d, mesh, dt, partit, water_flux=wf, uv_in=d%rk3_us)
+            call solve_tracers_rk3(dt, nsub, d, tr, mesh, Ki, hf, wf, vs, rs, sf, 1.0_WP, partit)
+            dev(1) = maxdev(tr%data(1)%values, 7.3_WP)
+            dev(2) = maxdev(tr%data(2)%values, 34.7_WP)
+            call check(dev(1) <= 1.0e-13_WP*7.3_WP .and. dev(2) <= 1.0e-13_WP*34.7_WP, &
+                       'Z3 zstar three-stage constancy, '//trim(tag), mype)
+            if (mype == 0) write(*,'(a,a,a,2es9.2)') 'test_rk3: Z3 ', trim(tag), ' max|T - T0| (FCT, not) ', dev
+            deallocate(u2)
+            call free_dyn(d)
+            tr = tr0
+        end do
+    end subroutine z3_constancy
 
     subroutine good(name, str)
         character(len=*), intent(in) :: name, str

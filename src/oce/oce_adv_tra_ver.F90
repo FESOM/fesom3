@@ -140,7 +140,7 @@ contains
     end subroutine adv_tra_ver_qr4c
 
     !===========================================================================
-    subroutine adv_tra_vert_impl(dt, w, ttf, mesh, partit, tend)
+    subroutine adv_tra_vert_impl(dt, w, ttf, mesh, partit, tend, hnew)
         ! Implicit (backward-Euler) 1st-order upwind vertical advection of the OWNED
         ! columns with the implicit part w_i of the split vertical velocity (use_wsplit,
         ! oce_wsplit / compute_Wvel_split), applied IN PLACE to the FCT low-order solution
@@ -192,19 +192,28 @@ contains
         ! M2.12c: OWNED node loop (FESOM2 :120 do n=1,myDim_nod2D); the TDMA is per column
         ! (no halo coupling); the driver's exchange_nod(fct_LO) follows.
         real(kind=WP), intent(in)    :: dt
-        type(t_mesh),  intent(in)    :: mesh
+        type(t_mesh),  intent(in), target :: mesh
         real(kind=WP), intent(in)    :: w  (mesh%nl,   mesh%nod2D)
         real(kind=WP), intent(inout) :: ttf(mesh%nl-1, mesh%nod2D)
         type(t_partit), intent(in), optional :: partit
         ! single precision: the low-order tendency in flux form gets the implicit increment
         ! tr*hnode_new too (upstream #1056 tend argument); the column scratch is WP_full (#1206)
         real(kind=WP_full), intent(inout), optional :: tend(mesh%nl-1, mesh%nod2D)
+        ! RK3 low-order substeps under zstar (docs/plans/2026-10-28-rk3.md, Task 19): the new
+        ! thickness of the substep, h^(k+1), in place of hnode_new (absent = hnode_new)
+        real(kind=WP_full), intent(in), optional, target :: hnew(:,:)
         real(kind=WP_full) :: a(mesh%nl), b(mesh%nl), c(mesh%nl), tr(mesh%nl), cp(mesh%nl), tp(mesh%nl)
         real(kind=WP_full) :: v, m, hn
+        real(kind=WP_full), pointer :: hh(:,:)
         integer :: n, nz, nzmax, nzmin
         integer :: nNodO, nNodL, nEdgeO, nElemO
 
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
+        if (present(hnew)) then
+            hh => hnew
+        else
+            hh => mesh%hnode_new
+        end if
         do n = 1, nNodO
             nzmax = mesh%nlevels_nod2D(n)
             nzmin = mesh%ulevels_nod2D(n)
@@ -213,30 +222,30 @@ contains
             ! coefficients: surface layer
             nz = nzmin
             a(nz) = 0.0_WP
-            b(nz) = mesh%hnode_new(nz,n) + w(nz,n)*v - min(0.0_WP, w(nz+1,n))*v
+            b(nz) = hh(nz,n) + w(nz,n)*v - min(0.0_WP, w(nz+1,n))*v
             c(nz) =                                  - max(0.0_WP, w(nz+1,n))*v
             ! interior layers
             do nz = nzmin+1, nzmax-2
                 a(nz) =                        min(0.0_WP, w(nz,n))*v
-                b(nz) = mesh%hnode_new(nz,n) + max(0.0_WP, w(nz,n))*v - min(0.0_WP, w(nz+1,n))*v
+                b(nz) = hh(nz,n) + max(0.0_WP, w(nz,n))*v - min(0.0_WP, w(nz+1,n))*v
                 c(nz) =                                              - max(0.0_WP, w(nz+1,n))*v
             end do
             ! bottom layer: zero bottom flux
             nz = nzmax-1
             a(nz) =                        min(0.0_WP, w(nz,n))*v
-            b(nz) = mesh%hnode_new(nz,n) + max(0.0_WP, w(nz,n))*v
+            b(nz) = hh(nz,n) + max(0.0_WP, w(nz,n))*v
             c(nz) = 0.0_WP
 
             ! rhs = -(M - h')*T, the explicit upwind flux divergence of the current T
             nz = nzmin
-            hn = mesh%hnode_new(nz,n)
+            hn = hh(nz,n)
             tr(nz) = -(b(nz)-hn)*ttf(nz,n) - c(nz)*ttf(nz+1,n)
             do nz = nzmin+1, nzmax-2
-                hn = mesh%hnode_new(nz,n)
+                hn = hh(nz,n)
                 tr(nz) = -a(nz)*ttf(nz-1,n) - (b(nz)-hn)*ttf(nz,n) - c(nz)*ttf(nz+1,n)
             end do
             nz = nzmax-1
-            hn = mesh%hnode_new(nz,n)
+            hn = hh(nz,n)
             tr(nz) = -a(nz)*ttf(nz-1,n) - (b(nz)-hn)*ttf(nz,n)
 
             ! Thomas sweep (c-prime / t-prime), then back substitution
@@ -259,7 +268,7 @@ contains
             end do
             if (present(tend)) then
                 do nz = nzmin, nzmax-1
-                    tend(nz,n) = tend(nz,n) + tr(nz)*mesh%hnode_new(nz,n)
+                    tend(nz,n) = tend(nz,n) + tr(nz)*hh(nz,n)
                 end do
             end if
         end do
