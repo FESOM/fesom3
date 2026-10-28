@@ -57,7 +57,8 @@ module oce_pressure_bv
 contains
 
     !===========================================================================
-    subroutine pressure_bv(temp, salt, density_ref, mesh, density_m_rho0, hpressure, bvfreq, partit, dbsfc, bvfreq_raw)
+    subroutine pressure_bv(temp, salt, density_ref, mesh, density_m_rho0, hpressure, bvfreq, partit, dbsfc, bvfreq_raw, &
+                           pressure_only)
         ! temp/salt/density_ref: (nl-1, nod2D) inputs. density_m_rho0: (nl-1, nod2D)
         ! out. hpressure/bvfreq: (nl, nod2D) out (only 1..nzmax used). The caller
         ! pre-zeros the three outputs (see header).
@@ -80,6 +81,11 @@ contains
         ! M?: optional copy of N^2 BEFORE the horizontal smoother, for consumers whose
         ! answer depends on the true local sign (mo_convect). Absent -> nothing written.
         real(kind=WP), intent(inout), optional :: bvfreq_raw(mesh%nl, mesh%nod2D)
+        ! RK3 stages 1-2 (docs/plans/2026-10-28-rk3.md, Task 5): .true. -> the EOS,
+        ! density_m_rho0 and hpressure only; bvfreq, bvfreq_raw and dbsfc are not touched (no
+        ! N^2, no spline, no smoothing): nothing reads N^2 before stage 3 recomputes it, so
+        ! this only keeps the cheap stages cheap. Absent or .false. -> the full call.
+        logical,       intent(in),    optional :: pressure_only
 
         integer       :: node, nz, nzmax, nzmin
         integer       :: nNodO, nNodL, nEdgeO, nElemO
@@ -92,8 +98,11 @@ contains
         real(kind=WP) :: alpha_sp, beta_sp
         real(kind=WP) :: xc_sp(mesh%nl), xi_sp(mesh%nl), tc_sp(mesh%nl), sc_sp(mesh%nl)
         real(kind=WP) :: ti_sp(mesh%nl), si_sp(mesh%nl), dt_sp(mesh%nl), ds_sp(mesh%nl)
+        logical       :: ponly
 
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
+        ponly = .false.
+        if (present(pressure_only)) ponly = pressure_only
 
         !_______________________________________________________________________
         ! Screen salinity (diagnostic; s<0 would break sqrt(s) in the EOS).
@@ -141,7 +150,7 @@ contains
             ! keeps the divide scalar (L29): the oracle's dbsfc1 sits in the db_max-reduction
             ! density loop (scalar); operands are the byte-matched density_m_rho0+density_ref,
             ! so scalar-vs-scalar is exact. dbsfc1(nzmin)=0 (rho_surf==rho_full there).
-            if (present(dbsfc)) then
+            if (present(dbsfc) .and. .not. ponly) then
                 !DIR$ NOVECTOR
                 do nz=nzmin, nzmax-1
                     rho_surf = bulk_0(nzmin) + mesh%Z_3d_n(nz,node)*(bulk_pz(nzmin) + mesh%Z_3d_n(nz,node)*bulk_pz2(nzmin))
@@ -186,6 +195,7 @@ contains
                     hpressure(nz, node)=hpressure(nz-1, node)+a
                 end do
             end if
+            if (ponly) cycle
 
             !___________________________________________________________________
             ! squared Brunt-Vaisala frequency N^2 (defined on full levels except the
@@ -245,6 +255,7 @@ contains
         ! stays inside nNodL like the rest of this routine -- `bvfreq_raw = bvfreq` did not,
         ! and wrote nl*nod2D elements into an nl*nNodL array (heap corruption at 512 ranks,
         ! invisible at np=1 where nNodL == nod2D).
+        if (ponly) return
         if (present(bvfreq_raw)) then
             do node = 1, nNodL
                 bvfreq_raw(:, node) = bvfreq(:, node)

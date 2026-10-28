@@ -24,6 +24,9 @@ program test_rk3
     !       faces exist in the default call (precondition asserted: owned faces with w_i /= 0);
     !       the default call keeps w_e + w_i = w to one spacing; split=.false. gives w bitwise
     !       the default's, w_e == w bitwise and w_i == 0 on every owned + halo face
+    !   P   pressure_bv(pressure_only=.true.) (Task 5): density_m_rho0 and hpressure equal the
+    !       full call's bitwise on owned + halo nodes (the JM EOS on a hashed T/S); bvfreq,
+    !       bvfreq_raw and dbsfc are not touched (a sentinel survives)
     use mpi
     use mod_precision,    only: WP, MP
     use mod_constants,    only: density_0
@@ -57,6 +60,7 @@ program test_rk3
     call r1_momentum_hooks()
     call r1c_vert_vel_hooks()
     call r2_split_off()
+    call p_pressure_only()
     call finish(partit, 'test_rk3')
 
 contains
@@ -375,6 +379,37 @@ contains
         call check(nbad == 0, 'R2 split=.false.: w_e == w, w_i == 0 on every owned + halo face', mype)
         if (mype == 0) write(*,'(a,i0)') 'test_rk3: R2 split faces in the default call: ', nsplit
     end subroutine r2_split_off
+
+    !===========================================================================
+    subroutine p_pressure_only()
+        real(kind=WP), allocatable :: T(:,:), S(:,:), rref(:,:), rho1(:,:), hp1(:,:), bv(:,:), bvr(:,:), db(:,:)
+        real(kind=WP), allocatable :: rho2(:,:), hp2(:,:)
+        integer :: n, nz, mype
+        logical :: smth_save
+        mype = partit%mype
+        smth_save = N2smth_h
+        N2smth_h = .true.
+        allocate(T(nl-1, nNodL), S(nl-1, nNodL), rref(nl-1, nNodL))
+        allocate(rho1(nl-1, nNodL), hp1(nl, nNodL), bv(nl, nNodL), bvr(nl, nNodL), db(nl, nNodL))
+        T = 0.0_WP; S = 0.0_WP; rref = density_0
+        do n = 1, nNodL
+            do nz = mesh%ulevels_nod2D(n), mesh%nlevels_nod2D(n) - 1
+                T(nz, n) = 12.0_WP - 0.002_WP*real(nz, WP)*10.0_WP + 2.0_WP*hval(partit%myList_nod2D(n), nz)
+                S(nz, n) = 35.0_WP + 0.5_WP*hval(partit%myList_nod2D(n), nz + 40)
+            end do
+        end do
+        rho1 = 0.0_WP; hp1 = 0.0_WP; bv = 0.0_WP; bvr = 0.0_WP; db = 0.0_WP
+        call pressure_bv(T, S, rref, mesh, rho1, hp1, bv, partit, dbsfc=db, bvfreq_raw=bvr)
+        call check(any(bv(:, 1:nNodO) /= 0.0_WP), 'P the full call computes N^2 (non-vacuous)', mype)
+        allocate(rho2(nl-1, nNodL), hp2(nl, nNodL))
+        rho2 = 0.0_WP; hp2 = 0.0_WP; bv = -777.0_WP; bvr = -777.0_WP; db = -777.0_WP
+        call pressure_bv(T, S, rref, mesh, rho2, hp2, bv, partit, dbsfc=db, bvfreq_raw=bvr, pressure_only=.true.)
+        call check(same_nod(rho2, rho1), 'P pressure_only: density_m_rho0 bitwise the full call', mype)
+        call check(same_nod(hp2, hp1), 'P pressure_only: hpressure bitwise the full call', mype)
+        call check(all(bv(:, 1:nNodL) == -777.0_WP) .and. all(bvr(:, 1:nNodL) == -777.0_WP) .and. &
+                   all(db(:, 1:nNodL) == -777.0_WP), 'P pressure_only: bvfreq, bvfreq_raw, dbsfc untouched', mype)
+        N2smth_h = smth_save
+    end subroutine p_pressure_only
 
     subroutine good(name, str)
         character(len=*), intent(in) :: name, str
