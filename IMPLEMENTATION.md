@@ -732,8 +732,8 @@ uⁿ⁺¹ is also trimmed to U^M, the barotropic velocity at n+1.
 **The w split (plan D7).** Only stage 3 splits w: its momentum advection uses w_e and the TDMA w_i of the
 stage-3 w; the non-FCT tracers w_e explicitly and w_i in the diffusion TDMA; the FCT tracers the split in the
 low order only (the high order and the antidiffusive flux use the full w), which is `do_oce_adv_tra` on T\*\*.
-A uniform tracer then stays uniform through all three stages (LESSONS L79: w_e in stages 1–2 instead costs an
-O(τ²) defect). The cost is a stability limit for the unlimited quantities: the explicit w_e acts on stage
+Stages 1–2 always advect with the full w (w_e + w_i) of the stage, never with w_e alone: a uniform tracer then
+stays uniform through all three stages (LESSONS L79). The cost is a stability limit for the unlimited quantities: the explicit w_e acts on stage
 values made with the full w, and a vertical upwind mode is stable up to a per-cell Courant number of about 9
 at maxcfl 1 (|1 + z_e·S(z)|/|1 − z_i| ≤ 1, S the stage polynomial); FCT tracers stay bounded by the limiter.
 

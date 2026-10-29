@@ -378,7 +378,7 @@ invariants, determinism and restart exactness:
   bitwise; R7/R8/R9 the low-order substeps (constancy, conservation, boundedness at Courant 1.5 with an
   overshooting N = 1 control, the Zalesak bounds and the unlimited identity on the clean cells, LESSONS L80);
   R10t at rest the stage-3 solve = `solve_tracers_ale` bitwise; R11 three-stage constancy with the split
-  (1.4e-14) and the O(τ²) control (ratio 4.007, L79); R10 the restart key and the cold AB start; Z1–Z3,
+  (1.4e-14, full w in stages 1–2, L79); R10 the restart key and the cold AB start; Z1–Z3,
   R7z zstar (layer sums, w(top) = 0 in every stage, constancy for N = 1..3); G the `rk3_init` guards
   (separate cases). `test_ssh_se` S1–S3: the RK3 barotropic forcing removes pressure and Coriolis exactly.
 - **`FESOM3_RK3_CHECK=1`** — one `RK3_CHECK` line per step: `trim1/2/3` (the stage transports), `etacomp`

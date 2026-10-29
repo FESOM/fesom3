@@ -3141,31 +3141,27 @@ and the gap in the stiffness matrix; this closes the gap.
 (including "setup" objects that a step modifies, and lazily-built caches) and gate a straight-vs-split
 run with that option ON. Check that each restored piece is needed by skipping it once.
 
-## L79 — An RK3 stage keeps a uniform tracer uniform only if it advects with the same w its continuity used: splitting w before the last stage costs an O(τ²) defect, splitting it in the last stage costs nothing
+## L79 — An RK3 stage keeps a uniform tracer uniform only if it advects with the full w its continuity used: stages 1–2 take the full w, the split of w lives only in the last stage, where an implicit solve closes it
 
-**Context.** RK3 time stepping (`FESOM3_RK3`, docs/plans/completed/2026-10-28-rk3.md, D7, 2026-10-28).
-The first plan used the AB2 rule in every stage (explicit w_e, implicit w_i); Dmitry changed it after
-reading `rk3.tex`: stages 1–2 advect with the full w of the stage, the split exists only in stage 3.
+**Context.** RK3 time stepping (`FESOM3_RK3`, docs/plans/completed/2026-10-28-rk3.md, D7, 2026-10-28,
+Dmitry after reading `rk3.tex`): stages 1–2 advect with the full w (w_e + w_i) of the stage, the split exists
+only in stage 3. w_e alone is never used in stages 1–2.
 
 **What happened.**
 - A stage update T_s h_s = Tⁿ hⁿ + τ_s·D(T_{s−1}; u_{s−1}, w_{s−1}) returns a uniform T₀ only if the
-  vertical flux uses the w that closes the stage's continuity. With w_e alone the w_i part of the
-  transport is missing and T\* ≠ T₀; stage 3 then advects that error. `test_rk3` R11 measures the
-  dropped rule: the non-FCT defect is 8.06e-3 at τ and 2.01e-3 at τ/2 (the cap halved with τ, so the
-  split fraction is the same): ratio 4.007, O(τ²). With the full w in stages 1–2 the three stages keep
-  T₀ to 1.4e-14.
+  vertical flux uses the w that closes the stage's continuity, i.e. the full w of the stage. `test_rk3`
+  R11 runs the three stages that way, with split faces present in stage 3: T₀ is kept to 1.4e-14
+  (non-FCT) and 3.6e-15 (FCT).
 - In stage 3 the split is harmless for constancy: the explicit w_e step leaves T₀ plus the w_i part,
   and the implicit w_i solve (the tracer TDMA for non-FCT tracers, `adv_tra_vert_impl` for the FCT low
   order) takes it out again — the C2 argument of `test_wimpl_tra`, which holds for any split.
 - The price is stability, not accuracy: the explicit w_e of stage 3 acts on stage values made with the
   full w, so momentum and non-FCT tracers are stable only up to a per-cell vertical Courant number of
-  about 9 at maxcfl 1 (plan §5); w_e in every stage is stable at any Courant number. The screens record
-  max CFL_z (`RK3_CHECK cflz=`).
+  about 9 at maxcfl 1 (plan §5). The screens record max CFL_z (`RK3_CHECK cflz=`).
 
 **How to apply.** In a multi-stage scheme, check each intermediate stage for the uniform-field identity
-with the stage's own w before thinking about stability; a split of w belongs where an implicit solve
-closes it. Pin the property with a unit test and a positive control that measures the order of the
-defect.
+with the stage's own full w before thinking about stability; a split of w belongs only where an implicit
+solve closes it. Pin the property with a unit test that asserts split faces are present.
 
 ## L80 — "No flux limited" cannot be arranged on a global coastline mesh: test the FCT identity on the cells whose every incident flux is unlimited
 

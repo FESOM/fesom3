@@ -313,9 +313,8 @@ contains
     subroutine rk3_tracer_stage(stage, tau_s, vel, w, dynamics, tracers, mesh, partit)
         ! Stage s = 1, 2 of every tracer (module header): valuesAB := T^n first (stage 1), then
         ! per tracer rk3_tracer_prep, the high order of valuesAB (do_oce_adv_tra_rk3) with the
-        ! stage velocity vel and the vertical velocity w (the step passes the full w of the
-        ! stage; test_rk3 R11 also w_e, the dropped rule), the stage update on the owned nodes
-        ! and exchange_nod(valuesAB).
+        ! stage velocity vel and the full vertical velocity w of the stage (plan D7: no split
+        ! before stage 3), the stage update on the owned nodes and exchange_nod(valuesAB).
         integer,        intent(in)            :: stage
         real(kind=WP),  intent(in)            :: tau_s
         real(kind=WP),  intent(in)            :: vel(:,:,:)
@@ -422,8 +421,8 @@ contains
     !===========================================================================
     subroutine rk3_momentum_rhs(stage, tau_s, dynamics, mesh, partit)
         ! R_s from compute_vel_rhs on u^n (s = 1) or u* (s = 2, dyn%rk3_us) into uv_rhs (owned
-        ! elements), on the current geometry. Needs w_e (vert_vel_ale of the stage, split off:
-        ! w_e = w).
+        ! elements), on the current geometry. compute_vel_rhs reads w_e: the stage's
+        ! vert_vel_ale with the split off puts the full w there (w_e = w, w_i = 0).
         integer,        intent(in)            :: stage
         real(kind=WP),  intent(in)            :: tau_s
         type(t_dyn),    intent(inout), target :: dynamics
