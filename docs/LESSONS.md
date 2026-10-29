@@ -3141,11 +3141,12 @@ and the gap in the stiffness matrix; this closes the gap.
 (including "setup" objects that a step modifies, and lazily-built caches) and gate a straight-vs-split
 run with that option ON. Check that each restored piece is needed by skipping it once.
 
-## L79 — An RK3 stage keeps a uniform tracer uniform only if it advects with the full w its continuity used: stages 1–2 take the full w, the split of w lives only in the last stage, where an implicit solve closes it
+## L79 — An RK3 stage keeps a uniform tracer uniform only if it advects with the full w its continuity used: stages 1–2 take the full w, the split of w lives only in the last stage (for FCT tracers only in the low order), where an implicit solve closes it
 
 **Context.** RK3 time stepping (`FESOM3_RK3`, docs/plans/completed/2026-10-28-rk3.md, D7, 2026-10-28,
 Dmitry after reading `rk3.tex`): stages 1–2 advect with the full w (w_e + w_i) of the stage, the split exists
-only in stage 3. w_e alone is never used in stages 1–2.
+only in stage 3. w_e alone is never used in stages 1–2. In stage 3 an FCT tracer uses the split only in its
+low-order solution (explicit w_e, then implicit w_i); its high order and its antidiffusive flux use the full w.
 
 **What happened.**
 - A stage update T_s h_s = Tⁿ hⁿ + τ_s·D(T_{s−1}; u_{s−1}, w_{s−1}) returns a uniform T₀ only if the
