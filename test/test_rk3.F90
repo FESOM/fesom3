@@ -673,13 +673,16 @@ contains
         end do
         ! cold: dUb = 0, rk3_ubold = Ub^n
         call rk3_bt_extrap(d, mesh, partit)
-        err = 0.0_WP; emax = 0.0_WP
+        err = 0.0_WP; emax = 0.0_WP; smax = 0.0_WP
         do e = 1, nElemO
             err  = max(err, maxval(abs(d%rk3_dub(:, e))))
             emax = max(emax, maxval(abs(d%rk3_ubold(:, e) - ub0(:, e))))
+            smax = max(smax, maxval(abs(ub0(:, e))))
         end do
-        call max_all(err, partit); call max_all(emax, partit)
-        call check(err == 0.0_WP .and. emax == 0.0_WP, 'R12 cold start: dUb = 0, rk3_ubold = Ub^n', mype)
+        call max_all(err, partit); call max_all(emax, partit); call max_all(smax, partit)
+        ! dUb = 0 exactly (Ub^n - Ub^n); rk3_ubold against the test's Ub^n from rk3_transport, another
+        ! summation loop: equal up to the compiler's contraction (GNU FMA), so to round-off
+        call check(err == 0.0_WP .and. emax <= 1.0e-15_WP*smax, 'R12 cold start: dUb = 0, rk3_ubold = Ub^n', mype)
         ! the next step: u^{n+1} = another hashed velocity
         call hashed_uv(d%uv, 132)
         call rk3_transport(d%uv, mesh, nElemO, s1)

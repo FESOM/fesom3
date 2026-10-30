@@ -90,6 +90,11 @@ conservation, mesh-delta, regression and self-consistency gates take its place
   - Stages 1–2 advect with the full w of the stage, so a uniform tracer stays uniform; the w split is made
     in stage 3 only. Momentum and non-FCT tracers are then stable up to a vertical Courant number of about
     9 at `FESOM3_WSPLIT_MAXCFL=1` (the `RK3_CHECK` line reports it as `cflz=`).
+  - With the CG solver the stage-1/2 trims go to the depth-mean velocity extrapolated in time (AB2's
+    weights for the stage-3 barotropic Coriolis; `rk3.tex`'s "AB-way"). The trim to Ūⁿ of `rk3.tex` made the
+    barotropic Coriolis forward Euler and grew a spurious Weddell cyclone on NEMO025 (−3.3 m ssh vs −1.9 m
+    AB2; 2400 s runs blew up in 10–13 days). The checkpoint carries Ūⁿ⁻¹ (`rk3_ubold_u/_v`, optional on
+    read). Plan Addendum A.
   - Meant to run at about twice the AB2 time step; the longer-Δt screens and the timing on compute nodes
     are open (see the env block in §4). See [IMPLEMENTATION.md](IMPLEMENTATION.md) §15.
 - **Conserving sea-ice cut_off (`FESOM3_ICE_CUTOFF_CONSERVE=1`, opt-in).** FESOM2's `cut_off` deletes

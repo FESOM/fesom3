@@ -724,8 +724,15 @@ uⁿ shear and N²(T\*\*)), GM/Redi from T\*\*, the horizontal viscosity of uⁿ
 vertical viscosity TDMA with wind and drag, the barotropic step, the FCT limiter, the horizontal and
 vertical tracer diffusion and the surface fluxes.
 
-**Trims.** Stages 1–2 keep the barotropic transport at Uⁿ: u_s = uⁿ + R_s − ⟨R_s⟩ with ⟨X⟩ = Σₖ helem·X/H
-(rk3.tex's 2D–3D coupling). In stage 3 the momentum right-hand side is taken from the untrimmed u\*\*, then
+**Trims.** Stages 1–2 trim the barotropic part of the stage velocity: u_s = uⁿ + R_s − ⟨R_s⟩ + c_s·ΔŪ with
+⟨X⟩ = Σₖ helem·X/H and ΔŪ = Ūⁿ − Ūⁿ⁻¹ (rk3.tex's 2D–3D coupling). Under SE c_s = 0 (the trim to Ūⁿ of
+rk3.tex; uⁿ⁺¹ is later trimmed to the BT solver's U^M, which integrates the barotropic Coriolis). Under CG
+c₁ = 1/3, c₂ = 1/2 + ε (ε = `ab_epsilon` = 0.1): the stage-3 Coriolis then acts on (3/2 + ε)Ūⁿ − (1/2 + ε)Ūⁿ⁻¹,
+AB2's weights. The CG corrector has no Coriolis of its own, so with the trim to Ūⁿ the barotropic Coriolis
+would be forward Euler (energy growth (fτ)² per step for barotropic motions larger than the Rossby radius;
+plan Addendum A, LESSONS L83). `rk3_bt_extrap` computes ΔŪ at the start of a CG step; Ūⁿ⁻¹ (`rk3_ubold`) is in
+the checkpoint as the optional stores `rk3_ubold_u/_v` (a cold start, an AB2 checkpoint or an RK3 checkpoint
+written before it start with ΔŪ = 0). In stage 3 the momentum right-hand side is taken from the untrimmed u\*\*, then
 u\*\* is trimmed to the transport that changed η (CG: Σh·uⁿ⁺¹; SE: ⟨⟨Ū⟩⟩) and carries the tracers. Under SE
 uⁿ⁺¹ is also trimmed to U^M, the barotropic velocity at n+1.
 

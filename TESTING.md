@@ -378,7 +378,9 @@ invariants, determinism and restart exactness:
   bitwise; R7/R8/R9 the low-order substeps (constancy, conservation, boundedness at Courant 1.5 with an
   overshooting N = 1 control, the Zalesak bounds and the unlimited identity on the clean cells, LESSONS L80);
   R10t at rest the stage-3 solve = `solve_tracers_ale` bitwise; R11 three-stage constancy with the split
-  (1.4e-14, full w in stages 1–2, L79); R10 the restart key and the cold AB start; Z1–Z3,
+  (1.4e-14, full w in stages 1–2, L79); R12 the extrapolated CG stage trims (cold ΔŪ = 0, ΔŪ = Ūⁿ⁺¹ − Ūⁿ
+  exactly, c₁ = 1/3 and c₂ = 1/2 + ε under CG and 0 under SE, the stage transport = Σh·uⁿ + c_s·ΔŪ·H to
+  6e-17); R10 the restart key, the optional `rk3_ubold_u/_v` stores (RK3 + CG only) and the cold AB start; Z1–Z3,
   R7z zstar (layer sums, w(top) = 0 in every stage, constancy for N = 1..3); G the `rk3_init` guards
   (separate cases). `test_ssh_se` S1–S3: the RK3 barotropic forcing removes pressure and Coriolis exactly.
 - **`FESOM3_RK3_CHECK=1`** — one `RK3_CHECK` line per step: `trim1/2/3` (the stage transports), `etacomp`
@@ -394,7 +396,8 @@ invariants, determinism and restart exactness:
 - **Determinism and decomposition** — two identical 1000-step pi runs print identical logs; np 1 and np 8
   from the deterministic IC (`FESOM3_IC_EXTRAP_DET`, L81) agree to 2e-14 in heat and salt over 20 steps.
 - **Restart** — `run_restart_gate_core2.sh` with `FESOM3_RK3=1` (CG and SE, np 1 and 2, mid-run and
-  month-boundary splits) and `run_restart_gate_zstar.sh` (zstar exact): split = straight at `max|Δ| = 0`;
+  month-boundary splits; with CG the checkpoint carries `rk3_ubold_u/_v`, Addendum A) and
+  `run_restart_gate_zstar.sh` (zstar exact): split = straight at `max|Δ| = 0`;
   AB2 → RK3 and RK3 → AB2 resumes run (the latter with the cold AB start).
 
 Measured levels (pi: 1000 steps np 1 for linfs CG, 20 steps np 1/2/8 for the rest; CORE2: production physics, np 8,

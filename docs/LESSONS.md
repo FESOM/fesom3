@@ -3207,3 +3207,25 @@ the split-explicit work.
 **How to apply.** Derive an expected value from the code path, not from the continuous equations; when
 a plan's number disagrees with the code, test the code's identity, add the positive control that shows
 the term is live, and correct the plan.
+
+## L83 — A coupling trim that freezes the barotropic velocity in the stages turns the barotropic Coriolis into forward Euler when the barotropic solver has no Coriolis of its own
+
+**Context.** RK3 + CG on NEMO025 (plan docs/plans/completed/2026-10-28-rk3.md, Addendum A, 2026-10-30).
+
+**What happened.**
+- RK3 passed every pi and CORE2 gate (10-day screens included), then grew a spurious barotropic cyclone on the
+  Weddell shelf break after ~9 days of a NEMO025 run (−3.3 m ssh vs −1.9 m AB2) and blew up at 2400 s. Global
+  conservation, the trims and etacomp were all at round-off — the invariants could not see it.
+- `rk3.tex` trims the stage velocities to the barotropic transport at n. With split-explicit, uⁿ⁺¹ is later
+  trimmed to the BT solver's U^{n+1}, which integrates f×Ū itself; with CG the elevation equation has only
+  gravity and divergence, so the barotropic Coriolis of uⁿ⁺¹ is f×Ūⁿ·τ: forward Euler, |A|² = 1 + (fτ)² for
+  barotropic motions larger than the Rossby radius (1.4 %/step at 1200 s, 72°S).
+- Switching one ingredient off per 20-day run (vector-invariant advection, w split, GM/Redi, CG→SE) located it
+  in an afternoon: only SE removed it; an AB-extrapolated trim target fixed it.
+
+**How to apply.** For a multi-stage scheme with a barotropic/baroclinic split, check which terms of the
+barotropic mode the stages freeze and who integrates them in the last stage; a term that only the last stage
+applies, to the frozen value, is forward Euler. Test the barotropic mode alone (linear f-plane, kR < 1) at high
+latitude. Short runs on small or mid-latitude meshes do not show a (fτ)² growth that friction holds down; a
+global mesh with strong high-latitude barotropic flow does — screen at least a month on the target mesh.
+
