@@ -46,6 +46,7 @@ module oce_ale_tracer
     ! M2.9b (step assembly): solve_tracers_ale is the full per-tracer wrapper
     ! (advection + diffusion solve + salinity clamp) the ocean step calls.
     public :: solve_tracers_ale
+    public :: tracer_carry_alloc
 
     ! FESOM3_LINFS_CONSERVE (not in FESOM2): 'S', 'T' or 'TS' returns the tracer that the vertical advection moves
     ! out through the linear free surface (linfs_surface_flux); unset = FESOM2. Read at the first
@@ -307,6 +308,19 @@ contains
     end subroutine linfs_corrected_fluxes
 
     !===========================================================================
+    ! The single-precision tracer carry (nl-1, nod, num_tracers), allocated once at zero (no residual
+    ! yet). The checkpoint holds it (carry_t / carry_s, mod_io_restart), so the lifecycle driver
+    ! allocates it before the restart registry; otherwise the first diff_tracers_ale does. Upstream's
+    ! restart omits the carry: a resume from a checkpoint without it starts from zero, as there.
+    ! No-op in double precision (use_tracer_carry = .false.).
+    subroutine tracer_carry_alloc(tracers)
+        type(t_tracer), intent(inout) :: tracers
+        if (.not. use_tracer_carry .or. allocated(tracers%work%carry)) return
+        allocate(tracers%work%carry(size(tracers%data(1)%values, 1), size(tracers%data(1)%values, 2), &
+                                    tracers%num_tracers))
+        tracers%work%carry = 0.0_WP
+    end subroutine tracer_carry_alloc
+
     subroutine diff_tracers_ale(tr_num, dt, dynamics, tracers, mesh, tr_xy, Ki, &
                                 heat_flux, water_flux, virtual_salt, relax_salt, &
                                 real_salt_flux, is_nonlinfs, partit)
@@ -343,12 +357,8 @@ contains
         del_ttf => tracers%work%del_ttf
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
 #if defined(USE_SINGLE_PRECISION)
-        ! the tracer carry, allocated on first use (zero = no residual yet; not in the restart,
-        ! as upstream: a restarted single-precision run starts from a zero carry)
-        if (.not. allocated(tracers%work%carry)) then
-            allocate(tracers%work%carry(size(trarr,1), size(trarr,2), tracers%num_tracers))
-            tracers%work%carry = 0.0_WP
-        end if
+        ! the tracer carry, allocated on first use unless the driver did it for the checkpoint
+        call tracer_carry_alloc(tracers)
 #endif
 
         ! horizontal diffusion: del_ttf += R_T^n (+ M4d Redi K13/K23 isoneutral terms if Redi)

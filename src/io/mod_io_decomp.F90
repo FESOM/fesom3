@@ -22,7 +22,7 @@ module mod_io_decomp
     ! canonical id g land at g - w_base_gid. Positions beyond N (the partial last chunk) stay `fill`
     ! (the only padding; matches mod_io_zarr's chunk padding, so the reader truncates them away).
     use mpi
-    use mod_precision, only: WP, MPI_WP
+    use mod_precision, only: WP, MPI_WP, WP_full, MPI_WP_FULL
     use mod_mesh,      only: t_mesh
     use mod_partit,    only: t_partit
     use mod_part_bounds, only: is_multirank
@@ -58,6 +58,11 @@ module mod_io_decomp
     interface decomp_redistribute
         module procedure decomp_redistribute_2d_r, decomp_redistribute_3d_r, &
                          decomp_redistribute_2d_i, decomp_redistribute_3d_i
+#if defined(USE_SINGLE_PRECISION)
+        ! single precision: the WP_full (real64) restart fields (hnode, ssh_stiff) move without a
+        ! round trip through WP; in double precision WP_full == WP and the real variants serve
+        module procedure decomp_redistribute_2d_r8, decomp_redistribute_3d_r8
+#endif
     end interface decomp_redistribute
 
     ! Inverse of decomp_redistribute (the read/restore direction): pull canonical writer-buffer
@@ -65,6 +70,9 @@ module mod_io_decomp
     ! Real WP only (restart serializes WP fields); no int variant needed.
     interface decomp_gather
         module procedure decomp_gather_2d_r, decomp_gather_3d_r
+#if defined(USE_SINGLE_PRECISION)
+        module procedure decomp_gather_2d_r8, decomp_gather_3d_r8
+#endif
     end interface decomp_gather
 
 contains
@@ -290,6 +298,82 @@ contains
             field_owned(L, 1:D%myDim) = col(1:D%myDim)
         end do
     end subroutine decomp_gather_3d_r
+
+#if defined(USE_SINGLE_PRECISION)
+    ! ---- redistribution and gather (WP_full; single precision only) ----
+    ! The real variants above with WP -> WP_full: the same plan, the same slots, real64 values.
+
+    subroutine decomp_redistribute_2d_r8(D, field_owned, buf_writer, fill)
+        type(t_io_decomp),  intent(in)  :: D
+        real(WP_full),      intent(in)  :: field_owned(:)
+        real(WP_full),      intent(out) :: buf_writer(:)
+        real(WP_full),      intent(in)  :: fill
+        real(WP_full), allocatable :: sbuf(:), rbuf(:)
+        integer :: i, k, ierr
+        allocate(sbuf(max(1,D%send_total)), rbuf(max(1,D%recv_total)))
+        do i = 1, D%myDim
+            sbuf(D%send_pos(i)+1) = field_owned(i)
+        end do
+        call MPI_Alltoallv(sbuf, D%sendcounts, D%sdispls, MPI_WP_FULL, &
+                           rbuf, D%recvcounts, D%rdispls, MPI_WP_FULL, D%comm, ierr)
+        if (D%w_nbuf > 0) then
+            buf_writer(1:D%w_nbuf) = fill
+            do k = 1, D%recv_total
+                buf_writer(D%recv_target(k)) = rbuf(k)
+            end do
+        end if
+    end subroutine decomp_redistribute_2d_r8
+
+    subroutine decomp_redistribute_3d_r8(D, field_owned, buf_writer, fill)
+        type(t_io_decomp),  intent(in)  :: D
+        real(WP_full),      intent(in)  :: field_owned(:,:)
+        real(WP_full),      intent(out) :: buf_writer(:,:)
+        real(WP_full),      intent(in)  :: fill
+        real(WP_full), allocatable :: col(:), outrow(:)
+        integer :: nlev, L
+        nlev = size(field_owned, 1)
+        allocate(col(max(1,D%myDim)), outrow(max(1,D%w_nbuf)))
+        do L = 1, nlev
+            col(1:D%myDim) = field_owned(L, 1:D%myDim)
+            call decomp_redistribute_2d_r8(D, col, outrow, fill)
+            if (D%w_nbuf > 0) buf_writer(L, 1:D%w_nbuf) = outrow(1:D%w_nbuf)
+        end do
+    end subroutine decomp_redistribute_3d_r8
+
+    subroutine decomp_gather_2d_r8(D, buf_writer, field_owned)
+        type(t_io_decomp),  intent(in)  :: D
+        real(WP_full),      intent(in)  :: buf_writer(:)
+        real(WP_full),      intent(out) :: field_owned(:)
+        real(WP_full), allocatable :: sbuf(:), rbuf(:)
+        integer :: i, k, ierr
+        allocate(sbuf(max(1,D%send_total)), rbuf(max(1,D%recv_total)))
+        if (D%w_nbuf > 0) then
+            do k = 1, D%recv_total
+                rbuf(k) = buf_writer(D%recv_target(k))
+            end do
+        end if
+        call MPI_Alltoallv(rbuf, D%recvcounts, D%rdispls, MPI_WP_FULL, &
+                           sbuf, D%sendcounts, D%sdispls, MPI_WP_FULL, D%comm, ierr)
+        do i = 1, D%myDim
+            field_owned(i) = sbuf(D%send_pos(i)+1)
+        end do
+    end subroutine decomp_gather_2d_r8
+
+    subroutine decomp_gather_3d_r8(D, buf_writer, field_owned)
+        type(t_io_decomp),  intent(in)  :: D
+        real(WP_full),      intent(in)  :: buf_writer(:,:)
+        real(WP_full),      intent(out) :: field_owned(:,:)
+        real(WP_full), allocatable :: col(:), inrow(:)
+        integer :: nlev, L
+        nlev = size(field_owned, 1)
+        allocate(col(max(1,D%myDim)), inrow(max(1,D%w_nbuf)))
+        do L = 1, nlev
+            if (D%w_nbuf > 0) inrow(1:D%w_nbuf) = buf_writer(L, 1:D%w_nbuf)
+            call decomp_gather_2d_r8(D, inrow, col)
+            field_owned(L, 1:D%myDim) = col(1:D%myDim)
+        end do
+    end subroutine decomp_gather_3d_r8
+#endif
 
     ! ---- redistribution (integer) ----
 

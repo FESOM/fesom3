@@ -127,6 +127,11 @@ module mod_io_zarr
     ! read, the new time slot is overwritten, and the whole chunk is re-written.
     interface zarr_read_chunk
         module procedure zarr_read_chunk_1d_real, zarr_read_chunk_2d_real, zarr_read_chunk_3d_real
+#if defined(USE_SINGLE_PRECISION)
+        ! single precision: a real64 reader for the WP_full restart fields (hnode, ssh_stiff); in
+        ! double precision the WP reader above is that reader
+        module procedure zarr_read_chunk_2d_r8
+#endif
     end interface zarr_read_chunk
 
 contains
@@ -786,6 +791,33 @@ contains
             do i0 = 1, c0; do i1 = 1, c1; out(i0,i1) = real(b4((i0-1)*c1 + i1), WP); end do; end do
         end if
     end subroutine zarr_read_chunk_2d_real
+
+#if defined(USE_SINGLE_PRECISION)
+    ! 2-D real chunk -> out(1:c0,1:c1) in real64 (single precision only: WP_full restart fields read
+    ! without a round trip through WP), un-transposing C row-major. Missing => out = fill.
+    subroutine zarr_read_chunk_2d_r8(store, arr, cidx, out)
+        type(t_zarr_store), intent(in)  :: store
+        type(t_zarr_array), intent(in)  :: arr
+        integer,            intent(in)  :: cidx(:)
+        real(real64),       intent(out) :: out(:,:)
+        integer(int8), allocatable, target :: raw(:)
+        real(real64), pointer, contiguous :: b8(:)
+        real(real32), pointer, contiguous :: b4(:)
+        logical :: exist
+        integer :: c0, c1, nb, i0, i1
+        c0 = arr%chunks(1); c1 = arr%chunks(2)
+        if (trim(arr%dtype) == '<f8') then; nb = 8*c0*c1; else; nb = 4*c0*c1; end if
+        call read_chunk_bytes(chunk_path(store, arr, cidx), nb, raw, exist, trim(arr%codec))
+        if (.not. exist) then; out(1:c0,1:c1) = arr%fill; return; end if
+        if (trim(arr%dtype) == '<f8') then
+            call c_f_pointer(c_loc(raw(1)), b8, [c0*c1])
+            do i0 = 1, c0; do i1 = 1, c1; out(i0,i1) = b8((i0-1)*c1 + i1); end do; end do
+        else
+            call c_f_pointer(c_loc(raw(1)), b4, [c0*c1])
+            do i0 = 1, c0; do i1 = 1, c1; out(i0,i1) = real(b4((i0-1)*c1 + i1), real64); end do; end do
+        end if
+    end subroutine zarr_read_chunk_2d_r8
+#endif
 
     ! 3-D real chunk -> out(1:c0,1:c1,1:c2) (WP), un-transposing C row-major. Missing => out = fill.
     subroutine zarr_read_chunk_3d_real(store, arr, cidx, out)

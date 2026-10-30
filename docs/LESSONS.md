@@ -3140,3 +3140,29 @@ and the gap in the stiffness matrix; this closes the gap.
 **How to apply.** For each new physics option, list the arrays a step READS before it WRITES them
 (including "setup" objects that a step modifies, and lazily-built caches) and gate a straight-vs-split
 run with that option ON. Check that each restored piece is needed by skipping it once.
+
+## L79 — In single precision the restart set also includes what a step keeps in real64 and what it allocates lazily: a WP-typed checkpoint path rounds the first, and the registry cannot point at the second
+
+**Context.** Exact single-precision restart (branch `sp-restart-exact`, 2026-10-28), after PR #4 (single
+precision) and L78 (exact zstar restart). Before it, a single-precision resume was close to, not identical
+with, the straight run (as upstream FESOM2).
+
+**What happened.**
+- Three pieces of single-precision state carry over between steps outside the WP prognostic arrays: the
+  layer thickness `hnode` (WP_full, upstream #1207), the stiffness accumulator `ssh_stiff%values_full`
+  (WP_full, #997; zstar), and the tracer carry `tracers%work%carry` (WP, #1206).
+- The checkpoint stores were already `<f8`, but the redistribution and the chunk reader in between were
+  WP-typed, so `hnode` came back rounded to float32; the zstar exact restart stored the WP copy of the
+  matrix; the carry was not registered at all (upstream omits it too).
+- The carry and `values_full` are allocated at their first use inside the step, after the driver has
+  built the restart registry, so there was nothing to point at. Allocating them before the registry (a
+  zero carry, `values_full` seeded from the cold matrix) gives the bits the first step would give.
+- With real64 decomposition and read paths (single precision only) and the carry as `carry_t`/`carry_s`
+  (the stores fesom3_jax already wrote), the straight-vs-split gates are `max|Δ| = 0` in single precision:
+  CORE2 linfs CG and split-explicit (np 1, 2), zstar exact on pi (np 1, 2, 8) and CORE2 (np 2, 8), the
+  np 2 → 8 restore. Double precision is unchanged to the bit.
+
+**How to apply.** When a build changes precision, list the carried state by kind, not by name: every
+array a step reads before it writes it, in WP, WP_full or any other kind, including those allocated on
+first use. Check that the I/O path keeps each one's kind end to end (the on-disk dtype alone does not),
+and that each exists when the registry is built.

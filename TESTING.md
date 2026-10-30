@@ -457,6 +457,12 @@ steps, checkpoints, starts a *fresh process*, reads the checkpoint, and runs the
     `max|Δ| = 0`; pi np 1 and CORE2 np 1).
   Cross-rank *evolution* is not bitwise for any setting (the CG reductions depend on the rank count),
   so the cross-rank case is the restore round trip, as for `linfs`.
+- **Single precision:** the same gates run on a `--precision sp` build (`BUILD=.../build_intel_sp`)
+  with `max|Δ| = 0`: `run_restart_gate_core2.sh` linfs with CG and with `FESOM3_SSH_SE=1` (np 1, 2,
+  mid-run and month-boundary splits), `run_restart_gate_zstar.sh` with the switch on pi (np 1, 2, 8)
+  and CORE2 (np 2, 8) and the restore round trips np 2 → 1/8, and `run_restart_gate_multirank.sh`
+  (np 2 → 8). The checkpoint adds `carry_t` and `carry_s` and keeps `hnode` and `ssh_stiff` in real64
+  (IMPLEMENTATION.md §10); before that (as upstream) a single-precision resume was not bitwise.
 
 ### 9. Results
 
@@ -492,7 +498,7 @@ byte-faithful but well-behaved.
 |---|---|
 | Intel + double | **anchor** — byte-exact vs FESOM2; all gate results |
 | GNU + double | portability — 170 of the 176 `ctest` cases pass; the 6 failures (`test_wimpl_tra_np1/np2`, `meshdiag_mixed/quad/pi_w`, `test_shared_elem_np1`) are deterministic and older than the split-explicit work. Pure-data fields bit-identical to Intel at the M-milestones (only rotation-derived coordinates differ at ~1e-13, expected libm differences) |
-| single precision | builds (scaffolding, §IMPLEMENTATION 6); not a byte-gate target |
+| single precision | `--precision sp` (§IMPLEMENTATION 6): conservation gates at `TOL=1e-6`; the restart gates `max|Δ| = 0` (§8); not bit-compared with double precision |
 
 ### 10. Scalability and performance
 
