@@ -115,6 +115,8 @@ module mod_io_restart
         integer           :: nlev   = 1                ! vertical size (3-D): nl or nl-1
         character(len=8)  :: hdim   = 'nod2'           ! 'nod2' (node) / 'elem' (element)
         character(len=8)  :: vdim   = ''               ! 'nz' (levels) / 'nz1' (layers)
+        logical           :: optional_store = .false.  ! read: a missing store is skipped (the live
+                                                       ! array keeps its value), not an abort
         real(WP), pointer :: p2d(:)   => null()        ! live array (2-D field, WP source)
         real(WP), pointer :: p3d(:,:) => null()        ! live array (3-D field, WP source)
         ! MP-source path (Task 3.4 precision gotcha): mesh%hbar / mesh%hnode are real(MP), which may
@@ -222,7 +224,8 @@ contains
     ! 2-D field, p3d for a 3-D field (on_full_levels selects nl vs nl-1). entity = DECOMP_NODE/ELEM.
     ! The pointer is stored, not copied, so the writer reads the live values and the reader (Task 4.1)
     ! can write back into the same array. Caller passes a Fortran pointer (e.g. peta => dyn%eta_n).
-    subroutine restart_register_field(R, name, units, entity, p2d, p3d, on_full_levels, precision, halo)
+    subroutine restart_register_field(R, name, units, entity, p2d, p3d, on_full_levels, precision, halo, &
+                                      optional_store)
         type(t_restart),  intent(inout)        :: R
         character(len=*), intent(in)           :: name, units
         integer,          intent(in)           :: entity
@@ -231,9 +234,11 @@ contains
         logical,          intent(in), optional :: on_full_levels
         character(len=*), intent(in), optional :: precision
         integer,          intent(in), optional :: halo     ! override the entity-default read-back variant
+        logical,          intent(in), optional :: optional_store  ! a missing store is skipped on read
         integer :: k
         k = restart_new_field(R, name, units, entity, precision)
         if (present(halo)) R%f(k)%halo = halo
+        if (present(optional_store)) R%f(k)%optional_store = optional_store
         call restart_set_levels(R, k, present(p3d), on_full_levels)
         if (present(p3d)) then
             R%f(k)%p3d => p3d
@@ -324,6 +329,9 @@ contains
     !       node 2-D : se_eta1 se_eta2
     !       elem 2-D : se_ubt0_u se_ubt0_v se_ubt1_u se_ubt1_v se_ubt2_u se_ubt2_v se_sbar_old_u se_sbar_old_v
     !     zstar exact restart only (R%zstar_exact): ssh_stiff (node, W slots) | dhe (elem 2-D)
+    !     RK3 with the CG corrector only (dyn%use_rk3, not SE): elem 2-D rk3_ubold_u rk3_ubold_v,
+    !       OPTIONAL on read (an AB2 or older RK3 checkpoint has none: the run starts its stage
+    !       extrapolation cold, oce_rk3 rk3_bt_extrap)
     ! partit (optional) is needed only by the zstar exact restart at np>1 (global column ids).
     subroutine restart_register_state(R, dyn, tracers, ice, mesh, mix_scheme, partit)
         type(t_restart), intent(inout)      :: R
@@ -441,6 +449,19 @@ contains
             call restart_register_field(R, 'se_sbar_old_u', 'm2/s', DECOMP_ELEM, p2d=p2, halo=RESTART_HALO_NONE)
             p2 => dyn%se_sbar_old(2,:)
             call restart_register_field(R, 'se_sbar_old_v', 'm2/s', DECOMP_ELEM, p2d=p2, halo=RESTART_HALO_NONE)
+        end if
+
+        ! ---- RK3 with the CG corrector: Ub^{n-1} of the extrapolated stage trims (oce_rk3 header,
+        !      plan Addendum A). Read and used on the owned elements only -> NONE. Optional: a
+        !      checkpoint without it (AB2, or RK3 before Addendum A) leaves rk3_init's huge marker,
+        !      and the first step starts the extrapolation cold. ----
+        if (dyn%use_rk3 .and. .not. dyn%use_ssh_se) then
+            p2 => dyn%rk3_ubold(1,:)
+            call restart_register_field(R, 'rk3_ubold_u', 'm/s', DECOMP_ELEM, p2d=p2, halo=RESTART_HALO_NONE, &
+                                        optional_store=.true.)
+            p2 => dyn%rk3_ubold(2,:)
+            call restart_register_field(R, 'rk3_ubold_v', 'm/s', DECOMP_ELEM, p2d=p2, halo=RESTART_HALO_NONE, &
+                                        optional_store=.true.)
         end if
 
         ! ---- zstar exact restart: the accumulated SSH stiffness values + the lagged dhe ----
@@ -965,8 +986,14 @@ contains
         ! entity context (node vs element decomp + owned count)
         if (f%entity == DECOMP_ELEM) then; D => R%De; nO = R%nElemO
         else;                              D => R%Dn; nO = R%nNodO; end if
-        ! abort on a missing/corrupt store (mirrors clock_init's missing-.clock abort)
+        ! abort on a missing/corrupt store (mirrors clock_init's missing-.clock abort); an optional
+        ! store (rk3_ubold) that is missing is skipped, the live array keeps its value
         inquire(file=trim(store_path)//'/.zgroup', exist=ex)
+        if (.not. ex .and. f%optional_store) then
+            if (R%mype == 0) write(*,'(a)') '[restart] optional store not in the checkpoint, skipped: '// &
+                                            trim(f%name)
+            return
+        end if
         call zarr_check(ex, 'restart_read: missing/corrupt store '//trim(store_path))
         store%path = trim(store_path)
         if (f%ndim == 2) then

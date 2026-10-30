@@ -78,8 +78,14 @@ program test_rk3
     !       (not) through stage 1 (u^n, full w), stage 2 (u*, full w) and solve_tracers_rk3 on
     !       u** (split: w_e explicit, w_i in the LO / the TDMA; split faces asserted), Kv /= 0,
     !       open surface: T^{n+1} = T0 to 1e-13 relative
+    !   R12 the extrapolated stage trims of the CG path (plan Addendum A): rk3_bt_extrap starts
+    !       cold (Ub^{n-1} = huge -> dUb = 0, rk3_ubold = Ub^n), then dUb = Ub^{n+1} - Ub^n exactly;
+    !       rk3_trim_coef = 1/3, 1/2 + ab_epsilon (CG) and 0 (SE); rk3_momentum_update with c_s
+    !       gives the stage transport sum_k helem*u^n + c_s*dUb*H_e (1e-14 relative), a
+    !       depth-uniform change, shared copies equal
     !   R10 restart (Task 16): restart_register_state registers the same stores, in the same
-    !       order, with RK3 on and off (R%rk3 set with RK3 only); checkpoint.json written with RK3
+    !       order, with RK3 on and off, plus rk3_ubold_u/_v (optional) at the end with RK3 + CG
+    !       (R%rk3 set with RK3 only); checkpoint.json written with RK3
     !       ends with "time_scheme": "rk3" and reads back 'rk3', without RK3 it has no such key and
     !       reads back 'ab2' (year, day, time_sec round-trip); rk3_cold_ab_start zeroes uv_rhsAB
     !       and se_sbar_old and sets every valuesold level to values
@@ -110,13 +116,14 @@ program test_rk3
     use mod_part_bounds,  only: local_dims
     use mod_param_phys,   only: rvo_upwind, Fer_GM, N2smth_h, alpha
     use oce_rk3,          only: rk3_env_requested, rk3_parse_knob, rk3_tracer_stage, rk3_tracer_prep, rk3_init, &
-                                rk3_depth, rk3_transport, rk3_momentum_stage, rk3_viscosity, rk3_trim
+                                rk3_depth, rk3_transport, rk3_momentum_stage, rk3_viscosity, rk3_trim, &
+                                rk3_bt_extrap, rk3_trim_coef, rk3_momentum_update
     use oce_dyn_visc,     only: viscosity_filter
     use oce_ale_tracer,   only: solve_tracers_ale, solve_tracers_rk3
     use mod_io_restart,   only: t_restart, restart_register_state, write_checkpoint_json, read_checkpoint_json
     use mod_ice,          only: t_ice
     use oce_rk3,          only: rk3_cold_ab_start, rk3_implied_eta, rk3_stage_geometry, rk3_inflow
-    use mod_config,       only: which_ALE
+    use mod_config,       only: which_ALE, ab_epsilon
     use, intrinsic :: iso_fortran_env, only: real64
     use mod_halo,         only: shared_copy_max_elem, exchange_nod
     use mod_tracer,       only: t_tracer
@@ -151,6 +158,7 @@ program test_rk3
     call r2_split_off()
     call p_pressure_only()
     call r3_momentum_stage()
+    call r12_extrap()
     call r4_inertial()
     call r5_ho_stage()
     call r6_substep_n1()
@@ -642,8 +650,86 @@ contains
         type(t_dyn), intent(inout) :: d
         allocate(d%rk3_us(2, nl-1, nElemF), d%rk3_visc(2, nl-1, nElemF), d%rk3_H(nElemL))
         d%rk3_us = 0.0_WP; d%rk3_visc = 0.0_WP; d%rk3_H = 0.0_WP
+        allocate(d%rk3_ubold(2, nElemL), d%rk3_dub(2, nElemL))
+        d%rk3_ubold = huge(1.0_WP); d%rk3_dub = 0.0_WP
         d%use_rk3 = .true.; d%rk3_ready = .true.
     end subroutine new_rk3
+
+    !===========================================================================
+    subroutine r12_extrap()
+        type(t_dyn) :: d
+        real(kind=WP), allocatable :: ub0(:,:), ub1(:,:), s0(:,:), s1(:,:), r(:,:,:)
+        real(kind=WP) :: err, emax, edu, smax, spread, c(2), cs
+        integer :: e, nz, mype
+        mype = partit%mype
+        call new_dyn(d, 1)
+        call new_rk3(d)
+        call hashed_state(d, 131)
+        call rk3_depth(d, mesh, partit)
+        allocate(ub0(2, nElemL), ub1(2, nElemL), s0(2, nElemL), s1(2, nElemL))
+        call rk3_transport(d%uv, mesh, nElemO, s0)
+        do e = 1, nElemO
+            ub0(:, e) = s0(:, e)/d%rk3_H(e)
+        end do
+        ! cold: dUb = 0, rk3_ubold = Ub^n
+        call rk3_bt_extrap(d, mesh, partit)
+        err = 0.0_WP; emax = 0.0_WP
+        do e = 1, nElemO
+            err  = max(err, maxval(abs(d%rk3_dub(:, e))))
+            emax = max(emax, maxval(abs(d%rk3_ubold(:, e) - ub0(:, e))))
+        end do
+        call max_all(err, partit); call max_all(emax, partit)
+        call check(err == 0.0_WP .and. emax == 0.0_WP, 'R12 cold start: dUb = 0, rk3_ubold = Ub^n', mype)
+        ! the next step: u^{n+1} = another hashed velocity
+        call hashed_uv(d%uv, 132)
+        call rk3_transport(d%uv, mesh, nElemO, s1)
+        err = 0.0_WP; emax = 0.0_WP
+        do e = 1, nElemO
+            ub1(:, e) = s1(:, e)/d%rk3_H(e)
+        end do
+        call rk3_bt_extrap(d, mesh, partit)
+        do e = 1, nElemO
+            err  = max(err, maxval(abs(d%rk3_dub(:, e) - (ub1(:, e) - ub0(:, e)))))
+            emax = max(emax, maxval(abs(ub1(:, e))))
+        end do
+        call max_all(err, partit); call max_all(emax, partit)
+        call check(err <= 1.0e-15_WP*emax, 'R12 dUb = Ub^{n+1} - Ub^n', mype)
+        ! the coefficients
+        call check(rk3_trim_coef(1, d) == 1.0_WP/3.0_WP .and. rk3_trim_coef(2, d) == 0.5_WP + ab_epsilon, &
+                   'R12 CG c_1 = 1/3, c_2 = 1/2 + ab_epsilon', mype)
+        d%use_ssh_se = .true.
+        call check(rk3_trim_coef(1, d) == 0.0_WP .and. rk3_trim_coef(2, d) == 0.0_WP, 'R12 SE c_s = 0', mype)
+        d%use_ssh_se = .false.
+        ! the stage update with c_2: transport = sum_k helem*u^n + c_2*dUb*H_e
+        cs = rk3_trim_coef(2, d)
+        call vert_vel_ale(d, mesh, dt, partit, split=.false., bolus=.false.)
+        call rk3_momentum_stage(1, dt/3.0_WP, d, mesh, partit)       ! fills uv_rhs (R_1)
+        r = d%uv_rhs
+        call rk3_momentum_update(d, mesh, partit, cs=cs)
+        call rk3_transport(d%uv, mesh, nElemO, s0)
+        call rk3_transport(d%rk3_us, mesh, nElemO, s1)
+        err = 0.0_WP; edu = 0.0_WP; smax = 0.0_WP
+        do e = 1, nElemO
+            c = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                c = c + mesh%helem(nz, e)*abs(d%uv(:, nz, e))
+            end do
+            smax = max(smax, maxval(c))
+            err  = max(err, maxval(abs(s1(:, e) - (s0(:, e) + cs*d%rk3_dub(:, e)*d%rk3_H(e)))))
+            nz = mesh%ulevels(e)
+            c = d%rk3_us(:, nz, e) - (d%uv(:, nz, e) + r(:, nz, e))
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                edu = max(edu, maxval(abs(d%rk3_us(:, nz, e) - (d%uv(:, nz, e) + r(:, nz, e)) - c)))
+            end do
+        end do
+        call max_all(err, partit); call max_all(edu, partit); call max_all(smax, partit)
+        call check(err <= 1.0e-14_WP*smax, 'R12 stage transport = sum_k helem*u^n + c_2*dUb*H', mype)
+        call check(edu <= 1.0e-14_WP, 'R12 u_s - (u^n + R_s) is depth-uniform', mype)
+        spread = shared_copy_max_elem(d%rk3_us, partit)
+        call check(spread == 0.0_WP, 'R12 shared copies of u_s agree', mype)
+        if (mype == 0) write(*,'(a,es9.2,a,es9.2)') 'test_rk3: R12 |transport - target|/max = ', err/smax, &
+            ', depth spread = ', edu
+    end subroutine r12_extrap
 
     subroutine r3_momentum_stage()
         type(t_dyn) :: d
@@ -1310,17 +1396,21 @@ contains
         allocate(ice%uice(1), ice%vice(1), ice%thermo%t_skin(1))
         allocate(ice%work%sigma11(1), ice%work%sigma12(1), ice%work%sigma22(1))
         Ron%nl = mesh%nl; Roff%nl = mesh%nl
+        allocate(d%rk3_ubold(2, 1))
         d%use_rk3 = .true.
         call restart_register_state(Ron, d, tr, ice, mesh)
         d%use_rk3 = .false.
         call restart_register_state(Roff, d, tr, ice, mesh)
-        same = (Ron%nf == Roff%nf)
+        same = (Ron%nf == Roff%nf + 2)
         if (same) then
-            do k = 1, Ron%nf
+            do k = 1, Roff%nf
                 if (trim(Ron%f(k)%name) /= trim(Roff%f(k)%name)) same = .false.
             end do
+            same = same .and. trim(Ron%f(Roff%nf + 1)%name) == 'rk3_ubold_u' .and. Ron%f(Roff%nf + 1)%optional_store &
+                        .and. trim(Ron%f(Roff%nf + 2)%name) == 'rk3_ubold_v' .and. Ron%f(Roff%nf + 2)%optional_store
         end if
-        call check(same .and. Ron%nf > 0, 'R10 the same stores with RK3 on and off', mype)
+        call check(same .and. Roff%nf > 0, 'R10 RK3 + CG: the AB2 stores in the same order, then the optional '// &
+                   'rk3_ubold_u/_v', mype)
         call check(Ron%rk3 .and. .not. Roff%rk3, 'R10 R%rk3 set with RK3 only', mype)
         ! the checkpoint.json round trip, with and without the key
         write(path, '(a,i0,a)') 'test_rk3_ckpt_', mype, '.json'

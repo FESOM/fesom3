@@ -47,8 +47,16 @@ module oce_rk3
     ! velocity u*, u** is dyn%rk3_us. rk3_momentum_stage(s) evaluates R_s = tau_s*(Coriolis +
     ! advection + PGF - g grad(eta^n)) on the stage velocity of s - 1 (compute_vel_rhs with
     ! uv_in and no_history) and sets
-    !     u_s = u^n + R_s - <R_s>,     <X>_e = sum_k helem*X / H_e,  H_e = rk3_H(e)
-    ! (rk3.tex: the trim keeps the barotropic transport at U^n). rk3_viscosity takes the
+    !     u_s = u^n + R_s - <R_s> + c_s*dUb,     <X>_e = sum_k helem*X / H_e,  H_e = rk3_H(e)
+    ! (rk3.tex trims to the barotropic transport at U^n, c_s = 0). With the CG corrector, a trim
+    ! to Ub^n leaves stage 3 the barotropic Coriolis f x Ub^n over tau, forward Euler (energy
+    ! growth (f tau)^2 per step for barotropic motions larger than the Rossby radius; the
+    ! Weddell instability of 2026-10-30, plan Addendum A). So the CG path trims to the depth-mean
+    ! velocity extrapolated in time, the AB-way rk3.tex names: dUb = Ub^n - Ub^{n-1}
+    ! (rk3_bt_extrap, Ub = <u>), c_1 = 1/3, c_2 = 1/2 + ab_epsilon; the stage-3 Coriolis then
+    ! acts on (3/2 + eps) Ub^n - (1/2 + eps) Ub^{n-1}, AB2's weights. Ub^{n-1} (rk3_ubold) is in
+    ! the checkpoint; a cold start or a checkpoint without it starts with dUb = 0. The SE path
+    ! keeps c_s = 0: its u^{n+1} is trimmed to the BT solver's U^M. rk3_viscosity takes the
     ! horizontal viscosity of u^n over tau once (stage 1) into rk3_visc; stage 3 adds it to its
     ! right-hand side. rk3_trim moves a velocity to a given transport, depth-uniformly. Every
     ! update is on the owned elements, then the shared copies are synced (FESOM3_SHARED_SYNC, as
@@ -101,7 +109,7 @@ module oce_rk3
     use oce_dyn_visc,    only: viscosity_filter
     use oce_adv_tra_hor, only: adv_tra_hor_upw1
     use mod_param_phys,  only: alpha, theta
-    use mod_config,      only: which_ALE
+    use mod_config,      only: which_ALE, ab_epsilon
     use oce_ssh_se,      only: se_env_requested
     implicit none
     private
@@ -109,6 +117,7 @@ module oce_rk3
     public :: rk3_tracer_prep, rk3_tracer_stage
     public :: rk3_depth, rk3_transport, rk3_momentum_stage, rk3_viscosity, rk3_trim, rk3_elem_sync
     public :: rk3_momentum_rhs, rk3_momentum_update, rk3_implied_eta, rk3_stage_geometry, rk3_check_eta
+    public :: rk3_bt_extrap, rk3_trim_coef
     public :: rk3_check_begin, rk3_check_trim, rk3_check_finish, rk3_check_line, rk3_inflow
     public :: rk3_cold_ab_start
     public :: RK3_NCHK, RK3_CHK_TRIM1, RK3_CHK_TRIM2, RK3_CHK_TRIM3, RK3_CHK_ETACOMP, RK3_CHK_TRIMM, &
@@ -250,6 +259,10 @@ contains
             allocate(dyn%rk3_sbar0(2, nElemL))
             dyn%rk3_sbar0 = 0.0_WP
         end if
+        ! the extrapolated stage trims of the CG path (module header): Ub^{n-1} = huge marks "not
+        ! set yet" (cold start, or a checkpoint without rk3_ubold), rk3_bt_extrap then starts with dUb = 0
+        allocate(dyn%rk3_ubold(2, nElemL), dyn%rk3_dub(2, nElemL))
+        dyn%rk3_ubold = huge(1.0_WP); dyn%rk3_dub = 0.0_WP
 
         if (partit%mype == 0) then
             bt = 'CG'
@@ -439,17 +452,22 @@ contains
     end subroutine rk3_momentum_rhs
 
     !===========================================================================
-    subroutine rk3_momentum_update(dynamics, mesh, partit)
-        ! rk3_us = u^n + R_s - <R_s> on the owned elements, <.> with the CURRENT helem and rk3_H
-        ! (zstar: h_s, so that sum_k h_s*u_s = sum_k h_s*u^n), synced and exchanged
+    subroutine rk3_momentum_update(dynamics, mesh, partit, cs)
+        ! rk3_us = u^n + R_s - <R_s> + cs*rk3_dub on the owned elements, <.> with the CURRENT helem
+        ! and rk3_H (zstar: h_s, so that sum_k h_s*u_s = sum_k h_s*(u^n + cs*dUb)), synced and
+        ! exchanged. cs = the stage's coefficient of the extrapolated trim (rk3_trim_coef; absent = 0,
+        ! the trim of rk3.tex to the transport of u^n)
         type(t_dyn),    intent(inout), target :: dynamics
         type(t_mesh),   intent(in),    target :: mesh
         type(t_partit), intent(in), optional  :: partit
+        real(kind=WP),  intent(in), optional  :: cs
         integer :: e, nz
         integer :: nNodO, nNodL, nEdgeO, nElemO
-        real(kind=WP) :: s(2)
+        real(kind=WP) :: s(2), c
 
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
+        c = 0.0_WP
+        if (present(cs)) c = cs
         do e = 1, nElemO
             s = 0.0_WP
             do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
@@ -457,6 +475,7 @@ contains
                 s(2) = s(2) + mesh%helem(nz, e)*dynamics%uv_rhs(2, nz, e)
             end do
             s = s/dynamics%rk3_H(e)
+            if (c /= 0.0_WP) s = s - c*dynamics%rk3_dub(:, e)
             do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
                 dynamics%rk3_us(1, nz, e) = dynamics%uv(1, nz, e) + (dynamics%uv_rhs(1, nz, e) - s(1))
                 dynamics%rk3_us(2, nz, e) = dynamics%uv(2, nz, e) + (dynamics%uv_rhs(2, nz, e) - s(2))
@@ -464,6 +483,50 @@ contains
         end do
         call rk3_elem_sync(dynamics%rk3_us, partit)
     end subroutine rk3_momentum_update
+
+    !===========================================================================
+    real(kind=WP) function rk3_trim_coef(stage, dynamics)
+        ! c_s of the extrapolated stage trim (module header): CG c_1 = 1/3, c_2 = 1/2 + ab_epsilon;
+        ! SE 0 (rk3.tex: its u^{n+1} is trimmed to the BT solver's U^M)
+        integer,     intent(in) :: stage
+        type(t_dyn), intent(in) :: dynamics
+        rk3_trim_coef = 0.0_WP
+        if (dynamics%use_ssh_se) return
+        select case (stage)
+        case (1)
+            rk3_trim_coef = 1.0_WP/3.0_WP
+        case (2)
+            rk3_trim_coef = 0.5_WP + ab_epsilon
+        end select
+    end function rk3_trim_coef
+
+    !===========================================================================
+    subroutine rk3_bt_extrap(dyn, mesh, partit)
+        ! Start of a CG step, u^n in uv, h^n in helem, rk3_H = H^n: rk3_dub = Ub^n - Ub^{n-1} with
+        ! Ub = sum_k helem*uv / rk3_H, then rk3_ubold = Ub^n for the next step, on the owned
+        ! elements (the trims use the owned ones only). An element whose rk3_ubold still holds
+        ! huge (rk3_init: cold start, or a checkpoint without rk3_ubold) gets dUb = 0. The owners of a
+        ! shared element hold the same synced uv and helem, so the same dUb.
+        type(t_dyn),    intent(inout)        :: dyn
+        type(t_mesh),   intent(in)           :: mesh
+        type(t_partit), intent(in), optional :: partit
+        integer :: e, nz
+        integer :: nNodO, nNodL, nEdgeO, nElemO
+        real(kind=WP) :: ub(2)
+
+        call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
+        do e = 1, nElemO
+            ub = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                ub(1) = ub(1) + mesh%helem(nz, e)*dyn%uv(1, nz, e)
+                ub(2) = ub(2) + mesh%helem(nz, e)*dyn%uv(2, nz, e)
+            end do
+            ub = ub/dyn%rk3_H(e)
+            if (dyn%rk3_ubold(1, e) == huge(1.0_WP)) dyn%rk3_ubold(:, e) = ub
+            dyn%rk3_dub(:, e) = ub - dyn%rk3_ubold(:, e)
+            dyn%rk3_ubold(:, e) = ub
+        end do
+    end subroutine rk3_bt_extrap
 
     !===========================================================================
     subroutine rk3_implied_eta(tau_s, vel, dyn, mesh, partit)

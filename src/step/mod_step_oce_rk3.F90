@@ -7,6 +7,7 @@ module mod_step_oce_rk3
     ! One step, tau = dt (dyn%uv = u^n, the tracer values = T^n and eta_n = eta^n until stage 3;
     ! zstar: hnode = h^n, the geometry (helem, zbar_3d_n, Z_3d_n) follows the stages, oce_rk3 header):
     !   rk3_H = sum helem                               (every step: a restart rebuilds helem)
+    !   CG: dUb = Ub^n - Ub^{n-1} for the extrapolated stage trims (rk3_bt_extrap, plan Addendum A)
     !   stage 1 (tau/3)  [zstar: hbar_old = hbar = eta^n, hbar = eta~_1 from u^n]
     !                    w from u^n, split off (w_e = w, w_i = 0), no bolus [zstar: hnode_new = h_1]
     !                    p(T^n) pressure only + PGF
@@ -15,12 +16,12 @@ module mod_step_oce_rk3
     !                    SE: se_bt_forcing_rk3 + se_subcycle (eta^M, U^M, <<U>>; not committed)
     !                    tracers: valuesAB T^n -> T*       (HO, full w)
     !                    [zstar: the geometry of h_1]
-    !                    rk3_us = u^n + R1 - <R1>
+    !                    rk3_us = u^n + R1 - <R1> + c_1*dUb   (CG c_1 = 1/3, SE 0)
     !   stage 2 (tau/2)  [zstar: hbar = eta~_2 from u*]; w from u*, split off, no bolus
     !                    p(T*) pressure only + PGF         (the textbook p(T*), plan D3: before T*
     !                                                       is overwritten)
     !                    R2 on u*; tracers: T* -> T**; [zstar: the geometry of h_2]
-    !                    rk3_us = u^n + R2 - <R2>
+    !                    rk3_us = u^n + R2 - <R2> + c_2*dUb   (CG c_2 = 1/2 + ab_epsilon, SE 0)
     !   stage 3 (tau)    p(T**) in full + PGF; sw_alpha_beta, sigma_xy, slopes from T**
     !                    compute_vel_nodes (u^n), shear, PP|KPP|TKE, mo_convect
     !                    [zstar: hbar = eta~_3 from u**]; w from the untrimmed u** with the split
@@ -69,7 +70,8 @@ module mod_step_oce_rk3
     use oce_rk3,            only: rk3_die, rk3_depth, rk3_transport, rk3_tracer_stage, rk3_viscosity, &
                                   rk3_momentum_rhs, rk3_momentum_update, rk3_trim, rk3_check_begin, &
                                   rk3_check_trim, rk3_check_eta, rk3_check_finish, rk3_implied_eta, &
-                                  rk3_stage_geometry, RK3_CHK_TRIM1, RK3_CHK_TRIM2, RK3_CHK_TRIM3, RK3_CHK_TRIMM
+                                  rk3_stage_geometry, rk3_bt_extrap, rk3_trim_coef, &
+                                  RK3_CHK_TRIM1, RK3_CHK_TRIM2, RK3_CHK_TRIM3, RK3_CHK_TRIMM
     use mod_timer,          only: timer_start, timer_stop, &
                                   TMR_OCE_MIXPRES, TMR_OCE_DYN, TMR_OCE_SSH, &
                                   TMR_OCE_SOLVE, TMR_OCE_GMREDI, TMR_OCE_TRACER, &
@@ -110,6 +112,7 @@ contains
         tau2 = 0.5_WP*dt
 
         call rk3_depth(dynamics, mesh, partit)
+        if (.not. dynamics%use_ssh_se) call rk3_bt_extrap(dynamics, mesh, partit)
         if (dynamics%rk3_check) then
             call rk3_check_begin(dynamics, mesh, partit)
             allocate(eta_old(nNodL))
@@ -145,9 +148,9 @@ contains
         call timer_stop(TMR_OCE_TRACER)
         call timer_start(TMR_OCE_DYN)
         call rk3_stage_geometry(dynamics, mesh, partit)
-        call rk3_momentum_update(dynamics, mesh, partit)
+        call rk3_momentum_update(dynamics, mesh, partit, cs=rk3_trim_coef(1, dynamics))
         call timer_stop(TMR_OCE_DYN)
-        if (dynamics%rk3_check) call check_stage_trim(RK3_CHK_TRIM1)
+        if (dynamics%rk3_check) call check_stage_trim(RK3_CHK_TRIM1, 1)
         call timer_stop(TMR_OCE_RK3_S1)
 
         !=======================================================================
@@ -168,9 +171,9 @@ contains
         call timer_stop(TMR_OCE_TRACER)
         call timer_start(TMR_OCE_DYN)
         call rk3_stage_geometry(dynamics, mesh, partit)
-        call rk3_momentum_update(dynamics, mesh, partit)
+        call rk3_momentum_update(dynamics, mesh, partit, cs=rk3_trim_coef(2, dynamics))
         call timer_stop(TMR_OCE_DYN)
-        if (dynamics%rk3_check) call check_stage_trim(RK3_CHK_TRIM2)
+        if (dynamics%rk3_check) call check_stage_trim(RK3_CHK_TRIM2, 2)
         call timer_stop(TMR_OCE_RK3_S2)
 
         !=======================================================================
@@ -334,11 +337,19 @@ contains
 
     contains
 
-        subroutine check_stage_trim(k)
-            ! trim1 / trim2: the stage transport against the transport of u^n, both with the weights
-            ! of the stage's geometry (helem = h_s; h^n under linfs)
-            integer, intent(in) :: k
+        subroutine check_stage_trim(k, stage)
+            ! trim1 / trim2: the stage transport against its target, the transport of u^n plus the
+            ! extrapolation c_s*dUb*H_s (CG; SE: c_s = 0), both with the weights of the stage's
+            ! geometry (helem = h_s, rk3_H = H_s; h^n under linfs)
+            integer, intent(in) :: k, stage
+            real(kind=WP) :: c
             call rk3_transport(dynamics%uv, mesh, nElemO, dynamics%rk3_sbar0)
+            c = rk3_trim_coef(stage, dynamics)
+            if (c /= 0.0_WP) then
+                do e = 1, nElemO
+                    dynamics%rk3_sbar0(:, e) = dynamics%rk3_sbar0(:, e) + c*dynamics%rk3_dub(:, e)*dynamics%rk3_H(e)
+                end do
+            end if
             call rk3_check_trim(k, dynamics%rk3_us, dynamics, mesh, partit)
         end subroutine check_stage_trim
 
