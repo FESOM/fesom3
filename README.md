@@ -95,6 +95,13 @@ conservation, mesh-delta, regression and self-consistency gates take its place
 - **Exact `zstar` restart (opt-in):** with `FESOM3_RESTART_ZSTAR_EXACT=1` a `zstar` checkpoint also
   holds the SSH stiffness values and `dhe`, and a resumed run matches the straight run bit for bit.
   Without it a `zstar` resume continues from the cold stiffness matrix and geometry (not bitwise).
+- **Redi diffusivity in the tapered zones scales with resolution.** Where the slope taper acts (mixed
+  layer, N² ≤ 0, isopycnal slopes above `ODM95_Scr`), the Redi tensor turns horizontal and its
+  diffusivity blends to `Redi_Kmin`. FESOM2 keeps that at 100 m²/s, a 1° value, while K_GM and the
+  interior Redi diffusivity scale with √(2·area)/100 km. With `scaling_resolution` (set in every
+  driver's GM/Redi setup) it now follows the same factor, clamped at `K_GM_min`: on NEMO025 about
+  30 m²/s in the Gulf Stream beside an interior 300 m²/s; unchanged on cells with √(2·area) ≥ 100 km.
+  Every run with `FESOM3_REDI` changes (CORE2 in its refined regions). Test: `test_redi_kmin`.
 
 Production runs on Levante with these changes conserve volume to roundoff: CORE2 on 512 ranks (about
 95 model years per day) and the NEMO ORCA025 quad mesh on 1280 ranks (about 29 model years per day).
@@ -252,7 +259,7 @@ examples. The most common variables:
 | `FESOM3_ICE_CUTOFF_CONSERVE` | sea-ice `cut_off`: `1` = conserving (the ice and snow it deletes melt into the ocean in the same step, with their fresh water and ice salt), `0` or unset = FESOM2's (deleted without a flux); any other value stops. See *Changes since v1* above |
 | `FESOM3_WHICH_ALE` | vertical coordinate: `linfs` (default) or `zstar`. `zlevel` is not ported, and the driver does not reject it: do not use it |
 | `FESOM3_LINFS_CONSERVE` | `S`, `T` or `TS` (unset = FESOM2): with `linfs` the layers are fixed while `w` at the surface is not zero, so the vertical advection moves tracer through the surface and the ocean's salt and heat content drift (CORE2 JRA55-do, Dmitry's setup: whole-ocean S -5.5e-5 in the cold-start year, ~-2e-6 a year later). This returns that flux, summed over the ocean, as a uniform surface flux of S and/or T every step (MITgcm's `linFSConserveTr`). `linfs` and the FCT limiter only. Read in `src/oce/oce_ale_tracer.F90` |
-| `FESOM3_FER_GM`, `FESOM3_REDI` | Gent–McWilliams bolus advection, Redi isopycnal diffusion |
+| `FESOM3_FER_GM`, `FESOM3_REDI` | Gent–McWilliams bolus advection, Redi isopycnal diffusion. `FESOM3_REDI` also switches GM on |
 | `FESOM3_MIX_KPP`, `FESOM3_MIX_TKE`, `FESOM3_SW_PENE` | vertical mixing and shortwave penetration |
 | `FESOM3_SHEAR_SPLINES`, `FESOM3_N2_SPLINES` | cubic-spline shear and N² at the interfaces (set both) |
 | `FESOM3_MOMADV_OPT` | momentum advection: `2` (default) = flux form, `1` = vector invariant |

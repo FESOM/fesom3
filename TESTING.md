@@ -154,6 +154,7 @@ plan"):
 | mixed/quad cases of `test_vinv`, `test_ivertvisc`, `test_muscl_onthefly` | patches, cut-outs | the converted ocean kernels |
 | `meshdiag_{mixed,quad,pi_w}` | cut-outs, pi_w | 4-column mesh-diagnostics store (`tools/check_meshdiag.py`) |
 | `fesom_conserve_mixcut_*`, `fesom_conserve_{q,mix}cut_ice_*` | cut-outs, np 1/2 | conservation (PP/KPP/TKE/GM/Redi; with sea ice, EVP and mEVP) |
+| `test_redi_kmin` | mixed cut-out, np 1/2 | `init_Redi_GM` with the production GM/Redi parameters: `fer_scal`, the interior Ki, the tapered-zone Ki = max(fer_scal·Redi_Kmin, K_GM_min), the √taper blend, and the fixed `Redi_Kmin` with `scaling_resolution` off |
 
 The mesh-dependent hybrid cases read meshes from the hard-coded root `/work/ab0995/a270029/meshes`
 (`test/CMakeLists.txt`). Whether a mesh exists is decided at configure time

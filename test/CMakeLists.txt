@@ -362,6 +362,11 @@ foreach(_np 1 2)
     endforeach()
 endforeach()
 
+# init_Redi_GM: the Redi_Ktaper blend in the tapered zones with the kmin scaled like K_GM
+# (fer_scal*Redi_Kmin under scaling_resolution, the fixed Redi_Kmin without); default mesh =
+# the NEMO-mixed cut-out, fine enough for fer_scal < 1.
+add_default_mesh_test(test_redi_kmin ${_mesh_mix} 1 2)
+
 # Task 17 (hybrid meshes): conservation with SEA ICE ON on the NEMO-quad and NEMO-mixed
 # cut-outs, np 1 and 2 (EVP) + mEVP at np 2. The ocean physics is the production set the
 # driver supports (TKE, GM + Redi, splines, vector-invariant momentum with rvo_upwind 1, w
