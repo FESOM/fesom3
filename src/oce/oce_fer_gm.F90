@@ -58,7 +58,7 @@ contains
         real(kind=WP),  intent(inout), optional :: Ki(mesh%nl-1, mesh%nod2D)
         real(kind=WP),  intent(in),    optional :: fer_tapfac(mesh%nl-1, mesh%nod2D)
         integer       :: n, k, nz, nzmax, nzmin, nNodO, nNodL, nEdgeO, nElemO
-        real(kind=WP) :: reso, cm, scaling
+        real(kind=WP) :: reso, cm, scaling, kmin
         real(kind=WP) :: zscaling(mesh%nl)
         real(kind=WP) :: refscalresol = 100000._WP   ! 100 km
 
@@ -174,15 +174,23 @@ contains
 
             ! vertical Ferreira scaling of the Redi diffusivity + Redi_Ktaper sqrt-split of the
             ! slope taper between Ki and the neutral slope (FESOM2 oce_fer_gm.F90:479-498).
+            ! Where the slope is tapered (mixed layer, N^2 <= 0, steep isopycnals) Ki blends to
+            ! kmin, and the tapered slope makes the tensor horizontal there. FESOM2 keeps kmin =
+            ! Redi_Kmin fixed (work_core: 100 m^2/s, a 1-degree value) while Ki itself follows
+            ! fer_scal; with scaling_resolution kmin follows the same fer_scal (clamped at
+            ! K_GM_min), so tapered and interior Ki keep the surface ratio Redi_Kmin/Redi_Kmax on
+            ! every mesh (NEMO025 Gulf Stream: 30 instead of 100 m^2/s beside an interior 300).
             if (Redi) then
                 do nz = nzmin+1, nzmax-1
                     Ki(nz,n) = Ki(nzmin,n)*0.5_WP*(zscaling(nz)+zscaling(nz+1))
                 end do
                 Ki(nzmin,n) = Ki(nzmin,n)*0.5_WP*(zscaling(nzmin)+zscaling(nzmin+1))
                 if (Redi_Ktaper) then
+                    kmin = Redi_Kmin
+                    if (Fer_GM .and. scaling_resolution) kmin = max(fer_scal(n)*Redi_Kmin, K_GM_min)
                     do nz = nzmin, nzmax-1
                         Ki(nz,n) = Ki(nz,n)*sqrt(fer_tapfac(nz,n)) &
-                                 + Redi_Kmin*abs(sqrt(fer_tapfac(nz,n))-1)
+                                 + kmin*abs(sqrt(fer_tapfac(nz,n))-1)
                     end do
                 end if
             end if
