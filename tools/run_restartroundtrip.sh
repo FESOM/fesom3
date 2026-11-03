@@ -10,8 +10,10 @@
 # at np 1 AND 2 (np=2 = real cross-rank gather + halo exchange — a wrong variant/gather shows up as a
 # nonzero Δ in the halo/eXDim region). Then the split-explicit pass (FESOM3_RESTARTRT_SE=1, AB_order=2,
 # 38 fields: + se_eta1/2, se_ubt{0,1,2}_{u,v}, se_sbar_old_{u,v}) and the SE read pre-check
-# (FESOM3_RESTARTRT_SE=2: a checkpoint without SE state read with SE registered must abort with
-# "checkpoint has no split-explicit state"), both at every np.
+# (FESOM3_RESTARTRT_SE=2: a checkpoint without SE state read with SE registered, by a caller that cannot
+# start the rings cold, must abort with "checkpoint has no split-explicit state") and the SE cold resume
+# (FESOM3_RESTARTRT_SE=3: the same read with se_cold: no abort, se_cold set, the SE arrays untouched, the 28
+# other fields max|Δ| = 0), all at every np.
 #
 #   tools/run_restartroundtrip.sh           # default: np 1 2
 #   tools/run_restartroundtrip.sh 1         # just 1-rank
@@ -71,6 +73,20 @@ for NP in $NPS; do
         echo "SE PRECHECK OK (exit $s)"
     else
         echo "SE PRECHECK FAIL (exit $s)"; rc=1
+    fi
+done
+
+# SE cold resume: the same checkpoint read with se_cold (the production driver's call)
+for NP in $NPS; do
+    DIR="$RUN/se_cold_np$NP"
+    rm -rf "$DIR"; mkdir -p "$DIR"
+    echo "=== fesom_restartroundtrip SE cold resume np=$NP (expect 28 fields max|Δ|=0, SE arrays not read) ==="
+    s=0
+    out=$(FESOM3_RESTARTRT_SE=3 FESOM3_RESTARTRT_DIR="$DIR" "${MPIRUN[@]}" -n "$NP" "$BUILD/bin/fesom_restartroundtrip" 2>&1) || s=$?
+    grep -E "SE cold resume|rings start cold|SE COLD|fields=|global max|ROUNDTRIP" <<<"$out" || true
+    if [ "$s" = 0 ] && grep -q "SE COLD OK" <<<"$out" && grep -q "fields=28$" <<<"$out" \
+            && grep -q "ROUNDTRIP OK" <<<"$out"; then :; else
+        echo "SE COLD FAIL (exit $s)"; rc=1
     fi
 done
 

@@ -44,6 +44,12 @@ program test_ssh_se
     !       == sum_k helem*uv on owned + eDim elements; s_old == 0; the drag rate 0 until the
     !       first forcing) and se_ready. eta_n and uv are hashed from the global ids, so every
     !       copy of a node or element holds the same value.
+    !   C4b se_cold_resume, the resume from a checkpoint without SE state: after se_init, a new
+    !       eta_n and uv (the restored state, hashed from the global ids), the rings, s_old and
+    !       uv_rhsAB scribbled; se_cold_resume rebuilds the rings from the new state as the cold
+    !       start of C4 (eta ring == eta_n bitwise, the three U levels bitwise equal and == sum_k
+    !       helem*uv on owned + eDim, s_old == 0); under RK3 uv_rhsAB is left as it was, under AB2
+    !       it is 0 (the cold AB momentum start whose forcing C6 checks).
     !   C5  se_elem_depth and the PRESSURE part of the forcing (Task 1.1): H^n == sum_k helem on
     !       owned + eDim elements (bitwise, positive); with uv = 0, pgf = 0, momentum advection off
     !       and a non-trivial eta_n, the real compute_vel_rhs puts only -g grad(eta) into UV_rhs,
@@ -164,7 +170,7 @@ program test_ssh_se
     use mod_constants,    only: density_0
     use oce_ssh_se,       only: se_bt_forcing_rk3
     use oce_dyn_visc,     only: viscosity_filter
-    use oce_ssh_se,       only: se_env_requested, se_parse_knob, se_init, se_sm_coeffs, &
+    use oce_ssh_se,       only: se_env_requested, se_parse_knob, se_init, se_cold_resume, se_sm_coeffs, &
                                 se_cfl_m_min, se_cfl_decision, se_cfl_stable, se_cfl_rho, &
                                 se_cfl_acrit, se_cfl_apply_a, se_cfl_omega_max, SE_CFL_SAFETY, &
                                 SE_CFL_OK, SE_CFL_FORCED, SE_CFL_DIE, se_bt_forcing, &
@@ -551,7 +557,7 @@ contains
 
     subroutine c4_se_init()
         type(t_dyn) :: dyn
-        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, n, e, nz, nl, c, nbad
+        integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, n, e, nz, nl, c, nbad, lrk
         real(kind=WP) :: b, z, gm, d, ub(2), err
         nl = mesh%nl
         call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
@@ -620,6 +626,52 @@ contains
         call check(all(dyn%se_sbar_old == 0.0_WP), 'C4 s_old == 0', partit%mype)
         call check(all(dyn%se_kdrag == 0.0_WP), 'C4 the drag rate is 0 until the first forcing', partit%mype)
         call check(maxval(abs(dyn%se_ubt(:, :, 0))) > 0.0_WP, 'C4 the U ring is non-trivial', partit%mype)
+
+        ! C4b: se_cold_resume from a new (restored) eta_n and uv, RK3 then AB2
+        allocate(dyn%uv_rhsAB(1, 2, nl-1, nElemF))
+        do lrk = 1, 2
+            dyn%use_rk3 = (lrk == 1)
+            do e = 1, nElemF
+                do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                    do c = 1, 2
+                        dyn%uv(c, nz, e) = 0.3_WP*hval(partit%myList_elem2D(e), 10*nz + c + 5*lrk)
+                    end do
+                end do
+            end do
+            do n = 1, nNodL
+                dyn%eta_n(n) = 0.4_WP*hval(partit%myList_nod2D(n), 1 + lrk)
+            end do
+            dyn%se_eta = -7.0_WP; dyn%se_ubt = -7.0_WP; dyn%se_sbar_old = -7.0_WP; dyn%uv_rhsAB = 3.0_WP
+            call se_cold_resume(dyn, mesh, partit)
+            nbad = count(dyn%se_eta(:, 1) /= dyn%eta_n(1:nNodL)) + count(dyn%se_eta(:, 2) /= dyn%eta_n(1:nNodL))
+            call sum_all(nbad, partit)
+            call check(nbad == 0, 'C4b '//trim(merge('RK3', 'AB2', lrk == 1))// &
+                       ' eta ring == the restored eta_n (bitwise, nNodL)', partit%mype)
+            nbad = count(dyn%se_ubt(:, :, 1) /= dyn%se_ubt(:, :, 0)) + count(dyn%se_ubt(:, :, 2) /= dyn%se_ubt(:, :, 0))
+            call sum_all(nbad, partit)
+            call check(nbad == 0, 'C4b '//trim(merge('RK3', 'AB2', lrk == 1))// &
+                       ' the three U ring levels are bitwise equal', partit%mype)
+            err = 0.0_WP
+            do e = 1, nElemL
+                ub = 0.0_WP
+                do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                    ub = ub + mesh%helem(nz, e)*dyn%uv(:, nz, e)
+                end do
+                err = max(err, maxval(abs(dyn%se_ubt(:, e, 0) - ub))/max(maxval(abs(ub)), 1.0_WP))
+            end do
+            call max_all(err, partit)
+            call check(err <= 1.0e-13_WP, 'C4b '//trim(merge('RK3', 'AB2', lrk == 1))// &
+                       ' U ring == sum_k helem*uv of the restored uv (owned + eDim)', partit%mype)
+            call check(all(dyn%se_sbar_old == 0.0_WP), 'C4b '//trim(merge('RK3', 'AB2', lrk == 1))// &
+                       ' s_old == 0', partit%mype)
+            if (lrk == 1) then
+                call check(all(dyn%uv_rhsAB == 3.0_WP), 'C4b RK3 uv_rhsAB unchanged', partit%mype)
+            else
+                call check(all(dyn%uv_rhsAB == 0.0_WP), 'C4b AB2 uv_rhsAB == 0 (cold AB momentum start)', &
+                           partit%mype)
+            end if
+        end do
+        dyn%use_rk3 = .false.
     end subroutine c4_se_init
 
     subroutine new_dyn(dyn)

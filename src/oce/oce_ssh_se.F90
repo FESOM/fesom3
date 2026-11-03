@@ -37,7 +37,9 @@ module oce_ssh_se
     ! se_trim_finish) and the zstar checks (mean sea level against the freshwater, the layer
     ! sum, w(1) and the depth law after the tail; Task 3.1). step_oce calls se_bt_forcing ->
     ! se_subcycle -> se_trim_finish in place of the CG solve block. The carried rings are in the
-    ! checkpoint (mod_io_restart, restart_register_state; Task 4.2).
+    ! checkpoint (mod_io_restart, restart_register_state; Task 4.2). An SE run that resumes a
+    ! checkpoint without them (written with the CG solve, AB2 or RK3) starts the rings cold from
+    ! the restored state (se_cold_resume), as se_init does at a cold start.
     !
     ! DETERMINISM (plan D2): every per-element operator of the substeps is a GATHER over the
     ! element's own vertex / neighbour slots in fixed slot order, never a scatter into elements.
@@ -133,7 +135,7 @@ module oce_ssh_se
     use mod_mesh_areas,  only: elem_center
     implicit none
     private
-    public :: se_env_requested, se_read_env, se_parse_knob, se_init, se_step_guard
+    public :: se_env_requested, se_read_env, se_parse_knob, se_init, se_step_guard, se_cold_resume
     public :: se_elem_depth, se_bt_forcing, se_subcycle, se_trim_finish
     public :: se_bt_forcing_rk3, se_rk3_finish
     public :: se_check_core, se_check_values, se_check_line, se_check_tail
@@ -567,7 +569,9 @@ contains
     !===========================================================================
     subroutine se_init(dyn, mesh, partit, dt)
         ! Called once by a driver that supports SE (fesom_lifecycle_native_mr, fesom_conserve),
-        ! after its cold init and before a restart read (which then overwrites the cold rings).
+        ! after its cold init and before a restart read (which then overwrites the cold rings; a
+        ! checkpoint without them is followed by se_cold_resume, which rebuilds them from the
+        ! restored state).
         ! A silent no-op unless FESOM3_SSH_SE=1. Otherwise: the knobs, the guards (AB2 momentum,
         ! no cavity), the SM coefficients, the state of the plan's Technical Details §1, the
         ! cold start, the viscosity coefficients (se_kappa_build), the CFL guard, and se_ready.
@@ -579,9 +583,9 @@ contains
         type(t_mesh),   intent(in)    :: mesh
         type(t_partit), intent(in)    :: partit
         real(kind=WP),  intent(in)    :: dt
-        integer       :: n, e, nz, M_min
+        integer       :: M_min
         integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
-        real(kind=WP) :: lim, ub(2), omega, relchg, acrit
+        real(kind=WP) :: lim, omega, relchg, acrit
         double precision :: twall
         character(len=320) :: msg
         character(len=16)  :: tw
@@ -615,21 +619,7 @@ contains
         dyn%se_zlen  = 0.0_WP; dyn%se_vn     = 0.0_WP; dyn%se_kdrag = 0.0_WP
 
         ! ---- cold start ----
-        do n = 1, nNodL
-            dyn%se_eta(n, 1) = dyn%eta_n(n)
-            dyn%se_eta(n, 2) = dyn%eta_n(n)
-        end do
-        do e = 1, nElemL
-            ub = 0.0_WP
-            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
-                ub(1) = ub(1) + mesh%helem(nz, e)*dyn%uv(1, nz, e)
-                ub(2) = ub(2) + mesh%helem(nz, e)*dyn%uv(2, nz, e)
-            end do
-            dyn%se_ubt(:, e, 0) = ub
-            dyn%se_ubt(:, e, 1) = ub
-            dyn%se_ubt(:, e, 2) = ub
-        end do
-        dyn%se_sbar_old = 0.0_WP
+        call se_cold_rings(dyn, mesh, partit)
 
         ! ---- BT viscosity coefficients (geometry, once) ----
         call se_kappa_build(dyn, mesh, partit)
@@ -680,6 +670,68 @@ contains
 
         dyn%se_ready = .true.
     end subroutine se_init
+
+    !===========================================================================
+    subroutine se_cold_rings(dyn, mesh, partit)
+        ! The cold start of the carried SE state from eta_n, uv and helem: the eta ring holds eta_n
+        ! (eta^{-1/M} = eta^{-2/M} = eta^n) on owned + halo nodes, the three U ring levels the
+        ! depth-integrated velocity sum_k helem*uv on owned + eDim elements (helem and uv are
+        ! halo-valid there), and s_old = 0.
+        type(t_dyn),    intent(inout) :: dyn
+        type(t_mesh),   intent(in)    :: mesh
+        type(t_partit), intent(in)    :: partit
+        integer       :: n, e, nz
+        integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
+        real(kind=WP) :: ub(2)
+        call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
+        do n = 1, nNodL
+            dyn%se_eta(n, 1) = dyn%eta_n(n)
+            dyn%se_eta(n, 2) = dyn%eta_n(n)
+        end do
+        do e = 1, nElemL
+            ub = 0.0_WP
+            do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
+                ub(1) = ub(1) + mesh%helem(nz, e)*dyn%uv(1, nz, e)
+                ub(2) = ub(2) + mesh%helem(nz, e)*dyn%uv(2, nz, e)
+            end do
+            dyn%se_ubt(:, e, 0) = ub
+            dyn%se_ubt(:, e, 1) = ub
+            dyn%se_ubt(:, e, 2) = ub
+        end do
+        dyn%se_sbar_old = 0.0_WP
+    end subroutine se_cold_rings
+
+    !===========================================================================
+    subroutine se_cold_resume(dyn, mesh, partit)
+        ! An SE run that resumed a checkpoint without the SE state (restart_read's se_cold: written
+        ! with the CG solve, AB2 or RK3). Called after restart_read and, under zstar, after the
+        ! thickness rebuild (helem from the restored hnode). The rings start cold from the restored
+        ! eta_n, uv and helem (se_cold_rings), as se_init's at a cold start.
+        ! RK3: nothing else; se_bt_forcing_rk3 removes the Coriolis of s^n exactly and does not read
+        ! s_old, and the RK3 step has no momentum history.
+        ! AB2: se_bt_forcing removes the AB2 Coriolis of compute_vel_rhs through a2*s^n + a1*s^{n-1}.
+        ! s^{n-1} is not in the checkpoint and cannot be recovered from uv_rhsAB (which also holds
+        ! the momentum advection), so the momentum starts cold, as in a cold run: uv_rhsAB = 0 here,
+        ! and the caller takes lfirst on the first step (compute_vel_rhs's ff = 1, a2 = 1), with
+        ! s_old = 0 the forcing is consistent (test_ssh_se C6). The tracer history stays.
+        ! One rank-0 line.
+        type(t_dyn),    intent(inout) :: dyn
+        type(t_mesh),   intent(in)    :: mesh
+        type(t_partit), intent(in)    :: partit
+        if (.not. dyn%se_ready) call se_die('se_cold_resume before se_init', partit)
+        call se_cold_rings(dyn, mesh, partit)
+        if (.not. dyn%use_rk3) dyn%uv_rhsAB = 0.0_WP
+        if (partit%mype == 0) then
+            if (dyn%use_rk3) then
+                write(*,'(a)') 'restart: checkpoint without split-explicit state: the SE rings start cold ' // &
+                    'from the restored eta_n and uv'
+            else
+                write(*,'(a)') 'restart: checkpoint without split-explicit state: the SE rings start cold ' // &
+                    'from the restored eta_n and uv, cold AB momentum start (Euler first step, uv_rhsAB = 0, ' // &
+                    's_old = 0)'
+            end if
+        end if
+    end subroutine se_cold_resume
 
     !===========================================================================
     subroutine se_step_guard(dyn, partit)

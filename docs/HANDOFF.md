@@ -5,6 +5,13 @@ Full pre-M2.12 milestone detail + the per-gate recipes live in [`HANDOFF-archive
 
 ## Where we are
 
+- **Split-explicit resume from a CG checkpoint (2026-11-03, branch `se-resume-from-cg`):** an SE run
+  (`FESOM3_SSH_SE=1`) used to stop on a checkpoint without SE state; it now resumes it with cold rings
+  (`restart_read(..., se_cold=)` skips the 10 SE stores, `se_cold_resume` sets them from the restored
+  state after the zstar rebuild; AB2 also starts its momentum cold: `uv_rhsAB` = 0, lfirst on step 1).
+  For Dmitry's NEMO025 RK3 branch: RK3 + CG ran 1962–1963, the 1964 RK3 run is to go on with SE from
+  the CG checkpoint `fesom.1964.001`. Tests: `test_ssh_se` C4b, `run_restartroundtrip.sh` mode 3, CORE2
+  np 8 resumes (TESTING.md §6c Restart). IMPLEMENTATION.md §14 Restart.
 - **RK3 time stepping ✅ (2026-10-28, branch `rk3`, opt-in `FESOM3_RK3=1`, plan
   `plans/completed/2026-10-28-rk3.md`, unpushed):** the Wicker–Skamarock RK3 step of Sergey's quad FV
   prototype (`rk3.tex`, `~/qq_new2`) in place of AB2: stages 1–2 advection (full w), Coriolis, PGF; stage 3

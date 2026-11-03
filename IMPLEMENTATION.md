@@ -644,8 +644,20 @@ fields. Checkpoints of the interim plan Task 5.4 code (commit 6a76b29, 8 SE stor
 drag off equals the straight run of the old binary). A resumed SE run equals the straight run
 (`max|Δ| = 0`, linfs and zstar, np 1 and 2, np 2 → 8 round trip). Limits:
 
-- An SE run that finds no SE state in the checkpoint stops with "checkpoint has no split-explicit
-  state: written with FESOM3_SSH_SE off; SI<->SE restarts are not supported".
+- An SE run that finds no SE state in the checkpoint (no `se_eta1` store: written with the CG solve,
+  AB2 or RK3) resumes it with cold rings (since 2026-11-03). `restart_read`, called with `se_cold`,
+  skips the 10 SE stores and says so; after the zstar thickness rebuild the driver calls
+  `se_cold_resume`, which sets the rings from the restored state as `se_init` does at a cold start
+  (η ring = ηⁿ, the three Ū levels Σ helem·uⁿ, š^{n−1} = 0).
+  - RK3 needs nothing more: its forcing removes the Coriolis of šⁿ exactly and it has no momentum
+    history.
+  - AB2: the forcing removes the AB2 Coriolis of `compute_vel_rhs` through a₂šⁿ + a₁š^{n−1}. A CG
+    checkpoint has no š^{n−1}, and `uv_rhsAB` cannot give it (it also holds the momentum advection).
+    So the momentum starts cold too: `uv_rhsAB` = 0 and an Euler first step (lfirst), the first step
+    of a cold run. The tracer history is kept.
+  - A caller without `se_cold` (the pre-check of `fesom_restartroundtrip`) still stops with
+    "checkpoint has no split-explicit state". A checkpoint with `se_eta1` but another SE store
+    missing stops on that store, as before.
 - The other direction is not detected: an SE checkpoint read with SE off silently ignores the `se_*`
   stores. SE → SI is not supported.
 - M and χ are not stored. Keep them fixed across a restart chain: the rings hold levels dtbt = τ/M
