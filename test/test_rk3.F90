@@ -1409,8 +1409,8 @@ contains
             do k = 1, Roff%nf
                 if (trim(Ron%f(k)%name) /= trim(Roff%f(k)%name)) same = .false.
             end do
-            same = same .and. trim(Ron%f(Roff%nf + 1)%name) == 'rk3_ubold_u' .and. Ron%f(Roff%nf + 1)%optional_store &
-                        .and. trim(Ron%f(Roff%nf + 2)%name) == 'rk3_ubold_v' .and. Ron%f(Roff%nf + 2)%optional_store
+            same = same .and. trim(Ron%f(Roff%nf + 1)%name) == 'rk3_ubold_u' .and. Ron%f(Roff%nf + 1)%may_be_absent &
+                        .and. trim(Ron%f(Roff%nf + 2)%name) == 'rk3_ubold_v' .and. Ron%f(Roff%nf + 2)%may_be_absent
         end if
         call check(same .and. Roff%nf > 0, 'R10 RK3 + CG: the AB2 stores in the same order, then the optional '// &
                    'rk3_ubold_u/_v', mype)

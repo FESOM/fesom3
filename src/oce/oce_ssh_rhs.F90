@@ -79,7 +79,7 @@ module oce_ssh_rhs
     use mod_halo,       only: exchange_nod
     implicit none
     private
-    public :: init_stiff_mat_ale, compute_ssh_rhs_ale, update_stiff_mat_ale
+    public :: init_stiff_mat_ale, compute_ssh_rhs_ale, update_stiff_mat_ale, stiff_full_seed
 
 contains
 
@@ -249,10 +249,7 @@ contains
         ! single precision (upstream #997): seed the real64 accumulator on the first update (a
         ! cold start and a restart alike: init_stiff_mat_ale has run by then), accumulate the
         ! increments in it, and refresh the WP matrix the solver reads once per step
-        if (.not. allocated(mesh%ssh_stiff%values_full)) then
-            allocate(mesh%ssh_stiff%values_full(size(mesh%ssh_stiff%values)))
-            mesh%ssh_stiff%values_full = real(mesh%ssh_stiff%values, WP_full)
-        end if
+        call stiff_full_seed(mesh)
         call add_edge_stiffness(mesh, nNodO, nEdgeO, -mesh%dhe(1:nElemO), g*dt*alpha*theta, rev, &
                                 acc=mesh%ssh_stiff%values_full)
         mesh%ssh_stiff%values = real(mesh%ssh_stiff%values_full, MP)
@@ -261,6 +258,21 @@ contains
 #endif
         deallocate(rev)
     end subroutine update_stiff_mat_ale
+
+    !===========================================================================
+    subroutine stiff_full_seed(mesh)
+        ! Single precision: allocate the real64 stiffness accumulator ssh_stiff%values_full and seed
+        ! it from the WP values, once. update_stiff_mat_ale does it at its first call; the lifecycle
+        ! driver does it before the restart registry when the zstar exact restart stores it
+        ! (ssh_stiff, mod_io_restart). Between init_stiff_mat_ale and the first update nothing
+        ! changes the values, so both seed the same bits. No-op in double precision.
+        type(t_mesh), intent(inout) :: mesh
+#if defined(USE_SINGLE_PRECISION)
+        if (allocated(mesh%ssh_stiff%values_full)) return
+        allocate(mesh%ssh_stiff%values_full(size(mesh%ssh_stiff%values)))
+        mesh%ssh_stiff%values_full = real(mesh%ssh_stiff%values, WP_full)
+#endif
+    end subroutine stiff_full_seed
 
     !===========================================================================
     subroutine add_edge_stiffness(mesh, nNodO, nEdgeO, depth_e, factor, rev, acc)

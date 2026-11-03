@@ -52,6 +52,13 @@ conservation, mesh-delta, regression and self-consistency gates take its place
 - **SSH solver:**
   - Jacobi preconditioner and fewer halo exchanges.
   - Tolerance and iteration limit can be set with `FESOM3_SSH_SOLTOL` and `FESOM3_SSH_MAXITER`.
+  - Opt-in block-Jacobi incomplete Cholesky preconditioner (`FESOM3_SSH_PRECOND=ic0`): IC(0) of
+    each rank's owned block, applied without communication. On NEMO025 (1280 ranks, 3-day runs from
+    1964) it needs 2.5–2.7 times fewer CG iterations and about half the solve time: AB2 at 2400 s
+    126 → 50 iterations (14.7 → 7.5 ms per step), RK3 at 3600 s 316 → 118 (35.5 → 16.5 ms). The
+    iterates depend on the partition, so runs at different rank counts differ at the solver
+    tolerance; at one rank count runs and restarts stay bitwise reproducible. FESOM2's MITgcm
+    preconditioner did not converge on NEMO025 at 2400 s.
 - **Hybrid meshes (triangles and quads):**
   - Python mesh tools (`tools/mesh/`): NEMO quad mesh, checks, splitting, cut-outs.
   - `fesom_ini`, a port of FESOM2's mesh_part with METIS 5.1.0 that handles mixed meshes.
@@ -112,6 +119,13 @@ conservation, mesh-delta, regression and self-consistency gates take its place
 - **Exact `zstar` restart (opt-in):** with `FESOM3_RESTART_ZSTAR_EXACT=1` a `zstar` checkpoint also
   holds the SSH stiffness values and `dhe`, and a resumed run matches the straight run bit for bit.
   Without it a `zstar` resume continues from the cold stiffness matrix and geometry (not bitwise).
+- **Redi diffusivity in the tapered zones scales with resolution.** Where the slope taper acts (mixed
+  layer, N² ≤ 0, isopycnal slopes above `ODM95_Scr`), the Redi tensor turns horizontal and its
+  diffusivity blends to `Redi_Kmin`. FESOM2 keeps that at 100 m²/s, a 1° value, while K_GM and the
+  interior Redi diffusivity scale with √(2·area)/100 km. With `scaling_resolution` (set in every
+  driver's GM/Redi setup) it now follows the same factor, clamped at `K_GM_min`: on NEMO025 about
+  30 m²/s in the Gulf Stream beside an interior 300 m²/s; unchanged on cells with √(2·area) ≥ 100 km.
+  Every run with `FESOM3_REDI` changes (CORE2 in its refined regions). Test: `test_redi_kmin`.
 
 Production runs on Levante with these changes conserve volume to roundoff: CORE2 on 512 ranks (about
 95 model years per day) and the NEMO ORCA025 quad mesh on 1280 ranks (about 29 model years per day).
@@ -269,7 +283,7 @@ examples. The most common variables:
 | `FESOM3_ICE_CUTOFF_CONSERVE` | sea-ice `cut_off`: `1` = conserving (the ice and snow it deletes melt into the ocean in the same step, with their fresh water and ice salt), `0` or unset = FESOM2's (deleted without a flux); any other value stops. See *Changes since v1* above |
 | `FESOM3_WHICH_ALE` | vertical coordinate: `linfs` (default) or `zstar`. `zlevel` is not ported, and the driver does not reject it: do not use it |
 | `FESOM3_LINFS_CONSERVE` | `S`, `T` or `TS` (unset = FESOM2): with `linfs` the layers are fixed while `w` at the surface is not zero, so the vertical advection moves tracer through the surface and the ocean's salt and heat content drift (CORE2 JRA55-do, Dmitry's setup: whole-ocean S -5.5e-5 in the cold-start year, ~-2e-6 a year later). This returns that flux, summed over the ocean, as a uniform surface flux of S and/or T every step (MITgcm's `linFSConserveTr`). `linfs` and the FCT limiter only. Read in `src/oce/oce_ale_tracer.F90` |
-| `FESOM3_FER_GM`, `FESOM3_REDI` | Gent–McWilliams bolus advection, Redi isopycnal diffusion |
+| `FESOM3_FER_GM`, `FESOM3_REDI` | Gent–McWilliams bolus advection, Redi isopycnal diffusion. `FESOM3_REDI` also switches GM on |
 | `FESOM3_MIX_KPP`, `FESOM3_MIX_TKE`, `FESOM3_SW_PENE` | vertical mixing and shortwave penetration |
 | `FESOM3_SHEAR_SPLINES`, `FESOM3_N2_SPLINES` | cubic-spline shear and N² at the interfaces (set both) |
 | `FESOM3_MOMADV_OPT` | momentum advection: `2` (default) = flux form, `1` = vector invariant |
@@ -281,6 +295,7 @@ examples. The most common variables:
 | `FESOM3_SHARED_SYNC` | shared border elements: `1` (default) = every step the other owners take the designated owner's `uv` (no volume leak, exact np>1 restarts); `0` = off, the old unsynced copies (A/B comparisons only). Read in `src/infra/mod_shared_elem.F90` |
 | `FESOM3_STEP_DIAG` | per-step global diagnostic line (max\|eta\|, max\|uv\|, ice, Tmax, Smax, and the shared-element numbers `divsum=`, `dUV=`, `dAB=`, `dsig=`); two extra collectives per step, off by default. Under zstar a second line per step, `salt step`: the ocean + sea-ice salt content, the step's residual (change minus the balanced SSS restoring; roundoff when salt is conserved) and the ice salt the conserving cut_off returned (one more collective) |
 | `FESOM3_SSH_SOLTOL`, `FESOM3_SSH_MAXITER` | SSH solver tolerance and iteration cap — test/diagnostic only, read in `src/oce/oce_ssh_solve.F90` (defaults `1e-5`, `2000`) |
+| `FESOM3_SSH_PRECOND` | SSH CG preconditioner: `jacobi` (default) or `ic0` (block-Jacobi incomplete Cholesky, `src/oce/oce_ssh_ic0.F90`); any other value stops |
 | `FESOM3_SSH_SE` | free surface: `0` (default) = semi-implicit CG solve, `1` = split-explicit barotropic subcycling (production driver and `fesom_conserve` only; AB2, no cavities). Read in `src/oce/oce_ssh_se.F90`, like the knobs below |
 | `FESOM3_SE_M`, `FESOM3_SE_M_FORCE` | substeps per baroclinic step (default `50`); the run stops if M is below the CFL-guard minimum printed at startup (CORE2 at 1800 s: 40 at the default χ 0.1, 38 at χ 0.05, 48 at χ 0.25) unless `FESOM3_SE_M_FORCE=1` |
 | `FESOM3_SE_CHI` | dissipation parameter χ in [0, 0.25] (default `0.1`). Mesh-dependent: use the smallest value stable on the mesh; the default is that value for CORE2 with the barotropic drag (`0.05` blew up a zstar year, `0.07` is marginal; see "Changes since v1") |

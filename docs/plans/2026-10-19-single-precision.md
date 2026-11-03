@@ -77,7 +77,8 @@ FESOM_F-only additions (no upstream counterpart, needed to run SP at all):
 | MPI: every reduction of a WP_full buffer uses `MPI_DOUBLE_PRECISION`; halos stay `MPI_WP`; `hnode_new` halo = hi + lo through the WP exchange (exact to 2^-48) | `mod_halo` | |
 
 SP-only state in WP: the tracer **carry** `tracers%work%carry` (nl-1, nod, ntracer), not in the checkpoint
-(a restarted SP run starts with zero carry, as upstream).
+(a restarted SP run starts with zero carry, as upstream). *Since branch `sp-restart-exact` (2026-10-28) it
+is: `carry_t`, `carry_s` (IMPLEMENTATION.md §10, LESSONS L79).*
 
 Everything else is WP = real32: prognostic T, S, u, v, η, d_eta, hbar, w, all ice fields and the EVP
 stresses, TKE state and Av/Kv, mesh geometry, the stiffness matrix values the CG reads, the CG vectors,
@@ -249,6 +250,9 @@ tests, the clock test, the meshes' read tests and `test_bottom`. Making the unit
    real64 path in `mod_io_decomp`.
 4. **Restart in SP** holds `hnode` rounded to WP (as upstream) and drops the carry and the stiffness
    shadow (as upstream); a resumed SP run is close to, not identical with, a straight run.
+   *Resolved 2026-10-28 (branch `sp-restart-exact`): real64 paths in `mod_io_decomp`/`mod_io_zarr`,
+   `values_full` and the carry in the checkpoint; the SP restart gates are `max|Δ| = 0` (LESSONS L79).
+   The real64 decomposition path is also what item 3 needs; the output writer does not use it yet.*
 5. **#995 has no counterpart** (Jacobi preconditioner). CG iteration counts in SP were not measured; the
    SSH solve time is 0.95 of DP at dist_512.
 6. **Salt anomaly** is wired into the production driver only (`FESOM3_SALT_ANOMALY`); other drivers keep

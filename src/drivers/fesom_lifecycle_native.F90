@@ -353,7 +353,7 @@ program fesom_lifecycle_native
         dyn%work%fer_K = 500.0_WP; dyn%work%fer_c = 1.0_WP; dyn%work%fer_scal = 0.0_WP
         dyn%work%fer_gamma = 0.0_WP
         if (use_redi) then
-            ! M4d Redi (work_core): Redi=T; Redi_Kmax<=0 -> synced to K_GM_max; Redi_Kmin=100;
+            ! M4d Redi (work_core): Redi=T; Redi_Kmax<=0 -> synced to K_GM_max; Redi_Kmin=100 (x fer_scal, init_Redi_GM);
             ! Redi_Ktaper sqrt-split; ODM95 slope taper (work_core ODM95_Scr=0.2e-2); K_hor=0.
             Redi = .true.; Redi_Ktaper = .true.; Redi_Kmax = 0.0_WP; Redi_Kmin = 100.0_WP
             scaling_ODM95 = .true.; ODM95_Scr = 0.2e-2_WP; ODM95_Sd = 1.0e-3_WP; scaling_LDD97 = .false.

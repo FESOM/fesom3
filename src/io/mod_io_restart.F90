@@ -58,6 +58,18 @@ module mod_io_restart
     ! is built from the cold matrix BEFORE restart_read (a straight run builds it at its first solve,
     ! where step 1 adds -dhe = 0), and after it every zstar resume (exact or not) derives
     ! zbar_3d_n/Z_3d_n/helem/hnode_new from the restored hnode with update_thickness_ale.
+    !
+    ! SINGLE PRECISION (WP = 4). The checkpoint holds every field a step carries over at the
+    ! precision the step keeps it in, so a resume is bitwise the straight run, as in double precision:
+    !   hnode      the WP_full (real64) thickness, written and read in real64 (not staged through WP);
+    !   ssh_stiff  (zstar exact restart) the real64 accumulator ssh_stiff%values_full; restart_read
+    !              refreshes the WP values the solver reads from it, as update_stiff_mat_ale does;
+    !   carry_t, carry_s  (carry_<tracer> for a further tracer) the tracer carry (upstream
+    !              use_tracer_carry, #1206), float32 as the carry, owned nodes. Upstream's restart omits
+    !              it and starts it from zero; a checkpoint without these stores resumes that way here.
+    ! The lifecycle driver allocates the carry and seeds values_full before restart_register_state
+    ! (both are otherwise allocated at the first step). fesom3_jax writes and reads the same stores.
+    ! In double precision WP_full == WP: the stores and their bits are those of before.
     use mpi
     use, intrinsic :: iso_fortran_env, only: real64, error_unit
     use mod_precision,   only: WP, MP, WP_full
@@ -115,8 +127,6 @@ module mod_io_restart
         integer           :: nlev   = 1                ! vertical size (3-D): nl or nl-1
         character(len=8)  :: hdim   = 'nod2'           ! 'nod2' (node) / 'elem' (element)
         character(len=8)  :: vdim   = ''               ! 'nz' (levels) / 'nz1' (layers)
-        logical           :: optional_store = .false.  ! read: a missing store is skipped (the live
-                                                       ! array keeps its value), not an abort
         real(WP), pointer :: p2d(:)   => null()        ! live array (2-D field, WP source)
         real(WP), pointer :: p3d(:,:) => null()        ! live array (3-D field, WP source)
         ! MP-source path (Task 3.4 precision gotcha): mesh%hbar / mesh%hnode are real(MP), which may
@@ -126,11 +136,15 @@ module mod_io_restart
         ! lossless. mp_src=.false. fields use p2d/p3d directly (no copy).
         logical           :: mp_src   = .false.
         real(MP), pointer :: pmp2d(:)   => null()      ! live array (2-D field, MP source)
-        ! 3-D staged source = the layer thickness mesh%hnode, which is WP_full (real64 in every
-        ! build, upstream #1207). In single precision it is staged through WP on write and
-        ! widened back on read: the checkpoint holds the thickness rounded to WP, as upstream's
-        ! restart does. In double precision WP_full == MP and nothing changes.
+        ! 3-D WP_full source (real64 in every build): the layer thickness mesh%hnode (upstream
+        ! #1207) and the ssh_stiff slot buffer. Written and read in WP_full end to end, so a
+        ! single-precision checkpoint holds every bit (upstream's restart rounds hnode to WP).
+        ! In double precision WP_full == WP and nothing changes.
         real(WP_full), pointer :: pmp3d(:,:) => null() ! live array (3-D field, WP_full source)
+        ! a store the checkpoint may lack (the single-precision tracer carry, absent from older
+        ! and upstream checkpoints; RK3's rk3_ubold, absent from AB2 and pre-Addendum-A RK3
+        ! checkpoints): restart_read then leaves the live array as it is
+        logical           :: may_be_absent = .false.
     end type t_restart_field
 
     type :: t_restart
@@ -159,8 +173,11 @@ module mod_io_restart
         logical               :: zstar_exact = .false.
         integer               :: stiff_w = 0                 ! W: longest row of the global matrix
         integer,  allocatable :: stiff_pos(:,:)              ! (W, nNodO) CSR position of each slot, 0 = empty
-        real(WP), pointer     :: stiff_stage(:,:) => null()  ! (W, nNodO) slot layout, the 'ssh_stiff' store
-        real(MP), pointer     :: stiff_vals(:) => null()     ! live mesh%ssh_stiff%values
+        real(WP_full), pointer :: stiff_stage(:,:) => null() ! (W, nNodO) slot layout, the 'ssh_stiff' store
+        ! the live values the store holds: mesh%ssh_stiff%values, in single precision the real64
+        ! accumulator values_full (stiff_vals_wp: the WP values the solver reads, refreshed on read)
+        real(WP_full), pointer :: stiff_vals(:) => null()
+        real(MP), pointer     :: stiff_vals_wp(:) => null()
         real(WP), allocatable :: stiff_slot(:)               ! slot coordinate 0..W-1
     end type t_restart
 
@@ -224,8 +241,7 @@ contains
     ! 2-D field, p3d for a 3-D field (on_full_levels selects nl vs nl-1). entity = DECOMP_NODE/ELEM.
     ! The pointer is stored, not copied, so the writer reads the live values and the reader (Task 4.1)
     ! can write back into the same array. Caller passes a Fortran pointer (e.g. peta => dyn%eta_n).
-    subroutine restart_register_field(R, name, units, entity, p2d, p3d, on_full_levels, precision, halo, &
-                                      optional_store)
+    subroutine restart_register_field(R, name, units, entity, p2d, p3d, on_full_levels, precision, halo)
         type(t_restart),  intent(inout)        :: R
         character(len=*), intent(in)           :: name, units
         integer,          intent(in)           :: entity
@@ -234,11 +250,9 @@ contains
         logical,          intent(in), optional :: on_full_levels
         character(len=*), intent(in), optional :: precision
         integer,          intent(in), optional :: halo     ! override the entity-default read-back variant
-        logical,          intent(in), optional :: optional_store  ! a missing store is skipped on read
         integer :: k
         k = restart_new_field(R, name, units, entity, precision)
         if (present(halo)) R%f(k)%halo = halo
-        if (present(optional_store)) R%f(k)%optional_store = optional_store
         call restart_set_levels(R, k, present(p3d), on_full_levels)
         if (present(p3d)) then
             R%f(k)%p3d => p3d
@@ -332,6 +346,8 @@ contains
     !     RK3 with the CG corrector only (dyn%use_rk3, not SE): elem 2-D rk3_ubold_u rk3_ubold_v,
     !       OPTIONAL on read (an AB2 or older RK3 checkpoint has none: the run starts its stage
     !       extrapolation cold, oce_rk3 rk3_bt_extrap)
+    !     single precision (tracer carry allocated): carry_t carry_s [carry_<tr>] (node 3-D nl-1, float32,
+    !       owned nodes; may be absent from the checkpoint)
     ! partit (optional) is needed only by the zstar exact restart at np>1 (global column ids).
     subroutine restart_register_state(R, dyn, tracers, ice, mesh, mix_scheme, partit)
         type(t_restart), intent(inout)      :: R
@@ -386,6 +402,23 @@ contains
                 p3 => tracers%data(j)%valuesold(2,:,:); call restart_register_field(R, trim(tn)//'_M2', '', DECOMP_NODE, p3d=p3)
             end if
         end do
+
+        ! ---- single precision: the tracer carry (module header) ----
+        ! Written and read on owned nodes only (oce_ale_tracer): the halo stays 0, as in a straight run.
+        ! The names are fesom3_jax's (carry_t, carry_s).
+        if (allocated(tracers%work%carry)) then
+            do j = 1, tracers%num_tracers
+                select case (tracers%data(j)%ID)
+                case (1);     tn = 'carry_t'
+                case (2);     tn = 'carry_s'
+                case default; tn = 'carry_'//trim(tracer_name(tracers%data(j)%ID, j))
+                end select
+                p3 => tracers%work%carry(:,:,j)
+                call restart_register_field(R, trim(tn), '', DECOMP_NODE, p3d=p3, precision='4', &
+                                            halo=RESTART_HALO_NONE)
+                R%f(R%nf)%may_be_absent = .true.
+            end do
+        end if
 
         ! ---- vertical velocities (NODE 3-D, FULL levels nl) ----
         p3 => dyn%w;   call restart_register_field(R, 'w',      'm/s', DECOMP_NODE, p3d=p3, on_full_levels=.true.)
@@ -452,16 +485,16 @@ contains
         end if
 
         ! ---- RK3 with the CG corrector: Ub^{n-1} of the extrapolated stage trims (oce_rk3 header,
-        !      plan Addendum A). Read and used on the owned elements only -> NONE. Optional: a
+        !      plan Addendum A). Read and used on the owned elements only -> NONE. may_be_absent: a
         !      checkpoint without it (AB2, or RK3 before Addendum A) leaves rk3_init's huge marker,
         !      and the first step starts the extrapolation cold. ----
         if (dyn%use_rk3 .and. .not. dyn%use_ssh_se) then
             p2 => dyn%rk3_ubold(1,:)
-            call restart_register_field(R, 'rk3_ubold_u', 'm/s', DECOMP_ELEM, p2d=p2, halo=RESTART_HALO_NONE, &
-                                        optional_store=.true.)
+            call restart_register_field(R, 'rk3_ubold_u', 'm/s', DECOMP_ELEM, p2d=p2, halo=RESTART_HALO_NONE)
+            R%f(R%nf)%may_be_absent = .true.
             p2 => dyn%rk3_ubold(2,:)
-            call restart_register_field(R, 'rk3_ubold_v', 'm/s', DECOMP_ELEM, p2d=p2, halo=RESTART_HALO_NONE, &
-                                        optional_store=.true.)
+            call restart_register_field(R, 'rk3_ubold_v', 'm/s', DECOMP_ELEM, p2d=p2, halo=RESTART_HALO_NONE)
+            R%f(R%nf)%may_be_absent = .true.
         end if
 
         ! ---- zstar exact restart: the accumulated SSH stiffness values + the lagged dhe ----
@@ -525,9 +558,16 @@ contains
         end do
         end associate
         allocate(R%stiff_stage(R%stiff_w, max(1, R%nNodO)))
-        R%stiff_stage = 0.0_WP
-        ! FESOM_F-SP (PR #4): store the real64 shadow ssh_stiff%values_full here instead of values.
+        R%stiff_stage = 0.0_WP_full
+#if defined(USE_SINGLE_PRECISION)
+        ! single precision: the real64 accumulator (seeded by the driver, stiff_full_seed)
+        call zarr_check(allocated(mesh%ssh_stiff%values_full), &
+                        'restart: ssh_stiff%values_full must be seeded (stiff_full_seed) before restart_register_state')
+        R%stiff_vals    => mesh%ssh_stiff%values_full
+        R%stiff_vals_wp => mesh%ssh_stiff%values
+#else
         R%stiff_vals => mesh%ssh_stiff%values
+#endif
         allocate(R%stiff_slot(R%stiff_w))
         do j = 1, R%stiff_w
             R%stiff_slot(j) = real(j - 1, WP)
@@ -537,7 +577,8 @@ contains
         R%f(k)%nlev = R%stiff_w
         R%f(k)%vdim = 'nstiff'
         R%f(k)%halo = RESTART_HALO_NONE
-        R%f(k)%p3d  => R%stiff_stage
+        R%f(k)%mp_src = .true.
+        R%f(k)%pmp3d  => R%stiff_stage
     end subroutine restart_register_stiff
 
     ! Live CSR values -> the slot layout (before a checkpoint write). Empty slots hold 0.
@@ -547,24 +588,28 @@ contains
         do n = 1, R%nNodO
             do k = 1, R%stiff_w
                 if (R%stiff_pos(k, n) > 0) then
-                    R%stiff_stage(k, n) = real(R%stiff_vals(R%stiff_pos(k, n)), WP)
+                    R%stiff_stage(k, n) = R%stiff_vals(R%stiff_pos(k, n))
                 else
-                    R%stiff_stage(k, n) = 0.0_WP
+                    R%stiff_stage(k, n) = 0.0_WP_full
                 end if
             end do
         end do
     end subroutine restart_stiff_pack
 
     ! The slot layout -> live CSR values (after restart_read). A non-zero value in an empty slot
-    ! means the store belongs to another mesh: stop.
+    ! means the store belongs to another mesh: stop. Single precision: the slots restore the real64
+    ! accumulator, and the WP values are rounded from it as update_stiff_mat_ale rounds them.
     subroutine restart_stiff_unpack(R)
         type(t_restart), intent(in) :: R
         integer :: n, k
         do n = 1, R%nNodO
             do k = 1, R%stiff_w
                 if (R%stiff_pos(k, n) > 0) then
-                    R%stiff_vals(R%stiff_pos(k, n)) = real(R%stiff_stage(k, n), MP)
-                else if (R%stiff_stage(k, n) /= 0.0_WP) then
+                    R%stiff_vals(R%stiff_pos(k, n)) = R%stiff_stage(k, n)
+#if defined(USE_SINGLE_PRECISION)
+                    R%stiff_vals_wp(R%stiff_pos(k, n)) = real(R%stiff_stage(k, n), MP)
+#endif
+                else if (R%stiff_stage(k, n) /= 0.0_WP_full) then
                     call restart_stop('restart_read: ssh_stiff has a value in an empty slot (another mesh?)')
                 end if
             end do
@@ -795,7 +840,8 @@ contains
         type(t_zarr_store) :: store
         type(t_zarr_array) :: a_data, a_vert, a_lon, a_lat
         type(t_zarr_attrs) :: gat, at
-        real(WP), allocatable :: buf(:), buf3(:,:), stg2(:), stg3(:,:)
+        real(WP), allocatable :: buf(:), buf3(:,:), stg2(:)
+        real(WP_full), allocatable :: buf3f(:,:)
         integer :: c, lo, ierr, cv, nvc, vc, L0, cvn
         ! resolve the entity context (node vs element-centroid)
         if (f%entity == DECOMP_ELEM) then
@@ -860,12 +906,11 @@ contains
                 call zarr_write_chunk(store, a_data, [c], buf(lo:lo + D%C - 1))
             end do
         else
-            allocate(buf3(f%nlev, max(1, D%w_nbuf)))
-            if (f%mp_src) then                                              ! MP->WP staged (lossless)
-                allocate(stg3(f%nlev, max(1, nO)))
-                stg3(1:f%nlev, 1:nO) = real(f%pmp3d(1:f%nlev, 1:nO), WP)
-                call decomp_redistribute(D, stg3(1:f%nlev, 1:nO), buf3, 0.0_WP)  ! collective
+            if (f%mp_src) then                                              ! WP_full source, in WP_full
+                allocate(buf3f(f%nlev, max(1, D%w_nbuf)))
+                call decomp_redistribute(D, f%pmp3d(1:f%nlev,1:nO), buf3f, 0.0_WP_full)  ! collective
             else
+                allocate(buf3(f%nlev, max(1, D%w_nbuf)))
                 call decomp_redistribute(D, f%p3d(1:f%nlev,1:nO), buf3, 0.0_WP)  ! collective
             end if
             nvc = (f%nlev + cv - 1)/cv
@@ -873,7 +918,11 @@ contains
                 lo = (c - D%w_first_chunk)*D%C + 1
                 do vc = 0, nvc - 1
                     L0 = vc*cv; cvn = min(cv, f%nlev - L0)
-                    call zarr_write_chunk(store, a_data, [vc, c], buf3(L0+1:L0+cvn, lo:lo + D%C - 1))
+                    if (f%mp_src) then
+                        call zarr_write_chunk(store, a_data, [vc, c], buf3f(L0+1:L0+cvn, lo:lo + D%C - 1))
+                    else
+                        call zarr_write_chunk(store, a_data, [vc, c], buf3(L0+1:L0+cvn, lo:lo + D%C - 1))
+                    end if
                 end do
             end do
         end if
@@ -957,6 +1006,14 @@ contains
         end if
         ! restore + halo-reconstruct every field
         do k = 1, R%nf
+            if (R%f(k)%may_be_absent) then
+                inquire(file=folder//'/'//trim(R%f(k)%name)//'.zarr/.zgroup', exist=ex)
+                if (.not. ex) then
+                    if (R%mype == 0) write(*,'(a)') '[restart] '//trim(R%f(k)%name)//' is not in the '// &
+                        'checkpoint (an older or upstream one): it keeps its cold value; the resume is not exact'
+                    cycle
+                end if
+            end if
             call restart_read_field(R, R%f(k), folder//'/'//trim(R%f(k)%name)//'.zarr', partit)
         end do
         ! the slot layout -> live CSR values. The caller must have built the SSH preconditioner from
@@ -981,19 +1038,15 @@ contains
         type(t_zarr_store) :: store
         type(t_zarr_array) :: a_data
         real(WP), allocatable :: buf(:), buf3(:,:), bo(:), bo3(:,:), rdc(:,:)
+        real(WP_full), allocatable :: buf3f(:,:), rdcf(:,:)
         integer :: c, lo, cv, nvc, vc, L0, cvn
         logical :: ex
         ! entity context (node vs element decomp + owned count)
         if (f%entity == DECOMP_ELEM) then; D => R%De; nO = R%nElemO
         else;                              D => R%Dn; nO = R%nNodO; end if
-        ! abort on a missing/corrupt store (mirrors clock_init's missing-.clock abort); an optional
-        ! store (rk3_ubold) that is missing is skipped, the live array keeps its value
+        ! abort on a missing/corrupt store (mirrors clock_init's missing-.clock abort); a store that
+        ! may be absent is checked for by restart_read before this call
         inquire(file=trim(store_path)//'/.zgroup', exist=ex)
-        if (.not. ex .and. f%optional_store) then
-            if (R%mype == 0) write(*,'(a)') '[restart] optional store not in the checkpoint, skipped: '// &
-                                            trim(f%name)
-            return
-        end if
         call zarr_check(ex, 'restart_read: missing/corrupt store '//trim(store_path))
         store%path = trim(store_path)
         if (f%ndim == 2) then
@@ -1017,20 +1070,29 @@ contains
             cv = vchunk_eff(R%chunk_vert, max(1, f%nlev))
             call zarr_array_init(a_data, trim(f%name), [f%nlev, D%N], [cv, D%C], trim(f%dtype), &
                                  has_fill=.false., codec=trim(R%compressor))
-            allocate(buf3(f%nlev, max(1, D%w_nbuf)), bo3(f%nlev, max(1, nO)), rdc(cv, D%C))
             nvc = (f%nlev + cv - 1)/cv
-            do c = D%w_first_chunk, D%w_last_chunk
-                lo = (c - D%w_first_chunk)*D%C + 1
-                do vc = 0, nvc - 1
-                    L0 = vc*cv; cvn = min(cv, f%nlev - L0)
-                    call zarr_read_chunk(store, a_data, [vc, c], rdc) ! reads the FULL (cv,C) chunk
-                    buf3(L0+1:L0+cvn, lo:lo + D%C - 1) = rdc(1:cvn, 1:D%C)  ! keep the valid rows
+            if (f%mp_src) then                                    ! WP_full source, in WP_full
+                allocate(buf3f(f%nlev, max(1, D%w_nbuf)), rdcf(cv, D%C))
+                do c = D%w_first_chunk, D%w_last_chunk
+                    lo = (c - D%w_first_chunk)*D%C + 1
+                    do vc = 0, nvc - 1
+                        L0 = vc*cv; cvn = min(cv, f%nlev - L0)
+                        call zarr_read_chunk(store, a_data, [vc, c], rdcf)
+                        buf3f(L0+1:L0+cvn, lo:lo + D%C - 1) = rdcf(1:cvn, 1:D%C)
+                    end do
                 end do
-            end do
-            call decomp_gather(D, buf3, bo3)
-            if (f%mp_src) then
-                f%pmp3d(1:f%nlev, 1:nO) = real(bo3(1:f%nlev, 1:nO), WP_full)
+                call decomp_gather(D, buf3f, f%pmp3d(1:f%nlev, 1:nO))
             else
+                allocate(buf3(f%nlev, max(1, D%w_nbuf)), bo3(f%nlev, max(1, nO)), rdc(cv, D%C))
+                do c = D%w_first_chunk, D%w_last_chunk
+                    lo = (c - D%w_first_chunk)*D%C + 1
+                    do vc = 0, nvc - 1
+                        L0 = vc*cv; cvn = min(cv, f%nlev - L0)
+                        call zarr_read_chunk(store, a_data, [vc, c], rdc) ! reads the FULL (cv,C) chunk
+                        buf3(L0+1:L0+cvn, lo:lo + D%C - 1) = rdc(1:cvn, 1:D%C)  ! keep the valid rows
+                    end do
+                end do
+                call decomp_gather(D, buf3, bo3)
                 f%p3d(1:f%nlev, 1:nO) = bo3(1:f%nlev, 1:nO)
             end if
         end if

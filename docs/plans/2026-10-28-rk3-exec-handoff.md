@@ -211,7 +211,7 @@ undone, and Dmitry then changed D7 (§1, §3).
 ## 6. When the plan is done
 
 - Final G0 against the Task 1 references.
-- The docs of Task 23: README run switches, TESTING, IMPLEMENTATION, HANDOFF, LESSONS from L79.
+- The docs of Task 23: README run switches, TESTING, IMPLEMENTATION, HANDOFF, LESSONS from L80 (main has L79).
 - Move the plan to `docs/plans/completed/`.
 - Report to Dmitry:
   - the measured invariant levels;

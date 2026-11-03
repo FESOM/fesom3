@@ -148,12 +148,14 @@ plan"):
 | `test_geom_mixed` | analytic patches, pi_w | centroids, kite weights `elem_w` (vs independent shoelace kites), Green–Gauss `gradient_sca`, node areas, `mesh_resolution` |
 | `test_halo_ext` (+ `_noformat`) | cut-outs, pi_w, core2_w at np 2/4/8 | `exchange_edge` / `exchange_nod_full` round trips; FESOM2-layout `dist_N` error |
 | `test_ssh_stiff` | patches, mixed cut-out, pi_w, core2_w | SSH matrix pattern and values (quadratic field on the parallelogram patch), symmetry, triangle bit-identity, quad checkerboard null mode |
+| `test_ssh_ic0` (+ `fesom_conserve_*_ic0_*`, `fesom_conserve_badprecond_np1`) | quad and mixed cut-outs, pi_w, core2_w at np 8; pi, the mixed cut-out with sea ice | the IC(0) preconditioner (`FESOM3_SSH_PRECOND=ic0`): no diagonal shift, L Lᵀ = B on the pattern of the owned block, owned columns only, the triangular solves, fewer than half the Jacobi iterations, the production solve; conservation with it; an unknown value stops |
 | `test_pgf_mixed`, `test_updown_mixed`, `test_coupling_mixed` | patches, cut-outs, pi_w, core2_w | pressure gradient, density gradient / smoother / GM bolus / IC extrapolation, MUSCL up/downwind elements, surface-stress gather |
 | `test_ice_dyn_mixed`, `test_ice_mass` (+ `_missing_col`) | patches, quad cut-out, pi_w, core2_w | EVP strain/stress adjoint, ice FCT mass matrix, lumped mass, conservation and bounds |
 | `fesom_ini_{aux3d,nodepth,onelem,count1,nonconvex}` | copies of the quad cut-out | `fesom_ini` level finder on quads, its error stops (`tools/check_fesom_ini.sh`) |
 | mixed/quad cases of `test_vinv`, `test_ivertvisc`, `test_muscl_onthefly` | patches, cut-outs | the converted ocean kernels |
 | `meshdiag_{mixed,quad,pi_w}` | cut-outs, pi_w | 4-column mesh-diagnostics store (`tools/check_meshdiag.py`) |
 | `fesom_conserve_mixcut_*`, `fesom_conserve_{q,mix}cut_ice_*` | cut-outs, np 1/2 | conservation (PP/KPP/TKE/GM/Redi; with sea ice, EVP and mEVP) |
+| `test_redi_kmin` | mixed cut-out, np 1/2 | `init_Redi_GM` with the production GM/Redi parameters: `fer_scal`, the interior Ki, the tapered-zone Ki = max(fer_scal·Redi_Kmin, K_GM_min), the √taper blend, and the fixed `Redi_Kmin` with `scaling_resolution` off |
 
 The mesh-dependent hybrid cases read meshes from the hard-coded root `/work/ab0995/a270029/meshes`
 (`test/CMakeLists.txt`). Whether a mesh exists is decided at configure time
@@ -376,9 +378,9 @@ invariants, determinism and restart exactness:
   trims; R4 the RK3 amplification of an inertial oscillation (2.9e-16; Euler misses by 3.4e-2); R5 the HO
   stages (constancy, conservation, the open-surface flux); R6 the N = 1 substep driver = `do_oce_adv_tra`
   bitwise; R7/R8/R9 the low-order substeps (constancy, conservation, boundedness at Courant 1.5 with an
-  overshooting N = 1 control, the Zalesak bounds and the unlimited identity on the clean cells, LESSONS L80);
+  overshooting N = 1 control, the Zalesak bounds and the unlimited identity on the clean cells, LESSONS L81);
   R10t at rest the stage-3 solve = `solve_tracers_ale` bitwise; R11 three-stage constancy with the split
-  (1.4e-14, full w in stages 1–2, L79); R12 the extrapolated CG stage trims (cold ΔŪ = 0, ΔŪ = Ūⁿ⁺¹ − Ūⁿ
+  (1.4e-14, full w in stages 1–2, L80); R12 the extrapolated CG stage trims (cold ΔŪ = 0, ΔŪ = Ūⁿ⁺¹ − Ūⁿ
   exactly, c₁ = 1/3 and c₂ = 1/2 + ε under CG and 0 under SE, the stage transport = Σh·uⁿ + c_s·ΔŪ·H to
   6e-17); R10 the restart key, the optional `rk3_ubold_u/_v` stores (RK3 + CG only) and the cold AB start; Z1–Z3,
   R7z zstar (layer sums, w(top) = 0 in every stage, constancy for N = 1..3); G the `rk3_init` guards
@@ -394,7 +396,7 @@ invariants, determinism and restart exactness:
   gates, the `RK3_CHECK` maxima below `RK3_TOL_TRIM=3e-10` m²/s and `RK3_TOL_ETACOMP=4e-12` m (the 1000-step
   levels 2.73e-12 / 3.34e-14 × 100), and the SE checks at the SE thresholds.
 - **Determinism and decomposition** — two identical 1000-step pi runs print identical logs; np 1 and np 8
-  from the deterministic IC (`FESOM3_IC_EXTRAP_DET`, L81) agree to 2e-14 in heat and salt over 20 steps.
+  from the deterministic IC (`FESOM3_IC_EXTRAP_DET`, L82) agree to 2e-14 in heat and salt over 20 steps.
 - **Restart** — `run_restart_gate_core2.sh` with `FESOM3_RK3=1` (CG and SE, np 1 and 2, mid-run and
   month-boundary splits; with CG the checkpoint carries `rk3_ubold_u/_v`, Addendum A) and
   `run_restart_gate_zstar.sh` (zstar exact): split = straight at `max|Δ| = 0`;
@@ -513,6 +515,12 @@ steps, checkpoints, starts a *fresh process*, reads the checkpoint, and runs the
     `max|Δ| = 0`; pi np 1 and CORE2 np 1).
   Cross-rank *evolution* is not bitwise for any setting (the CG reductions depend on the rank count),
   so the cross-rank case is the restore round trip, as for `linfs`.
+- **Single precision:** the same gates run on a `--precision sp` build (`BUILD=.../build_intel_sp`)
+  with `max|Δ| = 0`: `run_restart_gate_core2.sh` linfs with CG and with `FESOM3_SSH_SE=1` (np 1, 2,
+  mid-run and month-boundary splits), `run_restart_gate_zstar.sh` with the switch on pi (np 1, 2, 8)
+  and CORE2 (np 2, 8) and the restore round trips np 2 → 1/8, and `run_restart_gate_multirank.sh`
+  (np 2 → 8). The checkpoint adds `carry_t` and `carry_s` and keeps `hnode` and `ssh_stiff` in real64
+  (IMPLEMENTATION.md §10); before that (as upstream) a single-precision resume was not bitwise.
 
 ### 9. Results
 
@@ -548,7 +556,7 @@ byte-faithful but well-behaved.
 |---|---|
 | Intel + double | **anchor** — byte-exact vs FESOM2; all gate results |
 | GNU + double | portability — 170 of the 176 `ctest` cases pass; the 6 failures (`test_wimpl_tra_np1/np2`, `meshdiag_mixed/quad/pi_w`, `test_shared_elem_np1`) are deterministic and older than the split-explicit work. Pure-data fields bit-identical to Intel at the M-milestones (only rotation-derived coordinates differ at ~1e-13, expected libm differences) |
-| single precision | builds (scaffolding, §IMPLEMENTATION 6); not a byte-gate target |
+| single precision | `--precision sp` (§IMPLEMENTATION 6): conservation gates at `TOL=1e-6`; the restart gates `max|Δ| = 0` (§8); not bit-compared with double precision |
 
 ### 10. Scalability and performance
 

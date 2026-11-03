@@ -7,11 +7,17 @@ module oce_ssh_solve
     !   ssh_solve_preconditioner — diagonal (Jacobi) M^-1 (FESOM2 solver.F90:31-95 uses MITgcm's)
     !   ssh_solve_cg             (solver.F90:98-281)      — the CG iteration
     !
-    ! PRECONDITIONER: diagonal (Jacobi), M^-1 = diag(1/a_rr), stored in pr_values(nNodO).
+    ! PRECONDITIONER (FESOM3_SSH_PRECOND, value-based, read once):
+    !   jacobi (default)  diagonal M^-1 = diag(1/a_rr), stored in pr_values(nNodO).
+    !   ic0               block-Jacobi incomplete Cholesky: IC(0) of each rank's owned block
+    !                     (oce_ssh_ic0). Also local, 2.5-2.7x fewer iterations on NEMO025 (1280
+    !                     ranks, 2400-3600 s), about half the solve time; the iterates depend on
+    !                     the partition (bitwise reproducible at a given rank count).
     ! FESOM2 uses the MITgcm one (JGR 102,5753-5766,1997: one symmetrised Jacobi sweep,
     ! off-diagonals K_ri = -0.5*(a_ri/a_rr)/(a_rr + a_ii) on the ssh_stiff pattern); the
     ! diagonal one was faster in FESOM3 runs: M^-1 r is local, so the per-iteration halo
     ! exchange of r is gone (one exchange_nod(pp) + two allreduces per iteration remain).
+    ! (Restored for a test on 2026-11-03, the MITgcm one did not converge on NEMO025 at 2400 s.)
     ! Not bit-identical to FESOM2 any more (different iterates and iteration count).
     !
     ! CG (standard preconditioned CG; the FESOM2 comment notes it follows Wikipedia,
@@ -61,13 +67,18 @@ module oce_ssh_solve
     use mod_dyn,       only: t_dyn
     use mod_partit,    only: t_partit
     use mod_part_bounds, only: owned_bounds, is_multirank
-    use mod_halo,      only: exchange_nod, allreduce_sum
+    use mod_halo,      only: exchange_nod, allreduce_sum, allreduce_max
+    use oce_ssh_ic0,   only: t_ic0, ic0_factor, ic0_apply
     implicit none
     private
     public :: solve_ssh_ale
     ! The zstar exact resume (FESOM3_RESTART_ZSTAR_EXACT, fesom_lifecycle_native_mr) builds the
     ! preconditioner itself, from the cold matrix, before restart_read restores the stiffness values.
     public :: ssh_solve_preconditioner
+
+    integer, parameter :: PRECOND_JACOBI = 0, PRECOND_IC0 = 1
+    integer, save      :: precond = PRECOND_JACOBI    ! FESOM3_SSH_PRECOND, set by ssh_solve_preconditioner
+    type(t_ic0), save  :: ic                          ! the IC(0) factor of the owned block
 
 contains
 
@@ -135,14 +146,43 @@ contains
         ! M^-1 r is then purely local (no halo columns), so neither the diagonal nor r
         ! needs a halo exchange. Built ONCE and then frozen: under zstar the matrix moves
         ! (update_stiff_mat_ale) but pr_values keeps the diagonal of the first solve, which
-        ! is the cold matrix (step 1 adds -dhe = 0).
+        ! is the cold matrix (step 1 adds -dhe = 0). With FESOM3_SSH_PRECOND=ic0 the IC(0)
+        ! factor of the owned block is built here as well, from the same matrix and as frozen;
+        ! pr_values is then only the marker that the preconditioner exists.
         type(t_dyn),  intent(inout), target :: dynamics
         type(t_mesh), intent(inout), target :: mesh
         type(t_partit), intent(in), optional :: partit
-        integer :: row, n
+        integer :: row, n, env_len, ios
         integer :: nNodO, nNodL, nEdgeO, nElemO
+        character(len=16) :: env
+        logical :: ok, root
+        real(kind=WP_full) :: shift
 
         call owned_bounds(mesh, nNodO, nNodL, nEdgeO, nElemO, partit)
+        root = .true.
+        if (present(partit)) root = (partit%mype == 0)
+        call get_environment_variable('FESOM3_SSH_PRECOND', env, length=env_len, status=ios)
+        if (ios == 0 .and. env_len > 0) then
+            select case (trim(env))
+            case ('jacobi'); precond = PRECOND_JACOBI
+            case ('ic0');    precond = PRECOND_IC0
+            case default
+                write(*,'(a)') 'ssh_solve_preconditioner: FESOM3_SSH_PRECOND must be jacobi or ic0, not "'// &
+                               trim(env)//'"'
+                error stop 1
+            end select
+        end if
+        if (precond == PRECOND_IC0) then
+            call ic0_factor(ic, nNodO, mesh%ssh_stiff%rowptr_loc, mesh%ssh_stiff%colind_loc, &
+                            mesh%ssh_stiff%values, ok)
+            if (.not. ok) then
+                write(*,'(a)') 'ssh_solve_preconditioner: IC(0) has a non-positive pivot even with a diagonal shift of 1'
+                error stop 1
+            end if
+            shift = ic%shift
+            if (is_multirank(partit)) call allreduce_max(shift, partit)
+            if (root) write(*,'(a,es9.2)') ' ssh_solve_preconditioner: IC(0) of the owned blocks, largest diagonal shift ', shift
+        end if
 
         associate(ssh_stiff => mesh%ssh_stiff)
         allocate(ssh_stiff%pr_values(nNodO))
@@ -205,13 +245,25 @@ contains
         ! r0 = b - A x0  (owned rows; x's halo columns are the prescribed x0 halo);
         ! z0 = M^-1 r0 (diagonal: local) ; search direction pp = z0 ; rho = r0.z0
         s_old = 0.0_WP_full
-        do row = 1, nNodO
-            rr(row) = real(real(rhs(row), WP_full) - sum(real(values(rptr(row):rptr(row+1)-1), WP_full) &
-                           *real(x(cind(rptr(row):rptr(row+1)-1)), WP_full)), WP)
-            zz(row) = pr_values(row)*rr(row)
-            pp(row) = zz(row)
-            s_old   = s_old + real(rr(row), WP_full)*real(zz(row), WP_full)
-        end do
+        if (precond == PRECOND_JACOBI) then
+            do row = 1, nNodO
+                rr(row) = real(real(rhs(row), WP_full) - sum(real(values(rptr(row):rptr(row+1)-1), WP_full) &
+                               *real(x(cind(rptr(row):rptr(row+1)-1)), WP_full)), WP)
+                zz(row) = pr_values(row)*rr(row)
+                pp(row) = zz(row)
+                s_old   = s_old + real(rr(row), WP_full)*real(zz(row), WP_full)
+            end do
+        else
+            do row = 1, nNodO
+                rr(row) = real(real(rhs(row), WP_full) - sum(real(values(rptr(row):rptr(row+1)-1), WP_full) &
+                               *real(x(cind(rptr(row):rptr(row+1)-1)), WP_full)), WP)
+            end do
+            call ic0_apply(ic, rr, zz)                     ! z0 = (L L^T)^-1 r0, owned block
+            do row = 1, nNodO
+                pp(row) = zz(row)
+                s_old   = s_old + real(rr(row), WP_full)*real(zz(row), WP_full)
+            end do
+        end if
         if (is_multirank(partit)) call allreduce_sum(s_old, partit)
 
         !__________________________________________________________________
@@ -228,15 +280,27 @@ contains
             if (is_multirank(partit)) call allreduce_sum(s_aux, partit)
             al = s_old/s_aux
 
-            ! x += al p ; r -= al Ap ; z = M^-1 r (diagonal: local, no halo exchange)
+            ! x += al p ; r -= al Ap ; z = M^-1 r (Jacobi or IC(0): local, no halo exchange)
             sprod(1:2) = 0.0_WP_full
-            do row = 1, nNodO
-                x(row)   = real(x(row)  + al*pp(row), WP)
-                rr(row)  = real(rr(row) - al*App(row), WP)
-                zz(row)  = pr_values(row)*rr(row)
-                sprod(1) = sprod(1) + real(rr(row), WP_full)*real(zz(row), WP_full)
-                sprod(2) = sprod(2) + real(rr(row), WP_full)*real(rr(row), WP_full)
-            end do
+            if (precond == PRECOND_JACOBI) then
+                do row = 1, nNodO
+                    x(row)   = real(x(row)  + al*pp(row), WP)
+                    rr(row)  = real(rr(row) - al*App(row), WP)
+                    zz(row)  = pr_values(row)*rr(row)
+                    sprod(1) = sprod(1) + real(rr(row), WP_full)*real(zz(row), WP_full)
+                    sprod(2) = sprod(2) + real(rr(row), WP_full)*real(rr(row), WP_full)
+                end do
+            else
+                do row = 1, nNodO
+                    x(row)   = real(x(row)  + al*pp(row), WP)
+                    rr(row)  = real(rr(row) - al*App(row), WP)
+                end do
+                call ic0_apply(ic, rr, zz)
+                do row = 1, nNodO
+                    sprod(1) = sprod(1) + real(rr(row), WP_full)*real(zz(row), WP_full)
+                    sprod(2) = sprod(2) + real(rr(row), WP_full)*real(rr(row), WP_full)
+                end do
+            end if
             if (is_multirank(partit)) call allreduce_sum(sprod, partit)
 
             if (sqrt(sprod(2)/mesh%nod2D) < rtol) then   ! nod2D GLOBAL

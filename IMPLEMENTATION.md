@@ -231,7 +231,8 @@ scalars, the SSH stiffness accumulator, the TKE column solve, the tracer tendenc
 layer thickness `hnode`/`hnode_new` — plus the single-precision-only algorithms (point-slope forcing
 interpolation, FCT low-order tendency in flux form, tracer carry). In double precision every `WP_full`
 cast is the identity and the single-precision algorithms are preprocessor-guarded, so the DP build stays
-bit-identical. The full policy, the PR mapping and the validation are in
+bit-identical. A single-precision checkpoint holds that state exactly (`hnode` and the stiffness
+accumulator in real64, the tracer carry), so a single-precision resume is bitwise the straight run (§10). The full policy, the PR mapping and the validation are in
 `docs/plans/2026-10-19-single-precision.md`.
 
 ### 7. Mesh-arity generalization
@@ -359,10 +360,22 @@ With the switch the checkpoint adds two stores and the resume rebuilds the rest:
   `restart_register_stiff` maps slot to CSR position once. fesom3_jax reads and writes the same
   layout.
 - `dhe`: element 2-D, float64, through the element decomposition.
-- On resume the driver builds the Jacobi preconditioner from the cold matrix *before*
+- On resume the driver builds the preconditioner (Jacobi, or IC(0) with `FESOM3_SSH_PRECOND=ic0`)
+  from the cold matrix *before*
   `restart_read` restores the values (a straight run builds it at its first solve and keeps it,
   and there `-dhe` is still 0). After the read every zstar resume, exact or not, derives the
   geometry from the restored `hnode` (`hnode_new = hnode`, then `update_thickness_ale`; LESSONS L73).
+
+**Single-precision checkpoints.** Besides the WP prognostic fields, a single-precision step carries
+`hnode` (real64), under the exact zstar restart the real64 stiffness accumulator
+`ssh_stiff%values_full`, and the tracer carry (the float32 rounding residual of each tracer write,
+upstream #1206). The checkpoint holds all three: `hnode` and `ssh_stiff` go through real64
+redistribution and read paths (`mod_io_decomp`, `mod_io_zarr`, compiled in single precision only), and
+the carry is written as `carry_t` and `carry_s` (float32, owned nodes; the names fesom3_jax uses). The
+lifecycle driver allocates the carry and seeds `values_full` before the restart registry, as the first
+step would. A checkpoint without the carry stores (an older or upstream one) resumes with a zero carry
+and a log line saying the resume is not exact. Upstream FESOM2's restart rounds `hnode` and omits the
+other two. In double precision the stores and their bits are unchanged (LESSONS L79).
 
 ### 11. Correctness decisions that make byte-identity possible
 
@@ -730,7 +743,7 @@ rk3.tex; uⁿ⁺¹ is later trimmed to the BT solver's U^M, which integrates the
 c₁ = 1/3, c₂ = 1/2 + ε (ε = `ab_epsilon` = 0.1): the stage-3 Coriolis then acts on (3/2 + ε)Ūⁿ − (1/2 + ε)Ūⁿ⁻¹,
 AB2's weights. The CG corrector has no Coriolis of its own, so with the trim to Ūⁿ the barotropic Coriolis
 would be forward Euler (energy growth (fτ)² per step for barotropic motions larger than the Rossby radius;
-plan Addendum A, LESSONS L83). `rk3_bt_extrap` computes ΔŪ at the start of a CG step; Ūⁿ⁻¹ (`rk3_ubold`) is in
+plan Addendum A, LESSONS L84). `rk3_bt_extrap` computes ΔŪ at the start of a CG step; Ūⁿ⁻¹ (`rk3_ubold`) is in
 the checkpoint as the optional stores `rk3_ubold_u/_v` (a cold start, an AB2 checkpoint or an RK3 checkpoint
 written before it start with ΔŪ = 0). In stage 3 the momentum right-hand side is taken from the untrimmed u\*\*, then
 u\*\* is trimmed to the transport that changed η (CG: Σh·uⁿ⁺¹; SE: ⟨⟨Ū⟩⟩) and carries the tracers. Under SE
@@ -740,7 +753,7 @@ uⁿ⁺¹ is also trimmed to U^M, the barotropic velocity at n+1.
 stage-3 w; the non-FCT tracers w_e explicitly and w_i in the diffusion TDMA; the FCT tracers the split in the
 low order only (the high order and the antidiffusive flux use the full w), which is `do_oce_adv_tra` on T\*\*.
 Stages 1–2 always advect with the full w (w_e + w_i) of the stage, never with w_e alone: a uniform tracer then
-stays uniform through all three stages (LESSONS L79). The cost is a stability limit for the unlimited quantities: the explicit w_e acts on stage
+stays uniform through all three stages (LESSONS L80). The cost is a stability limit for the unlimited quantities: the explicit w_e acts on stage
 values made with the full w, and a vertical upwind mode is stable up to a per-cell Courant number of about 9
 at maxcfl 1 (|1 + z_e·S(z)|/|1 − z_i| ≤ 1, S the stage polynomial); FCT tracers stay bounded by the limiter.
 
@@ -762,7 +775,7 @@ runs unchanged; `se_rk3_finish` replaces `se_trim_finish` in stage 3.
 tracers go Tⁿhⁿ → T_s·h_s with the flux thickness h_{s−1}, `rk3_stage_geometry` rebuilds helem, zbar_3d_n,
 Z_3d_n (hnode stays hⁿ), and u_s is trimmed with h_s weights. Stage 3 runs on h₂ and restores hbar = ηⁿ before
 the barotropic block, so `compute_hbar_ale` / `se_rk3_finish` see what AB2's do; its last `vert_vel_ale` (with
-W) gives hⁿ⁺¹, which `update_thickness_ale` commits. w(top) is 0 in stage 3 too (L82).
+W) gives hⁿ⁺¹, which `update_thickness_ale` commits. w(top) is 0 in stage 3 too (L83).
 
 **Restart.** RK3 reads only the state (uv, η, hbar, hnode, T/S, d_eta, TKE, the SE rings); the AB stores
 are still written, never read. `checkpoint.json` gets `"time_scheme": "rk3"` from an RK3 run only. An AB2

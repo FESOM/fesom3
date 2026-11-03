@@ -18,17 +18,29 @@ Full pre-M2.12 milestone detail + the per-gate recipes live in [`HANDOFF-archive
   2400 s: the stage trims to Ūⁿ made the barotropic Coriolis forward Euler (the CG corrector has none). The CG
   path now trims to the AB-extrapolated Ū (c₁ = 1/3, c₂ = 1/2 + ε); Ūⁿ⁻¹ is the optional checkpoint store
   `rk3_ubold_u/_v`. NEMO025: 2400 s from AB2's 1959 checkpoint stable for 120 days, the Weddell anomaly gone
-  at 1200 s (plan Addendum A, LESSONS L83). Frozen binary for Dmitry's runs:
+  at 1200 s (plan Addendum A, LESSONS L84). Frozen binary for Dmitry's runs:
   `/work/ab0995/a270029/fesom3.0/bin_rk3_af5fba5`. Open: RK3 at 3600 s vs AB2, the 1-year twins, the CORE2
   screens, the questions for Sergey (plan Post-Completion), the PR.
+  **Merged with main (2026-11-03):** exact single-precision restart (#10), Redi_Kmin scaling (#12), the IC(0)
+  SSH preconditioner (#13). `rk3_ubold_u/_v` now use main's `may_be_absent` (RK3's own `optional_store` flag is
+  gone); RK3's lessons are L80–L84 after main's L79. NEMO025 with the low-viscosity gammas: RK3 at 3600 s runs
+  a year where AB2 blew up within 18 steps; per model year it costs about 1.3x AB2 at 2400 s.
+- **Exact single-precision restart (2026-10-28, branch `sp-restart-exact` from `single-precision-main`,
+  worktree `/work/ab0995/a270088/fesom3_sp_restart`):** the SP checkpoint keeps `hnode` and (zstar exact)
+  `ssh_stiff%values_full` in real64 (real64 `decomp_redistribute`/`decomp_gather`/`zarr_read_chunk`,
+  SP only) and adds the tracer carry as `carry_t`/`carry_s` (fesom3_jax's stores); the driver allocates
+  the carry and seeds `values_full` before the registry. SP restart gates `max|Δ| = 0` (core2 linfs CG +
+  SE np 1/2, zstar pi np 1/2/8 + CORE2 np 2/8, multirank 2 → 8); DP bit-identical to the base (ctest
+  191/191, checkpoint pairs, restart gates). TESTING.md §8, LESSONS L79. A checkpoint without the carry
+  stores resumes with a zero carry (log line).
 - **Exact zstar restart ✅ (2026-10-24, branch `zstar-exact-restart`, opt-in `FESOM3_RESTART_ZSTAR_EXACT=1`):**
   under zstar the checkpoint adds `ssh_stiff` (stiffness values in a partition-independent node-row
   layout, the format fesom3_jax shares) and `dhe`; the resume builds the SSH preconditioner from the
   cold matrix before `restart_read`; the geometry rebuild from `hnode` after it is main's (L73), for
   every zstar resume. Gate `tools/run_restart_gate_zstar.sh`: straight == split
   `max|Δ|=0` at np 1/2/8 on pi and CORE2, restore round trip np 2 → 1/8 exact; without the switch not
-  bitwise (TESTING.md §8, LESSONS L78). Unset: checkpoints and runs bit-identical to `main`. Follow-ups:
-  the SP branch stores `ssh_stiff%values_full` (comment in `restart_register_stiff`); split-explicit +
+  bitwise (TESTING.md §8, LESSONS L78). Unset: checkpoints and runs bit-identical to `main`. In single
+  precision the store holds `ssh_stiff%values_full` (branch `sp-restart-exact`, L79); split-explicit +
   zstar does not use the matrix and needs only the geometry rebuild.
 - **Split-explicit barotropic solver — Stages 0–6 DONE (2026-10-19, branch `split-explicit`, worktree
   `/work/ab0995/a270088/fesom3_se`, unpushed):** SE subcycling after Sergey's notes (SESM, `FESOM3_SSH_SE=1`), linfs

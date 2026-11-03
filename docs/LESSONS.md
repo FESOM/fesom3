@@ -3141,7 +3141,33 @@ and the gap in the stiffness matrix; this closes the gap.
 (including "setup" objects that a step modifies, and lazily-built caches) and gate a straight-vs-split
 run with that option ON. Check that each restored piece is needed by skipping it once.
 
-## L79 — An RK3 stage keeps a uniform tracer uniform only if it advects with the full w its continuity used: stages 1–2 take the full w, the split of w lives only in the last stage (for FCT tracers only in the low order), where an implicit solve closes it
+## L79 — In single precision the restart set also includes what a step keeps in real64 and what it allocates lazily: a WP-typed checkpoint path rounds the first, and the registry cannot point at the second
+
+**Context.** Exact single-precision restart (branch `sp-restart-exact`, 2026-10-28), after PR #4 (single
+precision) and L78 (exact zstar restart). Before it, a single-precision resume was close to, not identical
+with, the straight run (as upstream FESOM2).
+
+**What happened.**
+- Three pieces of single-precision state carry over between steps outside the WP prognostic arrays: the
+  layer thickness `hnode` (WP_full, upstream #1207), the stiffness accumulator `ssh_stiff%values_full`
+  (WP_full, #997; zstar), and the tracer carry `tracers%work%carry` (WP, #1206).
+- The checkpoint stores were already `<f8`, but the redistribution and the chunk reader in between were
+  WP-typed, so `hnode` came back rounded to float32; the zstar exact restart stored the WP copy of the
+  matrix; the carry was not registered at all (upstream omits it too).
+- The carry and `values_full` are allocated at their first use inside the step, after the driver has
+  built the restart registry, so there was nothing to point at. Allocating them before the registry (a
+  zero carry, `values_full` seeded from the cold matrix) gives the bits the first step would give.
+- With real64 decomposition and read paths (single precision only) and the carry as `carry_t`/`carry_s`
+  (the stores fesom3_jax already wrote), the straight-vs-split gates are `max|Δ| = 0` in single precision:
+  CORE2 linfs CG and split-explicit (np 1, 2), zstar exact on pi (np 1, 2, 8) and CORE2 (np 2, 8), the
+  np 2 → 8 restore. Double precision is unchanged to the bit.
+
+**How to apply.** When a build changes precision, list the carried state by kind, not by name: every
+array a step reads before it writes it, in WP, WP_full or any other kind, including those allocated on
+first use. Check that the I/O path keeps each one's kind end to end (the on-disk dtype alone does not),
+and that each exists when the registry is built.
+
+## L80 — An RK3 stage keeps a uniform tracer uniform only if it advects with the full w its continuity used: stages 1–2 take the full w, the split of w lives only in the last stage (for FCT tracers only in the low order), where an implicit solve closes it
 
 **Context.** RK3 time stepping (`FESOM3_RK3`, docs/plans/completed/2026-10-28-rk3.md, D7, 2026-10-28,
 Dmitry after reading `rk3.tex`): stages 1–2 advect with the full w (w_e + w_i) of the stage, the split exists
@@ -3164,7 +3190,7 @@ low-order solution (explicit w_e, then implicit w_i); its high order and its ant
 with the stage's own full w before thinking about stability; a split of w belongs only where an implicit
 solve closes it. Pin the property with a unit test that asserts split faces are present.
 
-## L80 — "No flux limited" cannot be arranged on a global coastline mesh: test the FCT identity on the cells whose every incident flux is unlimited
+## L81 — "No flux limited" cannot be arranged on a global coastline mesh: test the FCT identity on the cells whose every incident flux is unlimited
 
 **Context.** RK3 Task 7, `test_rk3` R9: on a smooth field at a small Courant number the stage-3 FCT result
 should equal the low order plus the full antidiffusive flux (HO(T\*\*) − the substep-mean LO flux).
@@ -3182,7 +3208,7 @@ should equal the low order plus the full antidiffusive flux (HO(T\*\*) − the s
 identity where the premise holds locally, assert that this set is the large majority, and add a
 positive control that would fail on the same set.
 
-## L81 — fesom_conserve's cold start is partition-dependent; an np 1 vs np N comparison needs the deterministic IC fill
+## L82 — fesom_conserve's cold start is partition-dependent; an np 1 vs np N comparison needs the deterministic IC fill
 
 **Context.** RK3 Task 12: np 1 vs np 8 to roundoff with `FESOM3_SSH_SOLTOL=1e-14` (L60).
 
@@ -3194,7 +3220,7 @@ to 2.0e-14 in heat and salt, and max|u| is identical at the printed digits in ev
 **How to apply.** Before a cross-decomposition comparison, compare the step-0 state; use one checkpoint or
 the deterministic fill.
 
-## L82 — Under zstar the free surface moves with the freshwater, so w(top) = 0 also in the forced stage
+## L83 — Under zstar the free surface moves with the freshwater, so w(top) = 0 also in the forced stage
 
 **Context.** RK3 Task 18, `test_rk3` Z2. The plan expected w(top) = −W in stage 3.
 
@@ -3208,7 +3234,7 @@ the split-explicit work.
 a plan's number disagrees with the code, test the code's identity, add the positive control that shows
 the term is live, and correct the plan.
 
-## L83 — A coupling trim that freezes the barotropic velocity in the stages turns the barotropic Coriolis into forward Euler when the barotropic solver has no Coriolis of its own
+## L84 — A coupling trim that freezes the barotropic velocity in the stages turns the barotropic Coriolis into forward Euler when the barotropic solver has no Coriolis of its own
 
 **Context.** RK3 + CG on NEMO025 (plan docs/plans/completed/2026-10-28-rk3.md, Addendum A, 2026-10-30).
 
@@ -3228,4 +3254,3 @@ barotropic mode the stages freeze and who integrates them in the last stage; a t
 applies, to the frozen value, is forward Euler. Test the barotropic mode alone (linear f-plane, kR < 1) at high
 latitude. Short runs on small or mid-latitude meshes do not show a (fτ)² growth that friction holds down; a
 global mesh with strong high-latitude barotropic flow does — screen at least a month on the target mesh.
-
