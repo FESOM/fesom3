@@ -28,8 +28,11 @@ program fesom_restartroundtrip
     !   FESOM3_CHUNK_HORIZ     horizontal chunk (default 1000 => multiple chunks + writer subset)
     !   FESOM3_RESTARTRT_SE    0 (default) | 1 = also the split-explicit fields (dyn%use_ssh_se, the shapes
     !                          of se_init: +10 stores) | 2 = the SE read pre-check: write WITHOUT the SE
-    !                          fields, then read with them registered -> must abort with "checkpoint has
-    !                          no split-explicit state" (the caller checks the nonzero exit + message)
+    !                          fields, then read with them registered and no se_cold argument -> must
+    !                          abort with "checkpoint has no split-explicit state" (the caller checks the
+    !                          nonzero exit + message) | 3 = the SE cold resume: write WITHOUT the SE fields,
+    !                          read with them registered and se_cold -> se_cold = .true., the 28 other
+    !                          fields round-trip (max|Δ| = 0) and the SE arrays keep their pre-read marker
     use mpi
     use, intrinsic :: iso_fortran_env, only: real64
     use mod_precision,    only: WP, MP, MPI_WP
@@ -63,8 +66,10 @@ program fesom_restartroundtrip
     integer :: nsw, i, j, L, gid, nl, ab, ios, k, ierr, nfail
     integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
     integer :: full, rext, se_mode
+    logical :: se_cold
     real(WP) :: vn, ve, v3, d, maxd
     real(WP), parameter :: SENT = -9.99e30_WP
+    real(WP), parameter :: SEMARK = -7.0_WP      ! se_mode 3: the SE arrays before the read
 
     call get_environment_variable('FESOM3_MESH_DIR', mesh_dir)
     if (len_trim(mesh_dir) == 0) &
@@ -81,7 +86,7 @@ program fesom_restartroundtrip
     call get_environment_variable('FESOM3_RESTARTRT_SE', sebuf)
     if (len_trim(sebuf) > 0) then
         read(sebuf, *, iostat=ios) i
-        if (ios == 0 .and. (i == 1 .or. i == 2)) se_mode = i
+        if (ios == 0 .and. i >= 1 .and. i <= 3) se_mode = i
     end if
 
     call par_init(partit)
@@ -250,8 +255,33 @@ program fesom_restartroundtrip
     end do
 
     ! ===== (6) read the checkpoint back (gather owned + write back + halo exchange) ====================
-    call restart_read(R, trim(out_dir), mesh, partit, &
-                      clock_year=2000, clock_day=1, clock_time_sec=3600.0_real64)
+    if (se_mode == 3) then
+        ! the SE cold resume: the same live arrays registered with SE on (R2), read with se_cold; the
+        ! SE arrays must keep the marker (restart_read skips their stores), the others round-trip
+        dyn%se_eta = SEMARK; dyn%se_ubt = SEMARK; dyn%se_sbar_old = SEMARK
+        dyn%use_ssh_se = .true.
+        call restart_init(R2, mesh, partit, chunk_horiz=1000)
+        call restart_register_state(R2, dyn, tracers, ice, mesh, mix_scheme=5)
+        if (partit%mype == 0) write(*,'(a,i0,a,i0,a)') 'fesom_restartroundtrip: SE cold resume: wrote ', R%nf, &
+            ' fields without SE, reading with ', R2%nf, ' registered and se_cold'
+        call restart_read(R2, trim(out_dir), mesh, partit, &
+                          clock_year=2000, clock_day=1, clock_time_sec=3600.0_real64, se_cold=se_cold)
+        d = 0.0_WP
+        if (.not. se_cold) d = 1.0_WP
+        if (any(dyn%se_eta /= SEMARK) .or. any(dyn%se_ubt /= SEMARK) .or. any(dyn%se_sbar_old /= SEMARK)) d = 1.0_WP
+        if (mr) call MPI_Allreduce(MPI_IN_PLACE, d, 1, MPI_WP, MPI_MAX, partit%MPI_COMM_FESOM, ierr)
+        if (partit%mype == 0) then
+            if (d == 0.0_WP) then
+                write(*,'(a)') 'SE COLD OK (se_cold set, the SE arrays not read)'
+            else
+                write(*,'(a)') 'SE COLD FAIL (se_cold not set or an SE array was read)'
+            end if
+        end if
+        if (d /= 0.0_WP) error stop 3
+    else
+        call restart_read(R, trim(out_dir), mesh, partit, &
+                          clock_year=2000, clock_day=1, clock_time_sec=3600.0_real64)
+    end if
 
     ! ===== (7) compare each live array to its reference over the FULL local extent ====================
     if (partit%mype == 0) write(*,'(a)') '--- per-field max|Δ| (live vs reference, full local extent) ---'

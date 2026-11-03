@@ -467,6 +467,8 @@ contains
         ! All of them are bitwise equal over the owners of a shared element (the F and uv syncs,
         ! plan 2026-10-17 Task 2.1), so the store's one copy per element restores every owner exactly.
         ! The checkpoint holds no M or chi: both must stay the same over a restart chain.
+        ! A checkpoint without these stores (written with the CG solve, AB2 or RK3) resumes an SE run
+        ! with cold rings: restart_read skips them (se_cold) and the driver calls se_cold_resume.
         if (dyn%use_ssh_se) then
             R%se = .true.
             p2 => dyn%se_eta(:,1);      call restart_register_field(R, 'se_eta1', 'm', DECOMP_NODE, p2d=p2)
@@ -966,27 +968,44 @@ contains
     ! dt-change restart trips it; oracle io_restart.F90:904-914 warns, never aborts). mesh is accepted
     ! for signature symmetry with the lifecycle (halo reconstruction needs only partit's com structures);
     ! the optional clock args drive the time-vs-clock safety warning.
-    subroutine restart_read(R, restart_dir, mesh, partit, clock_year, clock_day, clock_time_sec)
+    ! se_cold (optional, split-explicit runs): a checkpoint without the SE state (written with the CG
+    ! solve) is read without its 10 SE stores and se_cold returns .true.; the caller then starts the
+    ! rings cold from the restored state (oce_ssh_se se_cold_resume). Without the argument such a
+    ! checkpoint stops the read, as before.
+    subroutine restart_read(R, restart_dir, mesh, partit, clock_year, clock_day, clock_time_sec, se_cold)
         type(t_restart),  intent(in), target  :: R
         character(len=*), intent(in)           :: restart_dir
         type(t_mesh),     intent(in)           :: mesh
         type(t_partit),   intent(in)           :: partit
         integer,          intent(in), optional :: clock_year, clock_day
         real(real64),     intent(in), optional :: clock_time_sec
+        logical,          intent(out), optional :: se_cold
         character(len=:), allocatable :: folder
-        logical :: ok, have_json, ex, have_stiff, have_dhe
+        logical :: ok, have_json, ex, have_stiff, have_dhe, skip_se
         integer :: k, jyear, jday, ierr
         real(real64) :: jtime
         call restart_resolve_latest(restart_dir, folder, ok)
         call zarr_check(ok, 'restart_read: restart.latest missing/unreadable or checkpoint incomplete under '// &
                             trim(restart_dir))
         if (R%mype == 0) write(*,'(a)') '[restart] reading checkpoint '//folder
-        ! split-explicit (plan 2026-10-17 D6): an SE run resumes only from an SE checkpoint. Checked
-        ! before any field is read, so the message names the cause instead of a missing store.
+        ! split-explicit: a checkpoint without the SE state (no se_eta1 store: written with the CG
+        ! solve) is read without the SE stores when the caller asks for se_cold (the caller starts the
+        ! rings cold), otherwise the read stops (plan 2026-10-17 D6). Checked before any field is read,
+        ! so the message names the cause instead of a missing store. A checkpoint with se_eta1 must hold
+        ! all 10 SE stores (a missing one stops the read below).
+        skip_se = .false.
+        if (present(se_cold)) se_cold = .false.
         if (R%se) then
             inquire(file=folder//'/se_eta1.zarr/.zgroup', exist=ex)
-            call zarr_check(ex, 'restart_read: checkpoint has no split-explicit state: written with '// &
-                                'FESOM3_SSH_SE off; SI<->SE restarts are not supported ('//folder//')')
+            if (.not. ex .and. present(se_cold)) then
+                skip_se = .true.
+                se_cold = .true.
+                if (R%mype == 0) write(*,'(a)') '[restart] the checkpoint has no split-explicit state '// &
+                    '(written with FESOM3_SSH_SE off): the SE stores are not read, the rings start cold'
+            else
+                call zarr_check(ex, 'restart_read: checkpoint has no split-explicit state: written with '// &
+                                    'FESOM3_SSH_SE off; this caller cannot start the SE rings cold ('//folder//')')
+            end if
         end if
         ! time-vs-clock safety check (WARN, never abort)
         if (present(clock_time_sec)) then
@@ -1006,6 +1025,7 @@ contains
         end if
         ! restore + halo-reconstruct every field
         do k = 1, R%nf
+            if (skip_se .and. is_se_store(R%f(k)%name)) cycle
             if (R%f(k)%may_be_absent) then
                 inquire(file=folder//'/'//trim(R%f(k)%name)//'.zarr/.zgroup', exist=ex)
                 if (.not. ex) then
@@ -1021,6 +1041,14 @@ contains
         if (R%zstar_exact) call restart_stiff_unpack(R)
         if (R%mr) call MPI_Barrier(R%comm, ierr)
     end subroutine restart_read
+
+    ! The split-explicit stores of restart_register_state: se_eta1/2, se_ubt<k>_{u,v}, se_sbar_old_{u,v}
+    ! (no other store name starts with 'se_')
+    pure logical function is_se_store(name)
+        character(len=*), intent(in) :: name
+        is_se_store = len_trim(name) > 3
+        if (is_se_store) is_se_store = name(1:3) == 'se_'
+    end function is_se_store
 
     ! Read ONE field's snapshot store back into its live model array, then reconstruct its halo. WRITER
     ! ranks read their owned canonical chunks ([w_first_chunk..w_last_chunk]; 3-D loops the vertical

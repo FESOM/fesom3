@@ -105,7 +105,7 @@ program fesom_lifecycle_native_mr
     use oce_ale_tracer,     only: tracer_carry_alloc                    ! single-precision checkpoint
     use oce_ssh_solve,      only: ssh_solve_preconditioner   ! zstar exact resume (cold-matrix preconditioner)
     use mod_step_oce,       only: step_oce
-    use oce_ssh_se,         only: se_init
+    use oce_ssh_se,         only: se_init, se_cold_resume
     use oce_rk3,            only: rk3_init, rk3_cold_ab_start
     use mod_io_meshdiag,    only: meshdiag_write
     use mod_io_means,       only: t_io_means, t_io_config, t_io_entry, t_means_clock, MEANS_MAXF, &
@@ -160,7 +160,9 @@ program fesom_lifecycle_native_mr
     ! Restart Stage 5 (Tasks 5.1/5.3): checkpoint registry + global cadence + restart-mode detection.
     type(t_restart)     :: rst
     logical             :: do_restart      ! FESOM3_RESTART set => register + write the checkpoint state
-    logical             :: cold_ab = .false.  ! an AB2 run resumed an RK3 checkpoint: lfirst on step 1 (RK3 D11)
+    logical             :: cold_ab = .false.  ! an AB2 run resumed an RK3 checkpoint (RK3 D11), or an AB2 + SE
+                                              ! run a checkpoint without SE state: lfirst on step 1
+    logical             :: se_cold = .false.  ! an SE run resumed a checkpoint without SE state
     character(len=8)    :: ckpt_scheme     ! the resumed checkpoint's time scheme ('ab2' / 'rk3')
     logical             :: restart_mode    ! restart launch: do_restart AND a complete checkpoint resolves
     logical             :: wrote_final     ! did the last in-loop step already checkpoint? (skip the final)
@@ -1007,7 +1009,8 @@ program fesom_lifecycle_native_mr
         if (r_restart) then
             if (rst%zstar_exact) call ssh_solve_preconditioner(dyn, mesh, partit)
             call restart_read(rst, trim(RestartInPath), mesh, partit, &
-                              clock_year=yearnew, clock_day=daynew, clock_time_sec=real(timenew, real64))
+                              clock_year=yearnew, clock_day=daynew, clock_time_sec=real(timenew, real64), &
+                              se_cold=se_cold)
             ! zstar: the checkpoint holds hnode, not the geometry derived from it. At the top of a straight-run step hnode_new == hnode
             ! and zbar_3d_n / Z_3d_n / helem are what update_thickness_ale built from them (bottom-up from
             ! the fixed anchor; helem over owned elements + exchange_elem), so rerun it with
@@ -1020,6 +1023,13 @@ program fesom_lifecycle_native_mr
             if (partit%mype == 0) write(*,'(a,f9.1,a,i0,a,i0)') &
                 'restart: state restored (resumed run) at clock time=', timenew, ' day=', daynew, &
                 ' year=', yearnew
+            ! split-explicit from a checkpoint without SE state (CG, AB2 or RK3): the rings start cold
+            ! from the restored eta_n, uv and helem (after the zstar rebuild above); AB2 also starts its
+            ! momentum cold (se_cold_resume zeroes uv_rhsAB, lfirst on step 1)
+            if (se_cold) then
+                call se_cold_resume(dyn, mesh, partit)
+                if (.not. dyn%use_rk3) cold_ab = .true.
+            end if
             ! RK3 (plan D11): an AB2 run resuming an RK3 checkpoint starts AB2 cold (the history in the
             ! checkpoint is not AB state); an RK3 run ignores the AB fields of any checkpoint
             if (.not. dyn%use_rk3) then
