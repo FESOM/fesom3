@@ -86,6 +86,9 @@ conservation, mesh-delta, regression and self-consistency gates take its place
     up on day 229 (a grid-scale mode on one 30 m Kara-shelf node), and 0.07 is marginal there.
     Without the drag χ = 0.1 blows up a cold-started CORE2 run after about 7 days (a shelf mode fed
     through the sea ice).
+  - An SE run can resume a checkpoint written with the CG solve (AB2 or RK3), e.g. to branch an SE run
+    from a CG run. The barotropic rings then start cold from the restored state, as in a cold start;
+    under AB2 the momentum also takes one cold (Euler) first step.
   - See [IMPLEMENTATION.md](IMPLEMENTATION.md) §14.
 - **RK3 time stepping (`FESOM3_RK3=1`, branch `rk3`, opt-in):**
   - The three-stage Wicker–Skamarock Runge–Kutta step of Sergey Danilov's quad FV prototype in place of
@@ -296,7 +299,7 @@ examples. The most common variables:
 | `FESOM3_STEP_DIAG` | per-step global diagnostic line (max\|eta\|, max\|uv\|, ice, Tmax, Smax, and the shared-element numbers `divsum=`, `dUV=`, `dAB=`, `dsig=`); two extra collectives per step, off by default. Under zstar a second line per step, `salt step`: the ocean + sea-ice salt content, the step's residual (change minus the balanced SSS restoring; roundoff when salt is conserved) and the ice salt the conserving cut_off returned (one more collective) |
 | `FESOM3_SSH_SOLTOL`, `FESOM3_SSH_MAXITER` | SSH solver tolerance and iteration cap — test/diagnostic only, read in `src/oce/oce_ssh_solve.F90` (defaults `1e-5`, `2000`) |
 | `FESOM3_SSH_PRECOND` | SSH CG preconditioner: `jacobi` (default) or `ic0` (block-Jacobi incomplete Cholesky, `src/oce/oce_ssh_ic0.F90`); any other value stops |
-| `FESOM3_SSH_SE` | free surface: `0` (default) = semi-implicit CG solve, `1` = split-explicit barotropic subcycling (production driver and `fesom_conserve` only; AB2, no cavities). Read in `src/oce/oce_ssh_se.F90`, like the knobs below |
+| `FESOM3_SSH_SE` | free surface: `0` (default) = semi-implicit CG solve, `1` = split-explicit barotropic subcycling (production driver and `fesom_conserve` only; AB2, no cavities). A checkpoint written with the CG solve resumes with cold barotropic rings (one log line). Read in `src/oce/oce_ssh_se.F90`, like the knobs below |
 | `FESOM3_SE_M`, `FESOM3_SE_M_FORCE` | substeps per baroclinic step (default `50`); the run stops if M is below the CFL-guard minimum printed at startup (CORE2 at 1800 s: 40 at the default χ 0.1, 38 at χ 0.05, 48 at χ 0.25) unless `FESOM3_SE_M_FORCE=1` |
 | `FESOM3_SE_CHI` | dissipation parameter χ in [0, 0.25] (default `0.1`). Mesh-dependent: use the smallest value stable on the mesh; the default is that value for CORE2 with the barotropic drag (`0.05` blew up a zstar year, `0.07` is marginal; see "Changes since v1") |
 | `FESOM3_SE_VISC_AH` | barotropic viscosity A_h = value × edge length, the value in m/s (default `0.01`; `0` = off) |

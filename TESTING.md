@@ -170,7 +170,7 @@ the upwind blend on) and `test_ice_dyn_mixed` D6 (EVP/mEVP sigma copies bitwise 
 
 | Test | Ranks | Checks |
 |---|---|---|
-| `test_ssh_se` C1–C4 | 1, 2, 8 | SM coefficients against hand-computed literals; knob parsing (every rejected and accepted value per knob, the defaults, incl. `FESOM3_SE_BOTTDRAG`); CFL guard (a_crit, the Schur–Cohn radius against numpy, A self-adjoint, ω_max on pi equal at np 1/2/8 bitwise, M_min, the real substep loop stable at 0.97 and unstable at 1.03 a_crit); `se_init` extents and cold-start rings |
+| `test_ssh_se` C1–C4 | 1, 2, 8 | SM coefficients against hand-computed literals; knob parsing (every rejected and accepted value per knob, the defaults, incl. `FESOM3_SE_BOTTDRAG`); CFL guard (a_crit, the Schur–Cohn radius against numpy, A self-adjoint, ω_max on pi equal at np 1/2/8 bitwise, M_min, the real substep loop stable at 0.97 and unstable at 1.03 a_crit); `se_init` extents and cold-start rings; `se_cold_resume` (C4b): the rings rebuilt from a new (restored) η and uv, `uv_rhsAB` zeroed under AB2 only |
 | `test_ssh_se` C5–C12 | 1, 2, 8 | F = 0 for a pure pressure and a pure Coriolis state through the real `compute_vel_rhs` (the stored transport sums: the lfirst weight, s_old, the AB2 blend); the substep tendency equals G/τ at U\* = šⁿ, η = ηⁿ, Ūᵐ = Ūⁿ; the bottom-drag rate C_d·\|u_b\|/Hⁿ (F bitwise the same with the drag off), and D(Ūᵐ − Ūⁿ) is 0 at Ūᵐ = Ūⁿ (bitwise the drag-off tendency), −kdrag·X and linear otherwise; viscosity sums to 0 and vanishes for uniform flow; substeps: rest stays at rest, volume and η compatibility to rounding, convergence order ≥ 2 in dtbt; the trim Σhelemⁿuv = ⟨⟨Ū⟩⟩; the `SE_CHECK` values and their response to a planted perturbation and a NaN |
 | `test_ssh_se` P1–P4 | 2, 8 | F and the drag rate before and after the one-owner sync; copy spreads of the Ū ring, ⟨⟨Ū⟩⟩, `uv`, `uv_rhsAB` exactly 0 over 6 steps (and nonzero with the syncs off); inflow-sum ratio ≤ 1.4e-17; np 2 bitwise equal to np 1, np 8 to 3.9e-16 of max\|Ū\| (Intel; the test allows 1e-12) |
 | `test_ssh_se` Z1–Z6 | 1, 2 (+8) | zstar: the depth-law weights c, H_e(ηⁿ) = Σhelemⁿ bitwise, Σhelem^{n+1} = H_e(η^{n+1}) through the real `vert_vel_ale` + `update_thickness_ale` (4.5e-12 m of 5650 m), freshwater in η, one full zstar step with every invariant; c ≡ 0 under linfs |
@@ -332,8 +332,15 @@ byte diff (plan `docs/plans/completed/2026-10-17-split-explicit.md`):
   and the live dumps `max|Δ| = 0`, and the resumed segment's `SE_CHECK` lines equal the straight run's
   (without `msl`, which counts from the process start). `run_restart_gate_multirank.sh` (np 2 → 8):
   `max|Δ| = 0`. `run_restartroundtrip.sh` adds `FESOM3_RESTARTRT_SE=1` (38 fields round-trip at
-  `max|Δ| = 0`) and `FESOM3_RESTARTRT_SE=2` (a checkpoint without SE state, read with SE on, must
-  stop with the message).
+  `max|Δ| = 0`), `FESOM3_RESTARTRT_SE=2` (a checkpoint without SE state, read with SE on by a caller
+  without `se_cold`, must stop with the message) and `FESOM3_RESTARTRT_SE=3` (the same read with
+  `se_cold`: no stop, `se_cold` set, the SE arrays not read, the 28 other fields `max|Δ| = 0`).
+  An SE run resuming a CG checkpoint (2026-11-03, CORE2 np 8, linfs and zstar, RK3 and AB2): a
+  0-step resume rewrites the checkpoint with the cold rings; a 96-step resume prints the cold-start
+  lines, and its `RK3_CHECK` / `SE_CHECK` invariants stay at roundoff (trims ≤ 7e-13, etacomp ≤
+  2e-14, no bad values, spreads 0). NEMO025, 1280 ranks, RK3 + SE at 3600 s from the RK3 + CG
+  checkpoint of 1 Jan 1964: the first 1184 steps clean (max|η| 1.92 m, max|uv| 1.89 m/s, trims ≤
+  1.4e-12).
 - **Determinism.** The same binary at the same np is bitwise reproducible (CORE2 np 8, 480 steps:
   1,395,438 dump records and 99 checkpoint variables `max|Δ| = 0`); np 1 and np 8 differ about as
   much as they do with the CG solve (CORE2, 48 steps: max|Δη| 4.6e-2 m vs 4.9e-2 m).
