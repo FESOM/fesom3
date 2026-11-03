@@ -5,6 +5,26 @@ Full pre-M2.12 milestone detail + the per-gate recipes live in [`HANDOFF-archive
 
 ## Where we are
 
+- **RK3 time stepping ✅ (2026-10-28, branch `rk3`, opt-in `FESOM3_RK3=1`, plan
+  `plans/completed/2026-10-28-rk3.md`, unpushed):** the Wicker–Skamarock RK3 step of Sergey's quad FV
+  prototype (`rk3.tex`, `~/qq_new2`) in place of AB2: stages 1–2 advection (full w), Coriolis, PGF; stage 3
+  the rest, with the w split there only (D7). CG and split-explicit barotropic, linfs and zstar, np 1..8,
+  exact restarts (`"time_scheme": "rk3"` in `checkpoint.json`; an AB2 resume of it starts cold). RK3 off is
+  byte-identical to main `3bc68f5` (G0 against `/work/ab0995/a270029/fesom3_rk3_ref`). Unit identities in
+  `test_rk3` (K, R1–R11, Z1–Z3) and `test_ssh_se` S1–S3; RK3 blocks in `run_conserve_pi.sh` (hard gates);
+  `RK3_CHECK` invariant line. CORE2 480-step np 8 screens (CG/SE, linfs/zstar) stable — numbers in the
+  plan (Tasks 12, 15, 20, 21) and TESTING.md §6e. Pushed to origin/rk3 on 2026-10-29.
+  **Addendum A (2026-10-30, `af5fba5`):** on NEMO025 RK3 + CG grew a spurious Weddell cyclone and blew up at
+  2400 s: the stage trims to Ūⁿ made the barotropic Coriolis forward Euler (the CG corrector has none). The CG
+  path now trims to the AB-extrapolated Ū (c₁ = 1/3, c₂ = 1/2 + ε); Ūⁿ⁻¹ is the optional checkpoint store
+  `rk3_ubold_u/_v`. NEMO025: 2400 s from AB2's 1959 checkpoint stable for 120 days, the Weddell anomaly gone
+  at 1200 s (plan Addendum A, LESSONS L84). Frozen binary for Dmitry's runs:
+  `/work/ab0995/a270029/fesom3.0/bin_rk3_af5fba5`. Open: RK3 at 3600 s vs AB2, the 1-year twins, the CORE2
+  screens, the questions for Sergey (plan Post-Completion), the PR.
+  **Merged with main (2026-11-03):** exact single-precision restart (#10), Redi_Kmin scaling (#12), the IC(0)
+  SSH preconditioner (#13). `rk3_ubold_u/_v` now use main's `may_be_absent` (RK3's own `optional_store` flag is
+  gone); RK3's lessons are L80–L84 after main's L79. NEMO025 with the low-viscosity gammas: RK3 at 3600 s runs
+  a year where AB2 blew up within 18 steps; per model year it costs about 1.3x AB2 at 2400 s.
 - **Exact single-precision restart (2026-10-28, branch `sp-restart-exact` from `single-precision-main`,
   worktree `/work/ab0995/a270088/fesom3_sp_restart`):** the SP checkpoint keeps `hnode` and (zstar exact)
   `ssh_stiff%values_full` in real64 (real64 `decomp_redistribute`/`decomp_gather`/`zarr_read_chunk`,

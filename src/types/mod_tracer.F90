@@ -58,6 +58,15 @@ module mod_tracer
         ! M4d Redi: vertical tracer gradient (tracer_gradient_z), recomputed per tracer; NOT
         ! serialized (allocated only when Redi). Feeds diff_part_hor_redi's K13/K23 slope terms.
         real(kind=WP), allocatable, dimension(:,:) :: tr_z              ! (nl, nod2D)
+        ! RK3 stage 3 with FESOM3_RK3_LO_NSUB > 1 (do_oce_adv_tra_rk3): the FCT low order in N
+        ! substeps. Scratch, allocated on first use, NOT serialized: the substep state T^(k), the
+        ! (1/N)-sums of the low-order fluxes (horizontal on owned edges, vertical with the full
+        ! w) and the substep-mean low-order surface transport area*(w_e*T^(k) + w_i*T^(k+1)) at
+        ! the top face (FESOM3_LINFS_CONSERVE).
+        real(kind=MP), allocatable, dimension(:,:) :: rk3_lo_T          ! (nl-1, nNodL)
+        real(kind=MP), allocatable, dimension(:,:) :: rk3_lo_fh         ! (nl-1, nEdgeO)
+        real(kind=MP), allocatable, dimension(:,:) :: rk3_lo_fv         ! (nl,   nNodL)
+        real(kind=MP), allocatable, dimension(:)   :: rk3_lo_top        ! (nNodL)
     contains
         procedure :: write_tw => write_t_tracer_work
         procedure :: read_tw  => read_t_tracer_work

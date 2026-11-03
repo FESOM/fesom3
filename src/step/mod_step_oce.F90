@@ -71,6 +71,8 @@ module mod_step_oce
     use oce_ale_tracer,     only: solve_tracers_ale
     use oce_ssh_se,         only: se_step_guard, se_bt_forcing, se_subcycle, se_trim_finish, &
                                   se_check_tail
+    use oce_rk3,            only: rk3_step_guard
+    use mod_step_oce_rk3,   only: step_oce_rk3
     use mod_timer,          only: timer_start, timer_stop, &
                                   TMR_OCE_MIXPRES, TMR_OCE_DYN, TMR_OCE_SSH, &
                                   TMR_OCE_SOLVE, TMR_OCE_GMREDI, TMR_OCE_TRACER
@@ -108,11 +110,21 @@ contains
         is_kpp = (mix_scheme_nmb == 1)
         is_tke = (mix_scheme_nmb == 5)
 
-        ! split-explicit driver guard, first call only (oce_ssh_se): with FESOM3_SSH_SE=1, a
-        ! driver that did not run se_init would silently get the CG solve below
+        ! split-explicit and RK3 driver guards, first call only (oce_ssh_se, oce_rk3): with
+        ! FESOM3_SSH_SE=1 or FESOM3_RK3=1, a driver that did not run se_init / rk3_init would
+        ! silently get the CG solve / the AB2 step below
         if (.not. se_checked) then
             call se_step_guard(dynamics, partit)
+            call rk3_step_guard(dynamics, partit)
             se_checked = .true.
+        end if
+
+        ! RK3 (FESOM3_RK3=1, src/step/mod_step_oce_rk3.F90): the whole step is step_oce_rk3's
+        if (dynamics%use_rk3) then
+            call step_oce_rk3(n, dt, dynamics, tracers, mesh, Ki, heat_flux, water_flux, &
+                              virtual_salt, relax_salt, real_salt_flux, is_nonlinfs, stress_surf, &
+                              partit=partit, stress_node_surf=stress_node_surf)
+            return
         end if
 
         !_______________________________________________________________________

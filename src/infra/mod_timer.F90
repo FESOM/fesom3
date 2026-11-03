@@ -43,31 +43,35 @@ module mod_timer
     integer, parameter, public :: TMR_OCE_SE_BT   = 18   ! SUBSET of SSH (split-explicit barotropic substeps)
     integer, parameter, public :: TMR_OCE_GMREDI  = 19
     integer, parameter, public :: TMR_OCE_TRACER  = 20
-    integer, parameter, public :: NTIMER          = 20
+    integer, parameter, public :: TMR_OCE_RK3_S1  = 21   ! SUBSET of STEP_OCE (RK3 stage 1) — they contain
+    integer, parameter, public :: TMR_OCE_RK3_S2  = 22   !   the TMR_OCE_* timers above, so they are not
+    integer, parameter, public :: TMR_OCE_RK3_S3  = 23   !   summed with them; quiet unless FESOM3_RK3=1
+    integer, parameter, public :: NTIMER          = 23
 
     character(len=24), parameter :: TNAME(NTIMER) = [character(len=24) :: &
         'ocean2ice', 'forcing', 'sbc / crossing', 'open/reopen', 'read+inflate', 'interp loop', &
         'time-interp', 'bulk NCAR', 'wind/ice stress', &
         'ice', 'oce_fluxes', 'step_oce (ocean)', &
         'mix, pres, EOS', 'dynamics u,v,w', 'dynamics ssh', '(of which) ssh solve', &
-        '(of which) shared sync', '(of which) SE barotropic', 'GM / Redi', 'tracer' ]
+        '(of which) shared sync', '(of which) SE barotropic', 'GM / Redi', 'tracer', &
+        '(of which) RK3 stage 1', '(of which) RK3 stage 2', '(of which) RK3 stage 3' ]
     ! parent id for the indented report (0 = top-level component)
     integer, parameter :: TPARENT(NTIMER) = [ 0, 0, TMR_FORCING, TMR_FRC_SBC, TMR_FRC_SBC, TMR_FRC_SBC, &
         TMR_FORCING, TMR_FORCING, TMR_FORCING, &
         0, 0, 0, &
         TMR_STEP_OCE, TMR_STEP_OCE, TMR_STEP_OCE, TMR_OCE_SSH, TMR_OCE_SSH, TMR_OCE_SSH, &
-        TMR_STEP_OCE, TMR_STEP_OCE ]
+        TMR_STEP_OCE, TMR_STEP_OCE, TMR_STEP_OCE, TMR_STEP_OCE, TMR_STEP_OCE ]
     ! .true. => this timer is a subset of its parent (don't add to the parent's child-sum check)
     logical, parameter :: TSUBSET(NTIMER) = [ .false.,.false.,.false., .true.,.true.,.true., &
         .false.,.false.,.false., &
         .false.,.false.,.false., &
-        .false.,.false.,.false., .true., .true., .true., .false.,.false. ]
+        .false.,.false.,.false., .true., .true., .true., .false.,.false., .true., .true., .true. ]
     ! .true. => print the line only when the timer ran on some rank: a mode-specific timer (the
     ! split-explicit loop) adds no zero line to the report of a run that does not use the mode
     logical, parameter :: TQUIET(NTIMER) = [ .false.,.false.,.false., .false.,.false.,.false., &
         .false.,.false.,.false., &
         .false.,.false.,.false., &
-        .false.,.false.,.false., .false., .false., .true., .false.,.false. ]
+        .false.,.false.,.false., .false., .false., .true., .false.,.false., .true., .true., .true. ]
 
     real(real64) :: tacc(NTIMER) = 0.0_real64   ! accumulated seconds
     real(real64) :: tbeg(NTIMER) = 0.0_real64   ! start stamp of an open interval
