@@ -646,3 +646,47 @@ foreach(_np 1 2)
         FAIL_REGULAR_EXPRESSION "VIOLATED;non-finite"
         SKIP_REGULAR_EXPRESSION "cannot open;No such file")
 endforeach()
+
+# IC(0) preconditioner of the SSH CG (FESOM3_SSH_PRECOND=ic0, src/oce/oce_ssh_ic0.F90). test_ssh_ic0:
+# the factor of each rank's owned block (no shift, L L^T = B on the pattern, owned columns only, the
+# triangular solves, fewer than half the Jacobi iterations) and the production solve with it, on the
+# quad and mixed cut-outs (np 1/2), pi_w (triangles, np 2) and core2_w (np 8). Then the model with it:
+# conservation on pi (zstar np 1/2, linfs with FESOM3_LINFS_CONSERVE=TS np 2) and on the mixed cut-out with the production ocean and
+# sea ice (np 2); the pass pattern requires the IC(0) line, so a run that silently fell back to Jacobi
+# fails. Finally the switch's teeth: an unknown value stops.
+add_default_mesh_test(test_ssh_ic0 ${_mesh_q} 1 2)
+set_tests_properties(test_ssh_ic0_np1 test_ssh_ic0_np2 PROPERTIES ENVIRONMENT "FESOM3_SSH_PRECOND=ic0")
+foreach(_np 1 2)
+    add_mesh_test(test_ssh_ic0_mixed_np${_np} test_ssh_ic0 ${_mesh_mix} ${_np} FESOM3_TEST_ROTATE=0 FESOM3_SSH_PRECOND=ic0)
+endforeach()
+add_mesh_test(test_ssh_ic0_pi_w_np2    test_ssh_ic0 ${_mesh_piw} 2 FESOM3_TEST_ROTATE=1 FESOM3_SSH_PRECOND=ic0)
+add_mesh_test(test_ssh_ic0_core2_w_np8 test_ssh_ic0 ${_mesh_c2w} 8 FESOM3_TEST_ROTATE=1 FESOM3_SSH_PRECOND=ic0)
+set(_ic0_pass "IC\\(0\\) of the owned blocks, largest diagonal shift +0\\.00E\\+00.*fesom_conserve: CONSERVATION OK within tol")
+foreach(_case zstar:1 zstar:2 linfs_ts:2)
+    string(REPLACE ":" ";" _c ${_case})
+    list(GET _c 0 _tag)
+    list(GET _c 1 _np)
+    if(_tag STREQUAL "linfs_ts")
+        set(_alecfg "FESOM3_WHICH_ALE=linfs;FESOM3_LINFS_CONSERVE=TS")   # plain linfs does not conserve
+    else()
+        set(_alecfg "FESOM3_WHICH_ALE=${_tag}")
+    endif()
+    add_test(NAME fesom_conserve_${_tag}_ic0_np${_np}
+             COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np ${_np} $<TARGET_FILE:fesom_conserve>)
+    set_tests_properties(fesom_conserve_${_tag}_ic0_np${_np} PROPERTIES
+        ENVIRONMENT "FESOM3_MESH_DIR=${_mesh_pi};FESOM3_IC_FILE=${_icf};FESOM3_NSTEPS=20;${_alecfg};FESOM3_SSH_PRECOND=ic0;FESOM3_CONSERVE_TOL=1e-12"
+        PASS_REGULAR_EXPRESSION "${_ic0_pass}"
+        SKIP_REGULAR_EXPRESSION "cannot open;No such file")
+endforeach()
+add_test(NAME fesom_conserve_mixcut_ice_ic0_np2
+         COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np 2 $<TARGET_FILE:fesom_conserve>)
+set_tests_properties(fesom_conserve_mixcut_ice_ic0_np2 PROPERTIES
+    ENVIRONMENT "FESOM3_MESH_DIR=${_mesh_mix};FESOM3_IC_FILE=${_icf};FESOM3_NSTEPS=20;FESOM3_WHICH_ALE=zstar;${_prod_ocean};FESOM3_CONSERVE_ICE=1;FESOM3_WHICHEVP=0;FESOM3_SSH_PRECOND=ic0;FESOM3_CONSERVE_TOL=1e-12"
+    PASS_REGULAR_EXPRESSION "sea ice ON.*IC\\(0\\) of the owned blocks, largest diagonal shift +0\\.00E\\+00.*CONSERVATION OK")
+require_files(fesom_conserve_mixcut_ice_ic0_np2 ${_mesh_mix}/nod2d.out ${_icf})
+add_test(NAME fesom_conserve_badprecond_np1
+         COMMAND ${FESOM3_MPIEXEC} ${FESOM3_MPI_LAUNCH_FLAGS} -np 1 $<TARGET_FILE:fesom_conserve>)
+set_tests_properties(fesom_conserve_badprecond_np1 PROPERTIES
+    ENVIRONMENT "FESOM3_MESH_DIR=${_mesh_pi};FESOM3_IC_FILE=${_icf};FESOM3_NSTEPS=2;FESOM3_WHICH_ALE=zstar;FESOM3_SSH_PRECOND=ilu"
+    PASS_REGULAR_EXPRESSION "FESOM3_SSH_PRECOND must be jacobi or ic0"
+    SKIP_REGULAR_EXPRESSION "cannot open;No such file")

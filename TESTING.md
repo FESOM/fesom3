@@ -148,6 +148,7 @@ plan"):
 | `test_geom_mixed` | analytic patches, pi_w | centroids, kite weights `elem_w` (vs independent shoelace kites), Green–Gauss `gradient_sca`, node areas, `mesh_resolution` |
 | `test_halo_ext` (+ `_noformat`) | cut-outs, pi_w, core2_w at np 2/4/8 | `exchange_edge` / `exchange_nod_full` round trips; FESOM2-layout `dist_N` error |
 | `test_ssh_stiff` | patches, mixed cut-out, pi_w, core2_w | SSH matrix pattern and values (quadratic field on the parallelogram patch), symmetry, triangle bit-identity, quad checkerboard null mode |
+| `test_ssh_ic0` (+ `fesom_conserve_*_ic0_*`, `fesom_conserve_badprecond_np1`) | quad and mixed cut-outs, pi_w, core2_w at np 8; pi, the mixed cut-out with sea ice | the IC(0) preconditioner (`FESOM3_SSH_PRECOND=ic0`): no diagonal shift, L Lᵀ = B on the pattern of the owned block, owned columns only, the triangular solves, fewer than half the Jacobi iterations, the production solve; conservation with it; an unknown value stops |
 | `test_pgf_mixed`, `test_updown_mixed`, `test_coupling_mixed` | patches, cut-outs, pi_w, core2_w | pressure gradient, density gradient / smoother / GM bolus / IC extrapolation, MUSCL up/downwind elements, surface-stress gather |
 | `test_ice_dyn_mixed`, `test_ice_mass` (+ `_missing_col`) | patches, quad cut-out, pi_w, core2_w | EVP strain/stress adjoint, ice FCT mass matrix, lumped mass, conservation and bounds |
 | `fesom_ini_{aux3d,nodepth,onelem,count1,nonconvex}` | copies of the quad cut-out | `fesom_ini` level finder on quads, its error stops (`tools/check_fesom_ini.sh`) |

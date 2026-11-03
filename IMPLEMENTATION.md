@@ -360,7 +360,8 @@ With the switch the checkpoint adds two stores and the resume rebuilds the rest:
   `restart_register_stiff` maps slot to CSR position once. fesom3_jax reads and writes the same
   layout.
 - `dhe`: element 2-D, float64, through the element decomposition.
-- On resume the driver builds the Jacobi preconditioner from the cold matrix *before*
+- On resume the driver builds the preconditioner (Jacobi, or IC(0) with `FESOM3_SSH_PRECOND=ic0`)
+  from the cold matrix *before*
   `restart_read` restores the values (a straight run builds it at its first solve and keeps it,
   and there `-dhe` is still 0). After the read every zstar resume, exact or not, derives the
   geometry from the restored `hnode` (`hnode_new = hnode`, then `update_thickness_ale`; LESSONS L73).

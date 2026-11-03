@@ -52,6 +52,13 @@ conservation, mesh-delta, regression and self-consistency gates take its place
 - **SSH solver:**
   - Jacobi preconditioner and fewer halo exchanges.
   - Tolerance and iteration limit can be set with `FESOM3_SSH_SOLTOL` and `FESOM3_SSH_MAXITER`.
+  - Opt-in block-Jacobi incomplete Cholesky preconditioner (`FESOM3_SSH_PRECOND=ic0`): IC(0) of
+    each rank's owned block, applied without communication. On NEMO025 (1280 ranks, 3-day runs from
+    1964) it needs 2.5–2.7 times fewer CG iterations and about half the solve time: AB2 at 2400 s
+    126 → 50 iterations (14.7 → 7.5 ms per step), RK3 at 3600 s 316 → 118 (35.5 → 16.5 ms). The
+    iterates depend on the partition, so runs at different rank counts differ at the solver
+    tolerance; at one rank count runs and restarts stay bitwise reproducible. FESOM2's MITgcm
+    preconditioner did not converge on NEMO025 at 2400 s.
 - **Hybrid meshes (triangles and quads):**
   - Python mesh tools (`tools/mesh/`): NEMO quad mesh, checks, splitting, cut-outs.
   - `fesom_ini`, a port of FESOM2's mesh_part with METIS 5.1.0 that handles mixed meshes.
@@ -271,6 +278,7 @@ examples. The most common variables:
 | `FESOM3_SHARED_SYNC` | shared border elements: `1` (default) = every step the other owners take the designated owner's `uv` (no volume leak, exact np>1 restarts); `0` = off, the old unsynced copies (A/B comparisons only). Read in `src/infra/mod_shared_elem.F90` |
 | `FESOM3_STEP_DIAG` | per-step global diagnostic line (max\|eta\|, max\|uv\|, ice, Tmax, Smax, and the shared-element numbers `divsum=`, `dUV=`, `dAB=`, `dsig=`); two extra collectives per step, off by default. Under zstar a second line per step, `salt step`: the ocean + sea-ice salt content, the step's residual (change minus the balanced SSS restoring; roundoff when salt is conserved) and the ice salt the conserving cut_off returned (one more collective) |
 | `FESOM3_SSH_SOLTOL`, `FESOM3_SSH_MAXITER` | SSH solver tolerance and iteration cap — test/diagnostic only, read in `src/oce/oce_ssh_solve.F90` (defaults `1e-5`, `2000`) |
+| `FESOM3_SSH_PRECOND` | SSH CG preconditioner: `jacobi` (default) or `ic0` (block-Jacobi incomplete Cholesky, `src/oce/oce_ssh_ic0.F90`); any other value stops |
 | `FESOM3_SSH_SE` | free surface: `0` (default) = semi-implicit CG solve, `1` = split-explicit barotropic subcycling (production driver and `fesom_conserve` only; AB2, no cavities). Read in `src/oce/oce_ssh_se.F90`, like the knobs below |
 | `FESOM3_SE_M`, `FESOM3_SE_M_FORCE` | substeps per baroclinic step (default `50`); the run stops if M is below the CFL-guard minimum printed at startup (CORE2 at 1800 s: 40 at the default χ 0.1, 38 at χ 0.05, 48 at χ 0.25) unless `FESOM3_SE_M_FORCE=1` |
 | `FESOM3_SE_CHI` | dissipation parameter χ in [0, 0.25] (default `0.1`). Mesh-dependent: use the smallest value stable on the mesh; the default is that value for CORE2 with the barotropic drag (`0.05` blew up a zstar year, `0.07` is marginal; see "Changes since v1") |
