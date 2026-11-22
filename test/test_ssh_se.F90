@@ -182,7 +182,7 @@ program test_ssh_se
     use test_util,        only: setup_test_mesh, check, finish, sum_all, max_all, hval
     ! zstar block (Z1-Z6)
     use mod_config,       only: which_ALE
-    use oce_ale,          only: vert_vel_ale, update_thickness_ale
+    use oce_ale,          only: vert_vel_ale, update_thickness_ale, compute_hbar_ale
     use oce_ssh_se,       only: se_depth_at, se_check_tail_values, se_check_tail_line, SE_NTAIL, &
                                 SE_TAIL_LAYSUM, SE_TAIL_W1, SE_TAIL_HLAW, SE_TAIL_NBAD, SE_CHK_FW
     ! restart registry (R1)
@@ -2167,6 +2167,10 @@ contains
     !       se_subcycle's running mean: copies differed in the last bit at intermediate substeps
     !       and could round back to equal by M = 40); the SE_CHECK_TAIL line format.
     !   Z6  linfs: se_elem_depth leaves c == 0 (bitwise).
+    !   Z7  the CG stiffness update follows the columns (L85): in Z3's two steps, compute_hbar_ale's
+    !       dhe (uv = 0, water_flux = -(eta^{n+1} - eta^n)/dt, so hbar - hbar_old = d eta) equals
+    !       sum_k helem^{n+1} - sum_k helem^n through the real tail to 1e-14 of max H, where
+    !       FESOM2's sum(elem_w*d eta) (Z3's c = 1 law) misses by > 1 mm.
     ! Residuals are printed.
 
     subroutine z_zstar()
@@ -2295,12 +2299,13 @@ contains
         type(t_dyn) :: d, dz
         integer :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF, n, e, nz, i, nbad
         integer :: elnodes(MAX_NV)
-        real(kind=WP), allocatable :: eta_a(:), eta_b(:), HA(:)
-        real(kind=WP) :: maxH, s, res(2), resone(2), reslin(2), lay(2), tv(SE_NTAIL), deta
+        real(kind=WP), allocatable :: eta_a(:), eta_b(:), HA(:), wf(:), dhe7(:)
+        real(kind=WP) :: maxH, s, res(2), resone(2), reslin(2), lay(2), tv(SE_NTAIL), deta, res7(2)
         character(len=8) :: tag
         call local_dims(mesh, partit, nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF)
         call z_thickness_cold()
-        allocate(eta_a(nNodL), eta_b(nNodL), HA(nElemL))
+        allocate(eta_a(nNodL), eta_b(nNodL), HA(nElemL), wf(nNodL), dhe7(nElemL))
+        if (.not. allocated(mesh%dhe)) allocate(mesh%dhe(nElemL))
         call z_new_dyn(d)                                  ! eta_n = 0 = the cold elevation
         call se_init(d, mesh, partit, dt)
         call z_new_dyn(dz)                                 ! the tail's scratch state (uv = 0)
@@ -2330,10 +2335,16 @@ contains
             end do
             call sum_all(nbad, partit)
             call check(nbad == 0, 'Z2 H_e(eta^n) == se_H == sum_k helem^n (bitwise)', partit%mype)
+            ! Z7: compute_hbar_ale's dhe on this elevation change (uv = 0: only the freshwater term)
+            mesh%hbar(1:nNodL) = eta_a
+            wf(1:nNodL) = -(eta_b - eta_a)/dt
+            mesh%dhe = 0.0_MP
+            call compute_hbar_ale(dz, mesh, dt, partit, wf)
+            dhe7(1:nElemO) = mesh%dhe(1:nElemO)
             ! Z3: the depth law at eta^{n+1}, then the real tail
             call se_depth_at(d, mesh, partit, eta_b, HA)
             call z_tail(dz, eta_a, eta_b)
-            res(i) = 0.0_WP; resone(i) = 0.0_WP; reslin(i) = 0.0_WP
+            res(i) = 0.0_WP; resone(i) = 0.0_WP; reslin(i) = 0.0_WP; res7(i) = 0.0_WP
             do e = 1, nElemO
                 s = 0.0_WP
                 do nz = mesh%ulevels(e), mesh%nlevels(e) - 1
@@ -2343,6 +2354,7 @@ contains
                 res(i)    = max(res(i), abs(s - HA(e)))
                 resone(i) = max(resone(i), abs(s - (d%se_H(e) + sum(mesh%elem_w(:, e)*(eta_b(elnodes) - eta_a(elnodes))))))
                 reslin(i) = max(reslin(i), abs(s - d%se_H(e)))
+                if (mesh%ulevels(e) == 1) res7(i) = max(res7(i), abs(dhe7(e) - (s - d%se_H(e))))
             end do
             lay(i) = 0.0_WP
             do n = 1, nNodO
@@ -2353,8 +2365,10 @@ contains
                 lay(i) = max(lay(i), abs(s - ((mesh%zbar(1) - mesh%zbar(mesh%nlevels_nod2D(n))) + eta_b(n))))
             end do
             call max_all(res(i), partit); call max_all(resone(i), partit); call max_all(reslin(i), partit)
-            call max_all(lay(i), partit)
+            call max_all(lay(i), partit); call max_all(res7(i), partit)
             write(tag, '(a,i0)') 'step ', i
+            call check(res7(i) <= 1.0e-14_WP*maxH, 'Z7 '//trim(tag)//': compute_hbar_ale dhe = '// &
+                       'sum_k helem^{n+1} - sum_k helem^n (the CG stiffness follows the columns)', partit%mype)
             call check(res(i) <= 1.0e-14_WP*maxH, 'Z3 '//trim(tag)//': sum_k helem^{n+1} = H_e(eta^{n+1}) '// &
                        'through the real vert_vel_ale + update_thickness_ale', partit%mype)
             call check(resone(i) > 1.0e-3_WP .and. reslin(i) > 1.0e-3_WP, 'Z3 '//trim(tag)// &
@@ -2376,8 +2390,10 @@ contains
                 ' m, max|eta| = ', deta, ' m):'
             write(*,'(a,2es10.3,a,2es10.3,a,2es10.3,a,2es10.3)') 'test_ssh_se: Z3   steps 1, 2: max|sum helem - H_e(eta)| = ', &
                 res, ' m; c = 1 law ', resone, '; c = 0 law ', reslin, '; layer sum ', lay
+            write(*,'(a,2es10.3,a)') 'test_ssh_se: Z7   steps 1, 2: max|dhe - (sum helem^{n+1} - sum helem^n)| = ', &
+                res7, ' m (FESOM2 dhe: the c = 1 law above)'
         end if
-        deallocate(eta_a, eta_b, HA)
+        deallocate(eta_a, eta_b, HA, wf, dhe7)
     end subroutine z3_tail_law
 
     subroutine z4_uniform_w()

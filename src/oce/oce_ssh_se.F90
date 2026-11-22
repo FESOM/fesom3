@@ -133,6 +133,7 @@ module oce_ssh_se
     use mod_timer,       only: timer_start, timer_stop, TMR_OCE_SHSYNC, TMR_OCE_SE_BT
     use mod_mesh_rotate, only: trim_cyclic
     use mod_mesh_areas,  only: elem_center
+    use oce_ale,         only: zstar_depth_law     ! the depth law c, shared with compute_hbar_ale's dhe
     implicit none
     private
     public :: se_env_requested, se_read_env, se_parse_knob, se_init, se_step_guard, se_cold_resume
@@ -781,9 +782,9 @@ contains
         type(t_dyn),    intent(inout) :: dyn
         type(t_mesh),   intent(in)    :: mesh
         type(t_partit), intent(in)    :: partit
-        integer       :: e, nz, k, v, ule, nle, nlv, kb
+        integer       :: e, nz, k
         integer       :: nNodO, nNodL, nEdgeO, nEdgeL, nElemO, nElemL, nElemF
-        real(kind=WP) :: H, cv
+        real(kind=WP) :: H
 
         if (trim(which_ALE) /= 'linfs' .and. trim(which_ALE) /= 'zstar') &
             call se_die('split-explicit supports which_ALE = linfs and zstar, not '// &
@@ -799,20 +800,8 @@ contains
         if (trim(which_ALE) /= 'zstar') return
 
         do e = 1, nElemO
-            ule = mesh%ulevels(e)
-            nle = mesh%nlevels(e)
             do k = 1, MAX_NV
-                cv = 0.0_WP
-                if (k <= mesh%elem2D_nnodes(e)) then
-                    v = mesh%elem2D_nodes(k, e)
-                    if (mesh%ulevels_nod2D(v) == 1) then           ! vert_vel_ale's nzmin == 1
-                        nlv = mesh%nlevels_nod2D(v)
-                        kb  = min(nle - 1, nlv - 2)
-                        cv  = (mesh%zbar_3d_n(ule, v) - mesh%zbar_3d_n(kb+1, v)) &
-                            / (mesh%zbar_3d_n(1, v) - mesh%zbar_3d_n(nlv-1, v))
-                    end if
-                end if
-                dyn%se_c(k, e) = cv
+                dyn%se_c(k, e) = zstar_depth_law(mesh, e, k)    ! oce_ale (also compute_hbar_ale's dhe)
             end do
         end do
     end subroutine se_elem_depth

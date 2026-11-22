@@ -43,6 +43,9 @@ module oce_ale
     implicit none
     private
     public :: update_vel, compute_hbar_ale, update_eta_n, vert_vel_ale
+    ! zstar: the depth law c(k,e), shared by compute_hbar_ale's dhe (the CG stiffness update) and
+    ! oce_ssh_se's se_elem_depth (the split-explicit element depth)
+    public :: zstar_depth_law
     ! M2.9b (step assembly): compute_vel_nodes is the REAL dyn%uvnode source (prescribed
     ! at M2.8); update_thickness_ale is the linfs thickness commit (a no-op for which_ale=
     ! 'linfs'). Both join the faithful oce_timestep sequence assembled in mod_step_oce.
@@ -183,7 +186,9 @@ contains
         !   hbar_old    = hbar
         !   hbar        = hbar_old + ssh_rhs_old * dt / areasvol
         !   dhe         = sum(elem_w*(hbar - hbar_old)) (per element; feeds update_stiff,
-        !                 which linfs never calls — gated anyway)
+        !                 which linfs never calls — gated anyway); under zstar
+        !                 sum(elem_w*c*(hbar - hbar_old)), c = zstar_depth_law: the change the
+        !                 ALE tail makes to the element's column (see the dhe loop below)
         ! Same edge-divergence structure as M2.6 compute_ssh_rhs_ale (same edge order,
         ! gated). linfs skips the water_flux term + its exchange_nod. Writes mesh%hbar/
         ! hbar_old/dhe and dynamics%ssh_rhs_old.
@@ -199,9 +204,9 @@ contains
         type(t_partit), intent(in), optional :: partit
         real(kind=WP),  intent(in), optional :: water_flux(:)   ! M6a-3: non-linfs freshwater (zstar)
         !______________________________________________________________________
-        integer       :: ed, el(2), enodes(2), elem, elnodes(MAX_NV), n, nz, nzmin, nzmax
+        integer       :: ed, el(2), enodes(2), elem, elnodes(MAX_NV), n, nz, nzmin, nzmax, k
         integer       :: nNodO, nNodL, nEdgeO, nElemO
-        real(kind=WP) :: c1, c2, deltaX1, deltaX2, deltaY1, deltaY2
+        real(kind=WP) :: c1, c2, deltaX1, deltaX2, deltaY1, deltaY2, cw(MAX_NV)
         real(kind=WP), dimension(:,:,:), pointer :: UV
         real(kind=WP), dimension(:),     pointer :: ssh_rhs_old
 
@@ -268,15 +273,56 @@ contains
         end do
         if (is_multirank(partit)) call exchange_nod(mesh%hbar, partit)   ! FESOM2 :2293
 
+        ! dhe: the element depth change that the NEXT step's update_stiff_mat_ale adds to the SSH
+        ! stiffness (lagged), so that the matrix follows the actual columns. Under zstar with the
+        ! bottom at vertices, vert_vel_ale stretches a vertex's OWN column (layers 1..nlevels_nod2D-2),
+        ! and an element shallower than its vertex gets only the fraction c(k,e) of the vertex's
+        ! elevation change (zstar_depth_law; L53's helem inversion, L85). FESOM2's
+        ! sum(elem_w*(hbar - hbar_old)) assumed c = 1 (its stretch stops at nlevels_nod2D_min):
+        ! the stiffness then drifted from the columns (~1 m on 30-50 m shelf elements of CORE2 at
+        ! |eta| ~ 1.8 m), and at large dt (CORE2, 2700 s) the CG's uncorrected remainder grew a
+        ! grid-scale mode on day 4. cw = elem_w*c, left to right as se_subcycle's wc.
         do elem = 1, nElemO
             elnodes = mesh%elem2D_nodes(:, elem)
             if (mesh%ulevels(elem) > 1) then
                 mesh%dhe(elem) = 0.0_WP
+            else if (trim(which_ALE) == 'zstar') then
+                do k = 1, MAX_NV
+                    cw(k) = mesh%elem_w(k, elem)*zstar_depth_law(mesh, elem, k)
+                end do
+                mesh%dhe(elem) = sum(cw*(mesh%hbar(elnodes) - mesh%hbar_old(elnodes)))
             else
                 mesh%dhe(elem) = sum(mesh%elem_w(:, elem)*(mesh%hbar(elnodes) - mesh%hbar_old(elnodes)))
             end if
         end do
     end subroutine compute_hbar_ale
+
+    !===========================================================================
+    pure function zstar_depth_law(mesh, e, k) result(cv)
+        ! c(k,e): the fraction of vertex k's elevation change that the zstar ALE tail puts into
+        ! element e's column, from the current zbar_3d_n (the derivation is se_elem_depth's in
+        ! oce_ssh_se.F90): vert_vel_ale stretches the layers 1..nlv-2 of an open-surface vertex
+        ! v (nlv = nlevels_nod2D(v)) in proportion to their thickness over Htilde_v =
+        ! zbar_3d_n(1,v) - zbar_3d_n(nlv-1,v), and update_thickness_ale sums them into helem over
+        ! the element's layers ule..nle-1, so
+        !     c(k,e) = (zbar_3d_n(ule,v) - zbar_3d_n(K+1,v))/Htilde_v,   K = min(nle-1, nlv-2).
+        ! c == 1 at every vertex with nlv <= nle+1; 0 < c < 1 at the deeper ones; 0 beyond
+        ! elem2D_nnodes(e) and at a vertex without an open surface (not stretched).
+        type(t_mesh), intent(in) :: mesh
+        integer,      intent(in) :: e, k
+        real(kind=WP)            :: cv
+        integer :: v, ule, nle, nlv, kb
+        cv = 0.0_WP
+        if (k > mesh%elem2D_nnodes(e)) return
+        v = mesh%elem2D_nodes(k, e)
+        if (mesh%ulevels_nod2D(v) /= 1) return                    ! vert_vel_ale's nzmin == 1
+        ule = mesh%ulevels(e)
+        nle = mesh%nlevels(e)
+        nlv = mesh%nlevels_nod2D(v)
+        kb  = min(nle - 1, nlv - 2)
+        cv  = (mesh%zbar_3d_n(ule, v) - mesh%zbar_3d_n(kb+1, v)) &
+            / (mesh%zbar_3d_n(1, v) - mesh%zbar_3d_n(nlv-1, v))
+    end function zstar_depth_law
 
     !===========================================================================
     subroutine update_eta_n(dynamics, mesh, partit)
