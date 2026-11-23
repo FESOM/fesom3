@@ -229,7 +229,8 @@ contains
         ! init_stiff_mat_ale built the stiffness 2nd term over the UNPERTURBED depth
         ! (zbar_e_bot-zsrf). This ADDS -dhe(elem) per step, where dhe = hbar(n+1/2)-
         ! hbar(n-1/2) is the element-interpolated SSH change from the previous step's
-        ! compute_hbar_ale (LAGGED; step-1 dhe=0 -> stiffness unchanged step 1). The
+        ! compute_hbar_ale (LAGGED; step-1 dhe=0 -> stiffness unchanged step 1; under zstar
+        ! weighted by the depth law, the element column's actual change: L85). The
         ! additions ACCUMULATE across steps so the matrix tracks the moving free surface.
         !
         ! The same edge assembly as init_stiff_mat_ale's stiffness part (d), shared in

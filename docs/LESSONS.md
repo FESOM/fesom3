@@ -3254,3 +3254,29 @@ barotropic mode the stages freeze and who integrates them in the last stage; a t
 applies, to the frozen value, is forward Euler. Test the barotropic mode alone (linear f-plane, kR < 1) at high
 latitude. Short runs on small or mid-latitude meshes do not show a (fτ)² growth that friction holds down; a
 global mesh with strong high-latitude barotropic flow does — screen at least a month on the target mesh.
+
+## L85 — The vertex bottom flipped dhe too: a lagged copy of the geometry (the CG stiffness) must follow the same law as the geometry, or it drifts, and the drift is a time-step limit
+
+**Context.** fesom3_jax issue #2 (2026-11-22): zstar with the SSH CG on CORE2 at 2700 s grew a grid-scale
+SSH mode on day 4 (max|eta| 1.9 → 485 m → NaN at step ~116; 1800 s and split-explicit survived; GM irrelevant).
+fesom3_jax is FESOM_F's bitwise port, so FESOM_F does the same.
+
+**What happened.**
+- Under the bottom at vertices (L53) `vert_vel_ale` stretches a vertex's OWN column, so an element shallower than
+  a vertex gets only the fraction c(k,e) of that vertex's elevation change. L53 fixed `helem` for it and the
+  split-explicit solver took the depth law c (se_elem_depth). `compute_hbar_ale`'s `dhe`, which the next step's
+  `update_stiff_mat_ale` accumulates into the SSH stiffness, kept FESOM2's `sum(elem_w*(hbar - hbar_old))` —
+  c = 1, true only for FESOM2's stretch to `nlevels_nod2D_min`.
+- The accumulated stiffness depth then drifted from the actual columns by ~half of eta: ~1 m on ~1500 shallow
+  (30–50 m) Antarctic shelf elements with deeper vertices at |eta| ~ 1.8 m. The missed part of the barotropic
+  operator acts explicitly and scales with g·dt²·ΔH/dx²: at 2700 s a checkerboard grew where the CG increment
+  was −2× the actual elevation change; at 2160 s the same ~1 m drift stayed stable.
+- test_ssh_se Z3 had measured the inconsistency all along: its "c = 1 law" residual (> 1 mm, the check that the
+  test discriminates) is exactly FESOM2's dhe missing the column change. Nobody connected it to the stiffness.
+- Fix: dhe = sum(elem_w*c*(hbar - hbar_old)) under zstar (zstar_depth_law, shared with se_elem_depth). Z7 checks
+  dhe against the real tail; the drift drops to the one-step lag (≤ 0.14 m) and CORE2 zstar CG runs at 2700 s.
+
+**How to apply.** When a geometry law changes, list every LAGGED or ACCUMULATED copy of the geometry (a
+stiffness matrix, a preconditioner, a carried depth) and make each follow the same law; a residual that a test
+prints as a "negative control" may be a live inconsistency elsewhere. A drift of a lagged copy is a time-step
+limit, so screen the largest production dt, not only short runs at the gate's dt.
